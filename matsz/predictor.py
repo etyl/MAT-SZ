@@ -60,13 +60,15 @@ class MATPredictor:
         self.vmin = float(vmin)
         self.vmax = float(vmax)
 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         spandrel_extra_arches.install(ignore_duplicates=True)
-        desc = spandrel.ModelLoader().load_from_file(str(checkpoint_path))
+        desc = spandrel.ModelLoader(device=self.device).load_from_file(str(checkpoint_path))
         if desc.purpose != "Inpainting":
             raise ValueError(f"checkpoint is not an inpainting model: {desc}")
         self.model = desc.model.float().eval()
         self.model.z = torch.from_numpy(
-            np.random.RandomState(self.seed).randn(1, 512)).float()
+            np.random.RandomState(self.seed).randn(1, 512)).float().to(self.device)
 
         self.checkpoint_hash = hashlib.sha256(
             Path(checkpoint_path).read_bytes()).digest()[:16]
@@ -83,12 +85,12 @@ class MATPredictor:
         if c == 1:
             norm = np.repeat(norm, 3, axis=0)
 
-        x = torch.from_numpy(norm[None])
-        m = torch.from_numpy((~known).astype(np.float32)[None, None])
+        x = torch.from_numpy(norm[None]).to(self.device)
+        m = torch.from_numpy((~known).astype(np.float32)[None, None]).to(self.device)
         torch.manual_seed(self.seed)
         with torch.inference_mode():
             y = self.model(x, m)
-        pred = y[0].numpy()
+        pred = y[0].cpu().numpy()
         if c == 1:
             pred = pred.mean(axis=0, keepdims=True)
         pred = pred * span + self.vmin

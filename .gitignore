@@ -6,3 +6,4 @@ __pycache__/
 *.msz
 .pytest_cache/
 .claude/settings.local.json
+data/
