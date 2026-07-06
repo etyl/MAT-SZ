@@ -1,0 +1,8 @@
+models/*.safetensors
+tools/
+scripts/_spike_out/
+__pycache__/
+*.pyc
+*.msz
+.pytest_cache/
+.claude/settings.local.json

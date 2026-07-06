@@ -1,0 +1,10 @@
+# torch 2.6.0+cu118 and torchvision 0.21.0+cu118 must match variants
+# (install torchvision from https://download.pytorch.org/whl/cu118).
+spandrel
+spandrel_extra_arches
+numpy
+scipy
+zstandard
+pillow
+pytest
+pysz   # SZ3 baseline for `eval` (imagecodecs needs glibc>=2.28; this box has 2.27)
