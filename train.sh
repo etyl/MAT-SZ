@@ -5,7 +5,7 @@ set -euo pipefail
 
 shift || true
 
-conda run --no-capture-output -n nf python scripts/train_gnn.py \
+python scripts/train_gnn.py \
     --data /data/parietal/store/data/div2k \
     --out data/gnn_predictor.pt \
     --steps 6000 \
