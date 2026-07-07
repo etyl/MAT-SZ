@@ -51,8 +51,7 @@ def compress(
     canvas = canvas.transpose(2, 0, 1)  # (C, H, W)
 
     masks = stage_masks(t, t, levels, anchor_stride, anchor_block)
-    flags = (FLAG_MOCK if isinstance(predictor, MockPredictor) else 0) | \
-            (FLAG_GRAY if c == 1 else 0)
+    flags = getattr(predictor, "stream_flag", 0) | (FLAG_GRAY if c == 1 else 0)
     round_output = np.issubdtype(np.dtype(img.dtype), np.integer)
 
     stats = {"predict_s": 0.0, "quantize_s": 0.0, "entropy_s": 0.0,

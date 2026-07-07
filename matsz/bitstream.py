@@ -20,6 +20,7 @@ VERSION = 1
 
 FLAG_MOCK = 1 << 0
 FLAG_GRAY = 1 << 1
+FLAG_GNN = 1 << 2
 
 _HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHH"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)

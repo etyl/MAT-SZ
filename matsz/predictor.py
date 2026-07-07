@@ -15,10 +15,14 @@ from pathlib import Path
 
 import numpy as np
 
+from .bitstream import FLAG_MOCK
+
 
 class MockPredictor:
     """Nearest-known-pixel fill + box smoothing. Deterministic, torch-free,
     any tile size. Used by fast tests and the --mock CLI flag."""
+
+    stream_flag = FLAG_MOCK
 
     def __init__(self, tile_size: int = 64):
         self.tile_size = tile_size
