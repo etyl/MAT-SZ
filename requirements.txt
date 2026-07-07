@@ -1,7 +1,5 @@
 # torch 2.6.0+cu118 and torchvision 0.21.0+cu118 must match variants
 # (install torchvision from https://download.pytorch.org/whl/cu118).
-spandrel
-spandrel_extra_arches
 numpy
 scipy
 zstandard

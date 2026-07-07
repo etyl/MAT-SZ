@@ -21,6 +21,9 @@ VERSION = 1
 FLAG_MOCK = 1 << 0
 FLAG_GRAY = 1 << 1
 FLAG_GNN = 1 << 2
+FLAG_INTERP = 1 << 3       # SZ-style interpolation baseline (torch-free)
+FLAG_CUBIC = 1 << 4        # interp order: set = cubic, clear = linear
+FLAG_NOTILE = 1 << 5       # whole image is one tile (no padding, no seam)
 
 _HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHH"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)

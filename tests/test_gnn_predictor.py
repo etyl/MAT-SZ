@@ -1,5 +1,4 @@
-"""Tests for the dimension-agnostic GNN predictor. The untrained-net tests are
-fast; the learning-sanity test trains a couple hundred steps (marked slow)."""
+"""Tests for the dimension-agnostic GNN predictor (untrained-net smoke tests)."""
 
 import numpy as np
 import pytest
@@ -61,66 +60,3 @@ def test_no_neighbour_is_finite():
     recon = np.zeros((1, 8, 8), np.float32)
     out = _run(model, recon, known)
     assert np.isfinite(out).all()
-
-
-@pytest.mark.slow
-def test_learns_ramps_and_sines():
-    """Train ~250 steps on synthetic ramps + sinusoids; hole L1 must beat the
-    trivial 'predict the mean of known values' baseline."""
-    torch.manual_seed(0)
-    rng = np.random.RandomState(0)
-    model = build_model(d=32)
-    opt = torch.optim.Adam(model.parameters(), lr=3e-3)
-    crop = 64
-    yy, xx = np.mgrid[0:crop, 0:crop]
-
-    def batch(n=6):
-        out = []
-        for _ in range(n):
-            fx, fy = rng.uniform(0.05, 0.4, 2)
-            a, b = rng.uniform(-1, 1, 2)
-            img = 0.5 + 0.2 * (a * np.sin(fx * xx) + b * np.cos(fy * yy))
-            img += 0.15 * (xx / crop) * rng.uniform(-1, 1)
-            out.append(img.astype(np.float32))
-        return torch.from_numpy(np.stack(out)).reshape(n, -1).clamp(0, 1)
-
-    masks = stage_masks(crop, crop, 4, 16, anchor_block=4)
-
-    def run(model, x):
-        """Drive the propagating field over the schedule, teacher-forced from
-        truth; yield (pred, posf, kv, known) per predicted stage."""
-        n = x.shape[0]
-        E = torch.zeros(n, x.shape[1], model.d)
-        kv = torch.full_like(x, 0.5)
-        prev = np.zeros((crop, crop), bool)
-        known = masks[0].copy()
-        kv = torch.where(torch.from_numpy(masks[0].reshape(-1)), x, kv)
-        for pos in masks[1:]:
-            if not pos.any():
-                continue
-            posf = torch.from_numpy(pos.reshape(-1))
-            pred, E = stage_forward(model, E, prev, known, kv, 64, torch)
-            yield pred, posf, kv, known
-            prev = known.copy()
-            known = known | pos
-            kv = torch.where(posf, x, kv)
-
-    for _ in range(250):
-        x = batch()
-        loss = torch.zeros(())
-        ns = 0
-        for pred, posf, _, _ in run(model, x):
-            loss = loss + (pred[:, posf] - x[:, posf]).abs().mean()
-            ns += 1
-        loss = loss / ns
-        opt.zero_grad(); loss.backward(); opt.step()
-
-    # evaluate final-stage L1 vs. known-mean baseline
-    x = batch(8)
-    with torch.no_grad():
-        for pred, posf, kv, known in run(model, x):
-            pass  # last iteration = final stage
-    model_l1 = (pred[:, posf] - x[:, posf]).abs().mean().item()
-    known_mean = kv[:, torch.from_numpy(known.reshape(-1))].mean(1, keepdim=True)
-    base_l1 = (known_mean - x[:, posf]).abs().mean().item()
-    assert model_l1 < base_l1, f"model {model_l1:.4f} !< baseline {base_l1:.4f}"

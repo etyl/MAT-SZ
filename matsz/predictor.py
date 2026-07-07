@@ -10,12 +10,9 @@ are consumed by the codec). Predictions must be a pure function of
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-
 import numpy as np
 
-from .bitstream import FLAG_MOCK
+from .bitstream import FLAG_CUBIC, FLAG_INTERP, FLAG_MOCK, FLAG_NOTILE
 
 
 class MockPredictor:
@@ -40,62 +37,118 @@ class MockPredictor:
         return np.where(known[None], filled, smooth).astype(np.float32)
 
 
-class MATPredictor:
-    """MAT (Mask-Aware Transformer, CVPR 2022) inpainting as the SZ predictor.
+def _bcast(mask1d: np.ndarray, axis: int, ndim: int) -> np.ndarray:
+    shape = [1] * ndim
+    shape[axis] = mask1d.shape[0]
+    return mask1d.reshape(shape)
 
-    Determinism requirements (decoder must bitwise-reproduce encoder
-    predictions on the same platform):
-      - model.z is drawn unseeded in MAT.__init__ -> overwritten here with an
-        RNG seeded from the header seed;
-      - the synthesis network calls F.dropout(training=True) at inference ->
-        torch.manual_seed(seed) immediately before every forward.
+
+def _interp_axis(V: np.ndarray, axis: int, s: int, order: str) -> np.ndarray:
+    """Predict the odd-stride midpoints along ``axis`` from the even-stride
+    (known) samples: SZ3's 1D interpolation — cubic weights [-1, 9, 9, -1]/16
+    over the four nearest same-line samples, dropping to linear then to an edge
+    copy where the ±3s / ±s neighbours fall outside the tile."""
+    n = V.shape[axis]
+
+    def gather(off):
+        j = np.arange(n) + off
+        return np.take(V, np.clip(j, 0, n - 1), axis=axis), (j >= 0) & (j < n)
+
+    Lm1, vm1 = gather(-s)
+    Lp1, vp1 = gather(+s)
+    pred = 0.5 * (Lm1 + Lp1)
+    if order == "cubic":
+        Lm3, vm3 = gather(-3 * s)
+        Lp3, vp3 = gather(+3 * s)
+        cub = (-Lm3 + 9 * Lm1 + 9 * Lp1 - Lp3) / 16.0
+        pred = np.where(_bcast(vm3 & vp3, axis, V.ndim), cub, pred)
+    both = _bcast(vm1 & vp1, axis, V.ndim)
+    only_left = _bcast(vm1 & ~vp1, axis, V.ndim)
+    return np.where(both, pred, np.where(only_left, Lm1, Lp1))
+
+
+class InterpPredictor:
+    """SZ3-style interpolation baseline dropped into MAT-SZ's closed loop, so
+    MAT/GNN vs. classical interpolation is isolated to the predictor (identical
+    quantizer + Huffman/zstd stage, matching SZ3's own pipeline). Torch- and
+    checkpoint-free, so streams decode without a model.
+
+    Each dyadic level is split into two codec sub-stages: first the horizontal
+    midpoints (interpolate along x on the even rows), then the vertical and
+    diagonal midpoints (along y). Because they are separate stages, the codec
+    quantizes the horizontal midpoints into ``recon`` before the diagonals read
+    them — SZ3's interleaved quantize/predict order, so the diagonals predict
+    from *reconstructed* neighbours, not predicted ones. The predictor supplies
+    its own ``stage_masks`` for this split; the decoder rebuilds the identical
+    schedule from the header dims alone.
+
+    Tile-free: SZ3's interpolation has no fixed input size (unlike MAT), so the
+    codec runs it over the whole image as a single region — no padding, no
+    prediction seam.
     """
 
-    tile_size = 512
+    tile_free = True  # codec compresses the whole image as one region
 
-    def __init__(self, checkpoint_path: str | Path, seed: int,
-                 vmin: float, vmax: float):
-        import spandrel
-        import spandrel_extra_arches
-        import torch
+    def __init__(self, tile_size: int = 512, order: str = "cubic",
+                 levels: int = 4, anchor_stride: int = 16, anchor_block: int = 4):
+        if order not in ("linear", "cubic"):
+            raise ValueError("order must be 'linear' or 'cubic'")
+        self.order = order
+        self.levels = levels
+        self.anchor_stride = anchor_stride
+        self.anchor_block = anchor_block
+        self.stream_flag = FLAG_INTERP | (FLAG_CUBIC if order == "cubic" else 0)
+        self.checkpoint_hash = b"\0" * 16
+        self._cache: dict[tuple[int, int], tuple[list, dict]] = {}
 
-        self._torch = torch
-        self.seed = int(seed)
-        self.vmin = float(vmin)
-        self.vmax = float(vmax)
+    def _build(self, h: int, w: int) -> tuple[list, dict]:
+        """Return (masks, schedule) for an (h, w) region. ``masks`` is the split
+        stage list [anchor, lvl1-horizontal, lvl1-vert/diag, lvl2-h, ...];
+        ``schedule`` maps |known so far| -> (stride, phase) so ``predict`` knows
+        which sub-pass to run. Cached per shape (the codec reuses one region)."""
+        key = (h, w)
+        if key in self._cache:
+            return self._cache[key]
+        ih, iw = np.arange(h), np.arange(w)
+        covered = np.zeros((h, w), bool)
+        anchor = np.zeros((h, w), bool)
+        for di in range(self.anchor_block):
+            for dj in range(self.anchor_block):
+                anchor[di::self.anchor_stride, dj::self.anchor_stride] = True
+        masks = [anchor]
+        covered |= anchor
+        schedule: dict[int, tuple[int, str]] = {}
+        for k in range(1, self.levels + 1):
+            s = max(self.anchor_stride >> k, 1)
+            coarse_h = (ih % (2 * s)) == 0
+            mid_h = ((ih % s) == 0) & ~coarse_h
+            coarse_w = (iw % (2 * s)) == 0
+            mid_w = ((iw % s) == 0) & ~coarse_w
+            m_h = (coarse_h[:, None] & mid_w[None, :]) & ~covered    # horizontal
+            m_vd = (mid_h[:, None] & (((iw % s) == 0)[None, :])) & ~covered  # vert+diag
+            if k == self.levels:  # last level: absorb any remainder (small tiles)
+                m_vd |= ~covered & ~m_h
+            for mask, phase in ((m_h, "h"), (m_vd, "vd")):
+                if mask.any():
+                    schedule[int(covered.sum())] = (s, phase)
+                masks.append(mask)
+                covered |= mask
+        self._cache[key] = (masks, schedule)
+        return self._cache[key]
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        spandrel_extra_arches.install(ignore_duplicates=True)
-        desc = spandrel.ModelLoader(device=self.device).load_from_file(str(checkpoint_path))
-        if desc.purpose != "Inpainting":
-            raise ValueError(f"checkpoint is not an inpainting model: {desc}")
-        self.model = desc.model.float().eval()
-        self.model.z = torch.from_numpy(
-            np.random.RandomState(self.seed).randn(1, 512)).float().to(self.device)
-
-        self.checkpoint_hash = hashlib.sha256(
-            Path(checkpoint_path).read_bytes()).digest()[:16]
+    def stage_masks(self, h, w, levels, anchor_stride, anchor_block) -> list:
+        return self._build(h, w)[0]
 
     def predict(self, recon: np.ndarray, known: np.ndarray) -> np.ndarray:
-        torch = self._torch
-        c, h, w = recon.shape
-        if (h, w) != (self.tile_size, self.tile_size):
-            raise ValueError(f"MAT requires {self.tile_size}x{self.tile_size} tiles, got {h}x{w}")
+        _, h, w = recon.shape
+        entry = self._build(h, w)[1].get(int(known.sum()))
+        if entry is None:
+            raise ValueError("known mask does not match the interp schedule")
+        s, phase = entry
+        W = recon.astype(np.float64)
+        # 'h': horizontal midpoints from known coarse columns (along x, axis 2).
+        # 'vd': vertical + diagonal midpoints along y (axis 1); the diagonals read
+        # the horizontal midpoints already reconstructed into `recon` this level.
+        axis = 2 if phase == "h" else 1
+        return _interp_axis(W, axis, s, self.order).astype(np.float32)
 
-        span = self.vmax - self.vmin
-        norm = (np.clip(recon, self.vmin, self.vmax) - self.vmin) / span
-        norm = np.where(known[None], norm, 0.5).astype(np.float32)
-        if c == 1:
-            norm = np.repeat(norm, 3, axis=0)
-
-        x = torch.from_numpy(norm[None]).to(self.device)
-        m = torch.from_numpy((~known).astype(np.float32)[None, None]).to(self.device)
-        torch.manual_seed(self.seed)
-        with torch.inference_mode():
-            y = self.model(x, m)
-        pred = y[0].cpu().numpy()
-        if c == 1:
-            pred = pred.mean(axis=0, keepdims=True)
-        pred = pred * span + self.vmin
-        return np.clip(pred, self.vmin, self.vmax).astype(np.float32)

@@ -16,12 +16,10 @@ from pathlib import Path
 
 import numpy as np
 
-from .bitstream import FLAG_GNN, FLAG_MOCK, Header, read_stream
+from .bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_INTERP, FLAG_MOCK, Header, read_stream
 from .codec import compress, decompress
-from .predictor import MATPredictor, MockPredictor
+from .predictor import InterpPredictor, MockPredictor
 
-DEFAULT_CKPT = Path(__file__).resolve().parent.parent / "models" / \
-    "MAT_Places512_G_fp16.safetensors"
 DEFAULT_GNN = Path(__file__).resolve().parent.parent / "data" / "gnn_predictor.pt"
 
 
@@ -48,12 +46,15 @@ def build_predictor(args, header: Header):
     """Decompress-side predictor; all parameters come from the stream header."""
     if header.flags & FLAG_MOCK:
         return MockPredictor(header.tile_size)
-    if header.flags & FLAG_GNN:
-        from .gnn_predictor import GNNPredictor
-        pred = GNNPredictor(args.gnn_checkpoint, header.vmin, header.vmax,
-                            tile_size=header.tile_size)
-    else:
-        pred = MATPredictor(args.checkpoint, header.seed, header.vmin, header.vmax)
+    if header.flags & FLAG_INTERP:
+        return InterpPredictor(
+            header.tile_size, "cubic" if header.flags & FLAG_CUBIC else "linear",
+            header.levels, header.anchor_stride, header.anchor_block)
+    if not header.flags & FLAG_GNN:
+        raise ValueError("stream needs a predictor factory the CLI can't build")
+    from .gnn_predictor import GNNPredictor
+    pred = GNNPredictor(args.gnn_checkpoint, header.vmin, header.vmax,
+                        tile_size=header.tile_size)
     if pred.checkpoint_hash != header.ckpt_hash:
         print("warning: checkpoint hash differs from the one used to compress; "
               "decoded output may violate the error bound", file=sys.stderr)
@@ -67,12 +68,15 @@ def add_common(ap):
                     help="interpret --eb as relative to the data range")
     ap.add_argument("--levels", type=int, default=4)
     ap.add_argument("--anchor-stride", type=int, default=16)
-    ap.add_argument("--anchor-block", type=int, default=4)
+    ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--zstd-level", type=int, default=9)
-    ap.add_argument("--predictor", choices=("mat", "mock", "gnn"), default="mat")
-    ap.add_argument("--checkpoint", default=str(DEFAULT_CKPT))
+    ap.add_argument("--predictor",
+                    choices=("mock", "gnn", "interp", "interp-linear"),
+                    default="interp",
+                    help="interp = SZ-style cubic interpolation (default); "
+                         "interp-linear = its linear variant; gnn = trained GNN")
     ap.add_argument("--gnn-checkpoint", default=str(DEFAULT_GNN))
     ap.add_argument("--mock", action="store_true",
                     help="alias for --predictor mock (torch-free NN predictor)")
@@ -88,18 +92,17 @@ def run_compress(img: np.ndarray, args) -> tuple[bytes, dict]:
     kind = "mock" if args.mock else args.predictor
     tile = args.tile
     if kind == "gnn" and tile == 512:
-        tile = 64  # gnn default; MAT's 512 default is inappropriate here
-    if kind == "mat" and tile != 512:
-        raise SystemExit("--tile != 512 requires --predictor mock/gnn (MAT only runs at 512)")
-    if kind == "mock":
+        tile = 64  # gnn default tile size
+    if kind in ("interp", "interp-linear"):
+        order = "linear" if kind == "interp-linear" else "cubic"
+        predictor = InterpPredictor(tile, order, args.levels,
+                                    args.anchor_stride, args.anchor_block)
+    elif kind == "mock":
         predictor = MockPredictor(tile)
-    elif kind == "gnn":
+    else:  # gnn
         from .gnn_predictor import GNNPredictor
         predictor = GNNPredictor(args.gnn_checkpoint, float(img.min()),
                                  float(img.max()), tile_size=tile)
-    else:
-        predictor = MATPredictor(args.checkpoint, args.seed,
-                                 float(img.min()), float(img.max()))
     return compress(img, eb, predictor, levels=args.levels,
                     anchor_stride=args.anchor_stride,
                     anchor_block=args.anchor_block, radius=args.radius,
@@ -190,7 +193,6 @@ def main(argv=None):
     p = sub.add_parser("decompress", help="decompress a .msz stream to an image")
     p.add_argument("input")
     p.add_argument("output")
-    p.add_argument("--checkpoint", default=str(DEFAULT_CKPT))
     p.add_argument("--gnn-checkpoint", default=str(DEFAULT_GNN))
     p.set_defaults(fn=cmd_decompress)
 

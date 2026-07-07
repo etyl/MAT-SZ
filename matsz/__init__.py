@@ -1,5 +1,5 @@
-"""MAT-SZ: SZ-style error-bounded lossy compression with a Mask-Aware
-Transformer (MAT, CVPR 2022) replacing the classic Lorenzo/spline predictor."""
+"""MAT-SZ: SZ-style error-bounded lossy compression with a pluggable predictor
+(SZ3-style multilevel interpolation by default, or a trained GNN)."""
 
 from .codec import compress, decompress
 
