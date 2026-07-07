@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -69,40 +70,48 @@ def main():
                     help="uniform +/- noise on known values (mimics eb)")
     ap.add_argument("--max-radius", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available()
+                    else "cpu", help="cpu | cuda | cuda:N")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    device = torch.device(args.device)
     paths = list_images(args.data)
     if not paths:
         raise SystemExit(f"no images found under {args.data}")
-    print(f"{len(paths)} images")
+    print(f"{len(paths)} images, device={device}")
 
-    model = build_model(args.d)
+    model = build_model(args.d).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model: {n_params} params, d={args.d}")
 
     run_loss = run_base = 0.0
-    for step in range(1, args.steps + 1):
-        x = sample_batch(paths, args.batch, args.crop)  # (B, N) truth
+    history = []  # (step, mae, baseline) per step, for the loss curve
+    bar = tqdm(range(1, args.steps + 1), desc="train")
+    for step in bar:
+        x = sample_batch(paths, args.batch, args.crop).to(device)  # (B, N) truth
         levels = random.choice((3, 4, 5))
         stride = random.choice((8, 16, 32))
         masks = stage_masks(args.crop, args.crop, levels, stride, anchor_block=4)
 
-        E = torch.zeros(args.batch, x.shape[1], args.d)
+        E = torch.zeros(args.batch, x.shape[1], args.d, device=device)
         known_vals = torch.full_like(x, 0.5)
 
         def reveal(kv, posf):
             noise = (torch.rand_like(x) * 2 - 1) * args.noise
             return torch.where(posf, (x + noise).clamp(0, 1), kv)
 
+        def maskf(m):  # flat bool mask on the training device
+            return torch.from_numpy(m.reshape(-1)).to(device)
+
         # stage 0: anchors revealed exactly, no prediction
         prev = np.zeros((args.crop, args.crop), bool)
         known = masks[0].copy()
-        known_vals = reveal(known_vals, torch.from_numpy(masks[0].reshape(-1)))
+        known_vals = reveal(known_vals, maskf(masks[0]))
 
         # pixel-weighted MAE: sum absolute error over every hole across all
         # stages, divide by total holes, so each pixel counts once (the dense
@@ -113,7 +122,7 @@ def main():
         for pos in masks[1:]:
             if not pos.any():
                 continue
-            posf = torch.from_numpy(pos.reshape(-1))
+            posf = maskf(pos)
             # predict with `known` = earlier stages (pos not yet revealed),
             # finalising the previous stage's embeddings inside stage_forward
             pred, E = stage_forward(model, E, prev, known, known_vals,
@@ -130,17 +139,47 @@ def main():
         opt.zero_grad()
         loss.backward()
         opt.step()
+        history.append((step, loss.item(), base_abs / max(npix, 1)))
         run_loss += loss.item()
         run_base += base_abs / max(npix, 1)
 
         if step % 100 == 0:
-            print(f"step {step:5d}  MAE {run_loss / 100:.5f}  "
-                  f"(known-mean baseline {run_base / 100:.5f})  ")
+            bar.set_postfix(mae=f"{run_loss / 100:.5f}",
+                            baseline=f"{run_base / 100:.5f}")
             run_loss = run_base = 0.0
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": model.state_dict(), "d": args.d}, args.out)
-    print(f"saved {args.out}")
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": model.state_dict(), "d": args.d}, out)
+    print(f"saved {out}")
+    save_curve(history, out.with_suffix(".loss"))
+
+
+def save_curve(history, stem):
+    """Write the loss curve as CSV always, and a PNG if matplotlib is around."""
+    csv = stem.with_suffix(".csv")
+    with open(csv, "w") as f:
+        f.write("step,mae,baseline\n")
+        for s, mae, b in history:
+            f.write(f"{s},{mae:.6f},{b:.6f}\n")
+    print(f"saved {csv}")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    st = [h[0] for h in history]
+    plt.figure(figsize=(7, 4))
+    plt.plot(st, [h[1] for h in history], label="model MAE")
+    plt.plot(st, [h[2] for h in history], label="known-mean baseline", alpha=.6)
+    plt.xlabel("step")
+    plt.ylabel("MAE")
+    plt.legend()
+    plt.tight_layout()
+    png = stem.with_suffix(".png")
+    plt.savefig(png, dpi=110)
+    print(f"saved {png}")
 
 
 if __name__ == "__main__":

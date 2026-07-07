@@ -85,22 +85,27 @@ class _Geometry:
     """Precomputed, param-free neighbour geometry for one `known` mask.
     Holds per-line gather indices / distances / validity as torch tensors."""
 
-    def __init__(self, known: np.ndarray, max_radius: int, torch):
+    def __init__(self, known: np.ndarray, max_radius: int, torch, device=None):
         n = known.size
         flat = np.arange(n, dtype=np.int64).reshape(known.shape)
         self.shape = known.shape
         self.lines = []
+
+        def t(a):  # numpy -> torch on the target device (indices/masks/dists)
+            x = torch.from_numpy(a.reshape(-1))
+            return x.to(device) if device is not None else x
+
         for h in half_directions(known.ndim):
             neg = tuple(-c for c in h)  # the -h side
             ip, dp, vp = _nearest_in_dir(known, flat, h, max_radius)
             in_, dn, vn = _nearest_in_dir(known, flat, neg, max_radius)
             self.lines.append({
-                "ip": torch.from_numpy(ip.reshape(-1)),
-                "in": torch.from_numpy(in_.reshape(-1)),
-                "dp": torch.from_numpy(dp.reshape(-1)),
-                "dn": torch.from_numpy(dn.reshape(-1)),
-                "vp": torch.from_numpy(vp.reshape(-1)),
-                "vn": torch.from_numpy(vn.reshape(-1)),
+                "ip": t(ip),
+                "in": t(in_),
+                "dp": t(dp),
+                "dn": t(dn),
+                "vp": t(vp),
+                "vn": t(vn),
             })
 
 
@@ -188,7 +193,7 @@ def build_model(d: int = 32):
             values), so trends/periodicity propagate hop by hop. Returns
             msgs (L, B, N, d) and valid (L, N)."""
             B, N, _ = E.shape
-            one = torch.ones(B, N, 1)
+            one = torch.ones(B, N, 1, device=E.device)
             msgs, valids = [], []
             for ln in geom.lines:
                 ep = E[:, ln["ip"]]                # (B, N, d) +side neighbour
@@ -236,15 +241,15 @@ def stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch):
     # ponytail: each call rebuilds both geometries and embeds all N points
     # (finalize uses only `newly`); fine on real HW, subset the gather if the
     # python-loop scan becomes the bottleneck on large grids.
+    device = E.device
     N = known_mask.size
     newly = known_mask & ~prev_mask                 # revealed since last stage
     if newly.any():
-        geom_prev = _Geometry(prev_mask, max_radius, torch)
-        pooled = model.embed(E, geom_prev, norm,
-                             torch.from_numpy(newly.reshape(-1)))
-        nf = torch.from_numpy(newly.reshape(-1)).view(1, N, 1)
-        E = torch.where(nf, pooled, E)              # finalize their embeddings
-    geom = _Geometry(known_mask, max_radius, torch)
+        geom_prev = _Geometry(prev_mask, max_radius, torch, device)
+        sv = torch.from_numpy(newly.reshape(-1)).to(device)
+        pooled = model.embed(E, geom_prev, norm, sv)
+        E = torch.where(sv.view(1, N, 1), pooled, E)  # finalize their embeddings
+    geom = _Geometry(known_mask, max_radius, torch, device)
     values = model.head_of(model.embed(E, geom))    # predict every point
     return values, E
 
@@ -257,10 +262,11 @@ class GNNPredictor:
     stream_flag = _FLAG
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
-                 tile_size: int = 64, max_radius: int = 64):
+                 tile_size: int = 64, max_radius: int = 64, device: str = "cpu"):
         import torch
 
         self._torch = torch
+        self.device = torch.device(device)
         self.vmin = float(vmin)
         self.vmax = float(vmax)
         self.tile_size = int(tile_size)
@@ -268,7 +274,7 @@ class GNNPredictor:
 
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.d = ckpt["d"]
-        self.model = build_model(self.d).eval()
+        self.model = build_model(self.d).eval().to(self.device)
         self.model.load_state_dict(ckpt["state_dict"])
         self.checkpoint_hash = hashlib.sha256(
             Path(checkpoint_path).read_bytes()).digest()[:16]
@@ -288,13 +294,13 @@ class GNNPredictor:
                 and known.sum() > self._prev.sum()
                 and bool((known & self._prev == self._prev).all()))
         if not cont:
-            self._E = torch.zeros(c, known.size, self.d)
+            self._E = torch.zeros(c, known.size, self.d, device=self.device)
             self._prev = np.zeros(known.shape, bool)
 
-        x = torch.from_numpy(norm.reshape(c, -1))
+        x = torch.from_numpy(norm.reshape(c, -1)).to(self.device)
         with torch.no_grad():
             values, self._E = stage_forward(self.model, self._E, self._prev,
                                             known, x, self.max_radius, torch)
         self._prev = known.copy()
-        pred = values.numpy().reshape(recon.shape) * span + self.vmin
+        pred = values.cpu().numpy().reshape(recon.shape) * span + self.vmin
         return np.clip(pred, self.vmin, self.vmax).astype(np.float32)
