@@ -291,31 +291,26 @@ def stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch,
     grids of what was known before / is known now (known_mask >= prev_mask;
     the current stage's targets are NOT yet in known_mask, matching the codec).
     norm: (B, N) normalized values (only entries under known_mask are read).
-    Returns (values (B, N), E_new (B, N, d)).
+    Returns (values, E_new (B, N, d)); values is (B, N) when predict_idx is None
+    (the codec's full grid) or the compact (B, len(predict_idx)) predictions at
+    those points (the trainer's holes), in predict_idx order.
 
     Both embeds run over only the query points whose output is used: `finalize`
     writes just the newly-revealed points, so its context is embedded there; the
-    prediction head is embedded at `predict_idx` (the stage's holes) when given,
-    leaving the rest of `values` zero. embed is pointwise across query points, so
-    this is bit-identical to the full grid at every position anyone reads. The
-    codec passes predict_idx=None to get a full-grid prediction."""
+    prediction head is embedded only at `predict_idx`. embed is pointwise across
+    query points, so this is float-equivalent to the full grid at every position
+    anyone reads (encoder and decoder run this same code, so they still agree
+    bitwise). Returning the compact predictions avoids a full-N scatter/gather."""
     device = E.device
-    N = known_mask.size
     newly = known_mask & ~prev_mask                 # revealed since last stage
     if newly.any():
         geom_prev = _geometry(prev_mask, max_radius, torch, device)
         idx = torch.from_numpy(np.nonzero(newly.reshape(-1))[0]).to(device)
         ctx = model.embed(E, geom_prev, idx)        # context from the prev mask
         finalized = model.finalize(ctx, norm[:, idx])  # fuse with their own value
-        E = E.clone()
-        E[:, idx] = finalized
+        E = E.index_copy(1, idx, finalized)         # write the newly-known field
     geom = _geometry(known_mask, max_radius, torch, device)
-    if predict_idx is None:
-        values = model.head_of(model.embed(E, geom))       # predict every point
-    else:
-        sub = model.head_of(model.embed(E, geom, predict_idx))  # (B, M)
-        values = torch.zeros(E.shape[0], N, device=device, dtype=sub.dtype)
-        values[:, predict_idx] = sub
+    values = model.head_of(model.embed(E, geom, predict_idx))
     return values, E
 
 

@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import argparse
 import random
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -33,18 +36,30 @@ def list_images(root):
     return [p for p in Path(root).rglob("*") if p.suffix.lower() in IMG_EXT]
 
 
-def load_plane(path, crop):
-    """Random `crop`x`crop` patch from a random plane (R/G/B/gray), in [0,1]."""
+@lru_cache(maxsize=1024)
+def _decode_rgb(path):
+    """Decode the whole image once and keep it in RAM (uint8 RGB). Random crops
+    then slice from memory instead of re-decoding megapixels every sample — the
+    decode was ~half the training-step CPU time.
+    ponytail: 1024-image LRU (covers DIV2K's 800; ~8 GB at 2K uint8). Lower
+    maxsize if the node is RAM-tight, raise/drop it to cache a bigger set."""
     from PIL import Image
 
-    im = Image.open(path).convert("RGB")
-    if min(im.size) < crop:
-        im = im.resize((max(crop, im.size[0]), max(crop, im.size[1])))
-    a = np.asarray(im, np.float32) / 255.0  # (H, W, 3)
+    return np.asarray(Image.open(path).convert("RGB"), np.uint8)  # (H, W, 3)
+
+
+def load_plane(path, crop):
+    """Random `crop`x`crop` patch from a random plane (R/G/B/gray), in [0,1]."""
+    a = _decode_rgb(path)  # cached uint8; never mutated (we only slice + copy)
+    if min(a.shape[:2]) < crop:
+        from PIL import Image
+        im = Image.fromarray(a).resize((max(crop, a.shape[1]),
+                                        max(crop, a.shape[0])))
+        a = np.asarray(im, np.uint8)
     h, w, _ = a.shape
     y = random.randint(0, h - crop)
     x = random.randint(0, w - crop)
-    patch = a[y:y + crop, x:x + crop]
+    patch = a[y:y + crop, x:x + crop].astype(np.float32) / 255.0
     ch = random.randint(0, 3)
     if ch < 3:
         return patch[..., ch]
@@ -54,6 +69,38 @@ def load_plane(path, crop):
 def sample_batch(paths, batch, crop):
     planes = [load_plane(random.choice(paths), crop) for _ in range(batch)]
     return torch.from_numpy(np.stack(planes)).reshape(batch, -1)  # (B, N)
+
+
+def prefetch_batches(paths, batch, crop, steps, workers):
+    """Yield `steps` CPU batches, decoding on `workers` background threads so
+    image I/O overlaps the GPU step (PIL/numpy release the GIL, so threads
+    decode in parallel). Keeps ~2*workers batches in flight.
+
+    ponytail: workers==0 is the plain synchronous path — use it for a bit-
+    reproducible seeded run, since parallel workers race on the global RNG and
+    make the *content* of each batch non-deterministic (consumption order is
+    still FIFO). Overlap matters most while the decode cache is cold or the set
+    is larger than the cache; a fully-cached set barely needs it."""
+    if workers <= 0:
+        for _ in range(steps):
+            yield sample_batch(paths, batch, crop)
+        return
+    ahead = max(2 * workers, 2)
+    ex = ThreadPoolExecutor(max_workers=workers)
+    futs = deque()
+    submitted = 0
+    try:
+        while submitted < min(ahead, steps):
+            futs.append(ex.submit(sample_batch, paths, batch, crop))
+            submitted += 1
+        for _ in range(steps):
+            b = futs.popleft().result()
+            if submitted < steps:
+                futs.append(ex.submit(sample_batch, paths, batch, crop))
+                submitted += 1
+            yield b
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def qz(pred, truth, eb):
@@ -108,13 +155,18 @@ def maskf(m, device):  # flat bool mask on the given device
     return torch.from_numpy(m.reshape(-1)).to(device)
 
 
-def run_stages(model, x, masks, reveal, d, max_radius, device, eb=None):
+def run_stages(model, x, masks, reveal, d, max_radius, device, eb=None,
+               collect=False):
     """Run the stage schedule over truth `x` (B, N); return (sum |pred - truth|,
-    n_holes). Training passes `eb=None` and teacher-forces via `reveal(kv, posf)`
-    (noisy truth). Eval passes an error bound `eb`: the fed-back known values are
-    then the model's own linear-quantised reconstructions (real closed-loop
-    inference, matching the codec), so the reported MAE is the prediction error
-    the codec actually pays to encode."""
+    n_holes, known_vals, pred_only). Training passes `eb=None` and teacher-forces
+    via `reveal(kv, posf)` (noisy truth). Eval passes an error bound `eb`: the
+    fed-back known values are then the model's own linear-quantised
+    reconstructions (real closed-loop inference, matching the codec), so the
+    reported MAE is the prediction error the codec actually pays to encode.
+
+    `collect` builds the per-pixel `pred_only` image (raw preds at the holes) for
+    logging; it costs a scatter per stage and is only read when logging eval
+    images, so training leaves it off and gets `pred_only=None`."""
     E = torch.zeros(x.shape[0], x.shape[1], d, device=device)
     m0 = maskf(masks[0], device)
     if eb is None:
@@ -124,7 +176,8 @@ def run_stages(model, x, masks, reveal, d, max_radius, device, eb=None):
                                  torch.full_like(x, 0.5))
     prev = np.zeros(masks[0].shape, bool)
     known = masks[0].copy()
-    pred_only = known_vals.clone()  # recon *without* residuals (raw preds at holes)
+    # recon *without* residuals (raw preds at holes); only for image logging
+    pred_only = known_vals.clone() if collect else None
 
     abs_err = torch.zeros(())
     npix = 0
@@ -132,20 +185,21 @@ def run_stages(model, x, masks, reveal, d, max_radius, device, eb=None):
         if not pos.any():
             continue
         posf = maskf(pos, device)
-        pidx = posf.nonzero(as_tuple=True)[0]  # only the holes are read below
+        pidx = posf.nonzero(as_tuple=True)[0]  # holes; pred comes back compact
         pred, E = stage_forward(model, E, prev, known, known_vals,
                                 max_radius, torch, predict_idx=pidx)
-        tgt = x[:, posf]
-        abs_err = abs_err + (pred[:, posf] - tgt).abs().sum()
+        tgt = x[:, pidx]
+        abs_err = abs_err + (pred - tgt).abs().sum()
         npix += tgt.numel()
-        pred_only[:, posf] = pred[:, posf]
+        if collect:
+            pred_only[:, pidx] = pred
         prev = known.copy()
         known = known | pos
         if eb is None:
             known_vals = reveal(known_vals, posf)
         else:
             known_vals = known_vals.clone()
-            known_vals[:, posf] = qz(pred[:, posf], tgt, eb)
+            known_vals[:, pidx] = qz(pred, tgt, eb)
     # known_vals = full closed-loop recon; pred_only = same minus the quantised
     # residual added at each hole (residual = known_vals - pred_only).
     return abs_err, npix, known_vals, pred_only
@@ -186,6 +240,14 @@ def main():
     ap.add_argument("--eval-eb", type=float, default=0.01,
                     help="error bound (in [0,1]) for the real-inference eval loop")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--levels", type=int, default=None,
+                    help="fix the stage levels (default: random 3/4/5 per step; "
+                         "set it for a deterministic, comparable profile)")
+    ap.add_argument("--stride", type=int, default=None,
+                    help="fix the anchor stride (default: random 8/16/32)")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="background image-decode threads (0 = synchronous, "
+                         "bit-reproducible; >0 overlaps I/O with the GPU step)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available()
                     else "cpu", help="cpu | cuda | cuda:N")
     ap.add_argument("--wandb-mode", choices=("online", "offline", "disabled"),
@@ -253,11 +315,13 @@ def main():
         prof.start()
         args.steps = args.profile + 2  # wait + warmup + active
 
+    batches = prefetch_batches(paths, args.batch, args.crop, args.steps,
+                               args.workers)
     bar = tqdm(range(1, args.steps + 1), desc="train")
     for step in bar:
-        x = sample_batch(paths, args.batch, args.crop).to(device)  # (B, N) truth
-        levels = random.choice((3, 4, 5))
-        stride = random.choice((8, 16, 32))
+        x = next(batches).to(device)  # (B, N) truth, decoded on a worker thread
+        levels = args.levels or random.choice((3, 4, 5))
+        stride = args.stride or random.choice((8, 16, 32))
         masks = stage_masks((args.crop, args.crop), levels, stride, anchor_block=1)
 
         def reveal(kv, posf):
@@ -283,7 +347,7 @@ def main():
             with torch.no_grad():
                 ae, en, recon, pred_only = run_stages(
                     model, eval_x, eval_masks, None, args.d, args.max_radius,
-                    device, eb=args.eval_eb)
+                    device, eb=args.eval_eb, collect=True)
             model.train()
             last_eval = ae.item() / max(en, 1)
             log = {"eval/mae": last_eval,

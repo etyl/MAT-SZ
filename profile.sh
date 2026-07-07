@@ -17,9 +17,11 @@ module load pytorch-gpu
 python scripts/train_gnn.py \
     --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
     --out data/gnn_predictor.pt \
-    --batch 2 \
+    --batch 4 \
     --crop 128 \
-    --d 32 \
+    --d 64 \
+    --levels 4 \
+    --stride 16 \
     --device cuda \
     --wandb-mode disabled \
     --profile 1 \
