@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 
 from .bitstream import FLAG_CUBIC, FLAG_INTERP, FLAG_MOCK, FLAG_NOTILE
+from .levels import stage_plan
 
 
 class MockPredictor:
@@ -105,38 +106,24 @@ class InterpPredictor:
         self._cache: dict[tuple[int, int], tuple[list, dict]] = {}
 
     def _build(self, h: int, w: int) -> tuple[list, dict]:
-        """Return (masks, schedule) for an (h, w) region. ``masks`` is the split
-        stage list [anchor, lvl1-h, lvl1-v, lvl1-d, lvl2-h, ...]; ``schedule``
-        maps |known so far| -> (stride, phase) so ``predict`` knows which
-        sub-pass to run. Cached per shape (the codec reuses one region)."""
+        """Return (masks, schedule) for an (h, w) region, from the shared
+        ``levels.stage_plan`` (so the GNN codec/trainer use the identical
+        schedule). ``masks`` is the split stage list [anchor, l1-h, l1-v, l1-d,
+        l2-h, ...]; ``schedule`` maps |known so far| -> (stride, phase) so
+        ``predict`` knows which sub-pass to run. Cached per shape."""
         key = (h, w)
         if key in self._cache:
             return self._cache[key]
-        ih, iw = np.arange(h), np.arange(w)
-        covered = np.zeros((h, w), bool)
-        anchor = np.zeros((h, w), bool)
-        for di in range(self.anchor_block):
-            for dj in range(self.anchor_block):
-                anchor[di::self.anchor_stride, dj::self.anchor_stride] = True
-        masks = [anchor]
-        covered |= anchor
+        masks: list = []
         schedule: dict[int, tuple[int, str]] = {}
-        for k in range(1, self.levels + 1):
-            s = max(self.anchor_stride >> k, 1)
-            coarse_h = (ih % (2 * s)) == 0
-            mid_h = ((ih % s) == 0) & ~coarse_h
-            coarse_w = (iw % (2 * s)) == 0
-            mid_w = ((iw % s) == 0) & ~coarse_w
-            m_h = (coarse_h[:, None] & mid_w[None, :]) & ~covered    # horizontal
-            m_v = (mid_h[:, None] & coarse_w[None, :]) & ~covered    # vertical
-            m_d = (mid_h[:, None] & mid_w[None, :]) & ~covered        # diagonal
-            if k == self.levels:  # last level: absorb any remainder (small tiles)
-                m_d |= ~covered & ~m_h & ~m_v
-            for mask, phase in ((m_h, "h"), (m_v, "v"), (m_d, "d")):
-                if mask.any():
-                    schedule[int(covered.sum())] = (s, phase)
-                masks.append(mask)
-                covered |= mask
+        covered = 0
+        for mask, s, phase in stage_plan(h, w, self.levels, self.anchor_stride,
+                                         self.anchor_block):
+            n = int(mask.sum())
+            if phase != "anchor" and n:  # predict() is keyed by prior |known|
+                schedule[covered] = (s, phase)
+            masks.append(mask)
+            covered += n
         self._cache[key] = (masks, schedule)
         return self._cache[key]
 

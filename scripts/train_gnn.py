@@ -222,7 +222,7 @@ def main():
     # codec pays. The interp baseline is model-independent -> compute it once and
     # draw it as a reference line.
     eval_x, (eh, ew) = load_eval_plane(args.eval_image, device)
-    eval_masks = stage_masks(eh, ew, 4, 16, anchor_block=4)
+    eval_masks = stage_masks(eh, ew, 4, 16, anchor_block=1)
 
     be, bn = interp_eval(eval_x, eval_masks, args.eval_eb, args.baseline)
     baseline_mae = be / max(bn, 1)
@@ -240,7 +240,7 @@ def main():
         x = sample_batch(paths, args.batch, args.crop).to(device)  # (B, N) truth
         levels = random.choice((3, 4, 5))
         stride = random.choice((8, 16, 32))
-        masks = stage_masks(args.crop, args.crop, levels, stride, anchor_block=4)
+        masks = stage_masks(args.crop, args.crop, levels, stride, anchor_block=1)
 
         def reveal(kv, posf):
             noise = (torch.rand_like(x) * 2 - 1) * args.noise

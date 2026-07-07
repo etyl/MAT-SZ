@@ -14,7 +14,7 @@ from matsz.levels import stage_masks
 ])
 def test_partition(h, w, levels, stride, block):
     masks = stage_masks(h, w, levels, stride, block)
-    assert len(masks) == levels + 1
+    assert len(masks) == 1 + 3 * levels  # anchor + h/v/d per dyadic level
     total = np.zeros((h, w), int)
     for m in masks:
         total += m.astype(int)
