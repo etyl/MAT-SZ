@@ -132,8 +132,9 @@ def run_stages(model, x, masks, reveal, d, max_radius, device, eb=None):
         if not pos.any():
             continue
         posf = maskf(pos, device)
+        pidx = posf.nonzero(as_tuple=True)[0]  # only the holes are read below
         pred, E = stage_forward(model, E, prev, known, known_vals,
-                                max_radius, torch)
+                                max_radius, torch, predict_idx=pidx)
         tgt = x[:, posf]
         abs_err = abs_err + (pred[:, posf] - tgt).abs().sum()
         npix += tgt.numel()
@@ -191,6 +192,9 @@ def main():
                     default="online", help="wandb logging mode")
     ap.add_argument("--wandb-project", default="gnn-sz")
     ap.add_argument("--run-name", default=None)
+    ap.add_argument("--profile", type=int, default=0,
+                    help="profile this many steps with torch.profiler, print "
+                         "the op table + write trace.json, then exit")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -235,6 +239,20 @@ def main():
 
     run_loss = 0.0
     last_eval = float("nan")
+
+    prof = None
+    if args.profile:
+        acts = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == "cuda":
+            acts.append(torch.profiler.ProfilerActivity.CUDA)
+        prof = torch.profiler.profile(
+            activities=acts,
+            schedule=torch.profiler.schedule(wait=1, warmup=1,
+                                             active=args.profile),
+            record_shapes=True, with_stack=True)
+        prof.start()
+        args.steps = args.profile + 2  # wait + warmup + active
+
     bar = tqdm(range(1, args.steps + 1), desc="train")
     for step in bar:
         x = sample_batch(paths, args.batch, args.crop).to(device)  # (B, N) truth
@@ -283,6 +301,18 @@ def main():
             bar.set_postfix(mae=f"{run_loss / 100:.5f}",
                             eval=f"{last_eval:.5f}")
             run_loss = 0.0
+
+        if prof is not None:
+            prof.step()
+
+    if prof is not None:
+        prof.stop()
+        sort_key = ("cuda_time_total" if device.type == "cuda"
+                    else "cpu_time_total")
+        print(prof.key_averages().table(sort_by=sort_key, row_limit=25))
+        prof.export_chrome_trace("trace.json")
+        print("wrote trace.json (open in chrome://tracing or perfetto.dev)")
+        return
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=gnn-sz
-#SBATCH --qos=qos_gpu-t3
-#SBATCH --time=8:00:00
+#SBATCH --job-name=gnn-prof
+#SBATCH --qos=qos_gpu-dev
+#SBATCH --time=0:20:00
 #SBATCH --partition=gpu_p13
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -17,17 +17,12 @@ module load pytorch-gpu
 python scripts/train_gnn.py \
     --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
     --out data/gnn_predictor.pt \
-    --steps 10000 \
-    --batch 4 \
+    --batch 2 \
     --crop 128 \
-    --d 64 \
-    --lr 0.0001 \
-    --eval-every 100 \
-    --img-every 500 \
+    --d 32 \
     --device cuda \
-    --wandb-mode offline \
-    --run-name gnn-sz \
+    --wandb-mode disabled \
+    --profile 1 \
     "$@"
 
-# checkpoint  -> data/gnn_predictor.pt
-# loss curve  -> data/gnn_predictor.csv (+ .png if matplotlib is installed)
+# op table -> job log; chrome trace -> trace.json (open in perfetto.dev)

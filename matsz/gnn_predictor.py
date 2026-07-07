@@ -114,6 +114,24 @@ class _Geometry:
             })
 
 
+_GEOM_CACHE: dict = {}
+
+
+def _geometry(known: np.ndarray, max_radius: int, torch, device=None):
+    """Cached _Geometry. Neighbour geometry is a pure function of (known,
+    max_radius), and both training and the codec reuse a small set of
+    deterministic masks (per stage schedule), so the expensive numpy line-scan
+    runs once per distinct mask instead of twice per stage per step.
+    ponytail: unbounded dict, bounded in practice (a few dozen masks); add an
+    LRU cap if a caller ever feeds unboundedly many distinct masks."""
+    key = (known.shape, known.tobytes(), max_radius, str(device))
+    g = _GEOM_CACHE.get(key)
+    if g is None:
+        g = _Geometry(known, max_radius, torch, device)
+        _GEOM_CACHE[key] = g
+    return g
+
+
 def _mlp(torch, sizes):
     import torch.nn as nn
     layers = []
@@ -208,35 +226,46 @@ def build_model(d: int = 32):
             self.head = PredHead()
             self.mix = MixEmbed()
 
-        def _line_messages(self, E, geom: _Geometry):
+        def _line_messages(self, E, geom: _Geometry, idx=None):
             """Per-line messages built from neighbour *embeddings* E (not raw
             values), so trends/periodicity propagate hop by hop. Returns
-            msgs (L, B, N, d) and valid (L, N)."""
-            B, N, _ = E.shape
-            one = torch.ones(B, N, 1, device=E.device)
+            msgs (L, B, M, d) and valid (L, M), where M is the number of query
+            points: all N, or the subset `idx` when given. Messages gather each
+            query's neighbours out of the *full* field E and are computed
+            independently per point, so a subset is bit-identical to the same
+            rows of the full-grid result."""
+            B = E.shape[0]
+            M = E.shape[1] if idx is None else idx.shape[0]
+            one = torch.ones(B, M, 1, device=E.device)
             msgs, valids = [], []
             for ln in geom.lines:
-                ep = E[:, ln["ip"]]                # (B, N, d) +side neighbour
-                en = E[:, ln["in"]]                # -side neighbour
-                lp = torch.log2(ln["dp"]).view(1, N, 1).expand(B, N, 1)
-                lnn = torch.log2(ln["dn"]).view(1, N, 1).expand(B, N, 1)
+                ip, in_, dp, dn = ln["ip"], ln["in"], ln["dp"], ln["dn"]
+                vp, vn = ln["vp"], ln["vn"]
+                if idx is not None:
+                    ip, in_, dp, dn = ip[idx], in_[idx], dp[idx], dn[idx]
+                    vp, vn = vp[idx], vn[idx]
+                ep = E[:, ip]                      # (B, M, d) +side neighbour
+                en = E[:, in_]                     # -side neighbour
+                lp = torch.log2(dp).view(1, M, 1).expand(B, M, 1)
+                lnn = torch.log2(dn).view(1, M, 1).expand(B, M, 1)
                 bidir = self.bidir(en, ep, lnn, lp)
                 dpos = self.dir(ep, one, lp)
                 dneg = self.dir(en, -one, lnn)
-                both = (ln["vp"] & ln["vn"]).view(1, N, 1)
-                vp_only = (ln["vp"] & ~ln["vn"]).view(1, N, 1)
+                both = (vp & vn).view(1, M, 1)
+                vp_only = (vp & ~vn).view(1, M, 1)
                 msg = torch.where(both, bidir, torch.where(vp_only, dpos, dneg))
                 msgs.append(msg)
-                valids.append(ln["vp"] | ln["vn"])  # (N,)
+                valids.append(vp | vn)             # (M,)
             return torch.stack(msgs, 0), torch.stack(valids, 0)
 
-        def embed(self, E, geom):
-            """Pooled *context* embedding for every point: single-query
-            attention over the per-line neighbour messages (no self value).
-            For an anchor with no known neighbours every line message is masked
-            out and the pool falls back to the learned null token."""
-            msgs, valid = self._line_messages(E, geom)
-            return self.attn(msgs, valid)                        # (B, N, d)
+        def embed(self, E, geom, idx=None):
+            """Pooled *context* embedding for the query points (all N, or the
+            subset `idx`): single-query attention over the per-line neighbour
+            messages (no self value). For an anchor with no known neighbours
+            every line message is masked out and the pool falls back to the
+            learned null token."""
+            msgs, valid = self._line_messages(E, geom, idx)
+            return self.attn(msgs, valid)                        # (B, M, d)
 
         def finalize(self, ctx, self_val):
             """Finalized embedding for points whose value has just been
@@ -253,7 +282,8 @@ def build_model(d: int = 32):
     return GNN()
 
 
-def stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch):
+def stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch,
+                  predict_idx=None):
     """One codec stage of the propagating GNN, shared by encoder, decoder and
     trainer so all three evolve the embedding field identically.
 
@@ -261,21 +291,31 @@ def stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch):
     grids of what was known before / is known now (known_mask >= prev_mask;
     the current stage's targets are NOT yet in known_mask, matching the codec).
     norm: (B, N) normalized values (only entries under known_mask are read).
-    Returns (values (B, N), E_new (B, N, d))."""
-    # ponytail: each call rebuilds both geometries and embeds all N points
-    # (finalize uses only `newly`); fine on real HW, subset the gather if the
-    # python-loop scan becomes the bottleneck on large grids.
+    Returns (values (B, N), E_new (B, N, d)).
+
+    Both embeds run over only the query points whose output is used: `finalize`
+    writes just the newly-revealed points, so its context is embedded there; the
+    prediction head is embedded at `predict_idx` (the stage's holes) when given,
+    leaving the rest of `values` zero. embed is pointwise across query points, so
+    this is bit-identical to the full grid at every position anyone reads. The
+    codec passes predict_idx=None to get a full-grid prediction."""
     device = E.device
     N = known_mask.size
     newly = known_mask & ~prev_mask                 # revealed since last stage
     if newly.any():
-        geom_prev = _Geometry(prev_mask, max_radius, torch, device)
-        sv = torch.from_numpy(newly.reshape(-1)).to(device)
-        ctx = model.embed(E, geom_prev)             # context from the prev mask
-        finalized = model.finalize(ctx, norm)       # fuse with their own value
-        E = torch.where(sv.view(1, N, 1), finalized, E)
-    geom = _Geometry(known_mask, max_radius, torch, device)
-    values = model.head_of(model.embed(E, geom))    # predict every point
+        geom_prev = _geometry(prev_mask, max_radius, torch, device)
+        idx = torch.from_numpy(np.nonzero(newly.reshape(-1))[0]).to(device)
+        ctx = model.embed(E, geom_prev, idx)        # context from the prev mask
+        finalized = model.finalize(ctx, norm[:, idx])  # fuse with their own value
+        E = E.clone()
+        E[:, idx] = finalized
+    geom = _geometry(known_mask, max_radius, torch, device)
+    if predict_idx is None:
+        values = model.head_of(model.embed(E, geom))       # predict every point
+    else:
+        sub = model.head_of(model.embed(E, geom, predict_idx))  # (B, M)
+        values = torch.zeros(E.shape[0], N, device=device, dtype=sub.dtype)
+        values[:, predict_idx] = sub
     return values, E
 
 
