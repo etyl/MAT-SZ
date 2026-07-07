@@ -74,15 +74,14 @@ class InterpPredictor:
     quantizer + Huffman/zstd stage, matching SZ3's own pipeline). Torch- and
     checkpoint-free, so streams decode without a model.
 
-    Each dyadic level is split into three codec sub-stages, run antidiagonally
-    so every stage predicts from the maximum of already-reconstructed priors:
-    horizontal midpoints (interpolate along x), then vertical midpoints (along
-    y), then the diagonal centers. Because they are separate stages the codec
-    quantizes each into ``recon`` before the next reads it — SZ3's interleaved
-    quantize/predict order. By the time the centers run, both their vertical
-    neighbours (h-midpoints) and horizontal neighbours (v-midpoints) are
-    reconstructed, so a center predicts from 4 reconstructed priors (averaged
-    x/y interpolation) instead of the 2 it would see in a single y-pass. The
+    Each dyadic level is split into codec sub-stages ordered by how many axes a
+    point straddles as a midpoint (``levels.stage_plan``): the one-odd-axis
+    edge-midpoints first, then the multi-odd-axis centres. Because they are
+    separate stages the codec quantizes each into ``recon`` before the next
+    reads it — SZ3's interleaved quantize/predict order — so a point's ±stride
+    neighbours along each of its odd axes are already reconstructed, and it is
+    predicted by averaging the single-axis interpolation over exactly those
+    axes (2 neighbours for an edge-midpoint, 4 for a 2-D cell centre). The
     predictor supplies its own ``stage_masks``; the decoder rebuilds the
     identical schedule from the header dims alone.
 
@@ -103,48 +102,45 @@ class InterpPredictor:
         self.anchor_block = anchor_block
         self.stream_flag = FLAG_INTERP | (FLAG_CUBIC if order == "cubic" else 0)
         self.checkpoint_hash = b"\0" * 16
-        self._cache: dict[tuple[int, int], tuple[list, dict]] = {}
+        self._cache: dict[tuple[int, ...], tuple[list, dict]] = {}
 
-    def _build(self, h: int, w: int) -> tuple[list, dict]:
-        """Return (masks, schedule) for an (h, w) region, from the shared
-        ``levels.stage_plan`` (so the GNN codec/trainer use the identical
-        schedule). ``masks`` is the split stage list [anchor, l1-h, l1-v, l1-d,
-        l2-h, ...]; ``schedule`` maps |known so far| -> (stride, phase) so
-        ``predict`` knows which sub-pass to run. Cached per shape."""
-        key = (h, w)
+    def _build(self, shape: tuple[int, ...]) -> tuple[list, dict]:
+        """Return (masks, schedule) for a region of the given spatial shape,
+        from the shared ``levels.stage_plan`` (so the GNN codec/trainer use the
+        identical schedule). ``masks`` is the per-axis split stage list [anchor,
+        l1-axis0, l1-axis1, ..., l2-axis0, ...]; ``schedule`` maps |known so far|
+        -> (stride, axis) so ``predict`` knows which axis to interpolate along.
+        Cached per shape."""
+        key = tuple(int(n) for n in shape)
         if key in self._cache:
             return self._cache[key]
         masks: list = []
-        schedule: dict[int, tuple[int, str]] = {}
+        schedule: dict[int, tuple[int, tuple[int, ...]]] = {}
         covered = 0
-        for mask, s, phase in stage_plan(h, w, self.levels, self.anchor_stride,
-                                         self.anchor_block):
+        for mask, s, axes in stage_plan(key, self.levels, self.anchor_stride,
+                                        self.anchor_block):
             n = int(mask.sum())
-            if phase != "anchor" and n:  # predict() is keyed by prior |known|
-                schedule[covered] = (s, phase)
+            if axes and n:  # non-anchor sub-stage; predict() is keyed by prior |known|
+                schedule[covered] = (s, axes)
             masks.append(mask)
             covered += n
         self._cache[key] = (masks, schedule)
         return self._cache[key]
 
-    def stage_masks(self, h, w, levels, anchor_stride, anchor_block) -> list:
-        return self._build(h, w)[0]
+    def stage_masks(self, shape, levels, anchor_stride, anchor_block) -> list:
+        return self._build(shape)[0]
 
     def predict(self, recon: np.ndarray, known: np.ndarray) -> np.ndarray:
-        _, h, w = recon.shape
-        entry = self._build(h, w)[1].get(int(known.sum()))
+        entry = self._build(recon.shape[1:])[1].get(int(known.sum()))
         if entry is None:
             raise ValueError("known mask does not match the interp schedule")
-        s, phase = entry
+        s, axes = entry
         W = recon.astype(np.float64)
-        # 'h': horizontal midpoints from coarse columns (along x, axis 2).
-        # 'v': vertical midpoints from coarse rows (along y, axis 1).
-        # 'd': diagonal centers — average the x and y interpolations; both axes
-        # read midpoints already reconstructed this level (4 priors, not 2).
-        if phase == "d":
-            out = 0.5 * (_interp_axis(W, 1, s, self.order)
-                         + _interp_axis(W, 2, s, self.order))
-        else:
-            out = _interp_axis(W, 2 if phase == "h" else 1, s, self.order)
+        # Average the single-axis interpolation over each odd axis of this
+        # sub-stage (array axes offset by the leading channel dim). Every
+        # ±stride neighbour on those lines was reconstructed in an earlier,
+        # lower-weight sub-stage of the same level, so an edge-midpoint reads 2
+        # priors and a 2-D centre reads 4.
+        out = sum(_interp_axis(W, a + 1, s, self.order) for a in axes) / len(axes)
         return out.astype(np.float32)
 

@@ -71,7 +71,7 @@ def compress(
     mh, mw = (ch, cw) if notile else (th, tw)
     # interp supplies its own sub-pass split; others use the plain dyadic schedule
     make_masks = getattr(predictor, "stage_masks", stage_masks)
-    masks = make_masks(mh, mw, levels, anchor_stride, anchor_block)
+    masks = make_masks((mh, mw), levels, anchor_stride, anchor_block)
     flags = getattr(predictor, "stream_flag", 0) | (FLAG_GRAY if c == 1 else 0)
     flags |= FLAG_NOTILE if notile else 0
     round_output = np.issubdtype(np.dtype(img.dtype), np.integer)
@@ -129,7 +129,7 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
     else:
         step_h = step_w = header.tile_size
     make_masks = getattr(predictor, "stage_masks", stage_masks)
-    masks = make_masks(step_h, step_w, header.levels, header.anchor_stride,
+    masks = make_masks((step_h, step_w), header.levels, header.anchor_stride,
                        header.anchor_block)
     canvas = np.empty((header.channels, ty * step_h, tx * step_w), np.float32)
     for idx, payload in enumerate(payloads):

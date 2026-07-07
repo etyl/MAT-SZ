@@ -16,10 +16,15 @@ stage schedule, which progressively densifies `known`):
   * embed each neighbour value (InitEmbed), turn a two-sided pair into a
     trend/curvature message (BiDirEmbed) or a one-sided neighbour into an
     extrapolation message (DirEmbed);
-  * pool the per-line messages with a single-query attention layer (AttnPool),
-    then read out the value (PredHead).
+  * pool the per-line messages with a single-query attention layer (AttnPool)
+    into a *context* embedding, then read out the value (PredHead);
+  * once a point's own value is revealed — known, but carrying the small error
+    left by residual coding — embed it with InitEmbed and fuse it into the
+    pooled context with MixEmbed to form that point's finalized embedding (the
+    one stored in the propagating field). In training the revealed value is the
+    truth plus noise, so MixEmbed learns to trust it only up to that error.
 
-The five modules are exposed as separate nn.Modules as requested.
+The six modules are exposed as separate nn.Modules as requested.
 """
 
 from __future__ import annotations
@@ -178,6 +183,20 @@ def build_model(d: int = 32):
         def forward(self, e):
             return torch.sigmoid(self.net(e)).squeeze(-1)  # (..,) in [0,1]
 
+    class MixEmbed(nn.Module):
+        """Fuse a point's pooled neighbour context with the embedding of its
+        own now-known value into the finalized embedding stored in the field.
+        The value carries the small residual-coding error (noise in training),
+        so this lets the field remember what was actually reconstructed there
+        rather than the raw prediction."""
+
+        def __init__(self):
+            super().__init__()
+            self.net = _mlp(torch, [2 * d, d, d])
+
+        def forward(self, ctx, value_emb):  # (B, N, d), (B, N, d) -> (B, N, d)
+            return self.net(torch.cat([ctx, value_emb], dim=-1))
+
     class GNN(nn.Module):
         def __init__(self):
             super().__init__()
@@ -187,6 +206,7 @@ def build_model(d: int = 32):
             self.bidir = BiDirEmbed()
             self.attn = AttnPool()
             self.head = PredHead()
+            self.mix = MixEmbed()
 
         def _line_messages(self, E, geom: _Geometry):
             """Per-line messages built from neighbour *embeddings* E (not raw
@@ -210,18 +230,22 @@ def build_model(d: int = 32):
                 valids.append(ln["vp"] | ln["vn"])  # (N,)
             return torch.stack(msgs, 0), torch.stack(valids, 0)
 
-        def embed(self, E, geom, self_val=None, self_valid=None):
-            """Pooled embedding for every point: attention over the line
-            messages plus, for points whose own value is known,
-            InitEmbed(self_val). For an anchor (no neighbours) that lone init
-            message is de facto the embedding."""
+        def embed(self, E, geom):
+            """Pooled *context* embedding for every point: single-query
+            attention over the per-line neighbour messages (no self value).
+            For an anchor with no known neighbours every line message is masked
+            out and the pool falls back to the learned null token."""
             msgs, valid = self._line_messages(E, geom)
-            if self_val is not None:
-                _, N = self_val.shape
-                init_msg = self.init(self_val.unsqueeze(-1))     # (B, N, d)
-                msgs = torch.cat([msgs, init_msg[None]], 0)
-                valid = torch.cat([valid, self_valid.view(1, N)], 0)
             return self.attn(msgs, valid)                        # (B, N, d)
+
+        def finalize(self, ctx, self_val):
+            """Finalized embedding for points whose value has just been
+            revealed: embed the (noisy) known value with InitEmbed and fuse it
+            with the pooled context via MixEmbed. `self_val` is the
+            reconstructed value — truth + noise in training, the quantised
+            recon at inference — so the mix learns to trust it up to eb."""
+            value_emb = self.init(self_val.unsqueeze(-1))        # (B, N, d)
+            return self.mix(ctx, value_emb)                      # (B, N, d)
 
         def head_of(self, pooled):
             return self.head(pooled)                             # (B, N)
@@ -247,8 +271,9 @@ def stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch):
     if newly.any():
         geom_prev = _Geometry(prev_mask, max_radius, torch, device)
         sv = torch.from_numpy(newly.reshape(-1)).to(device)
-        pooled = model.embed(E, geom_prev, norm, sv)
-        E = torch.where(sv.view(1, N, 1), pooled, E)  # finalize their embeddings
+        ctx = model.embed(E, geom_prev)             # context from the prev mask
+        finalized = model.finalize(ctx, norm)       # fuse with their own value
+        E = torch.where(sv.view(1, N, 1), finalized, E)
     geom = _Geometry(known_mask, max_radius, torch, device)
     values = model.head_of(model.embed(E, geom))    # predict every point
     return values, E
