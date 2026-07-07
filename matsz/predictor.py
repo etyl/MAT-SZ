@@ -73,14 +73,17 @@ class InterpPredictor:
     quantizer + Huffman/zstd stage, matching SZ3's own pipeline). Torch- and
     checkpoint-free, so streams decode without a model.
 
-    Each dyadic level is split into two codec sub-stages: first the horizontal
-    midpoints (interpolate along x on the even rows), then the vertical and
-    diagonal midpoints (along y). Because they are separate stages, the codec
-    quantizes the horizontal midpoints into ``recon`` before the diagonals read
-    them — SZ3's interleaved quantize/predict order, so the diagonals predict
-    from *reconstructed* neighbours, not predicted ones. The predictor supplies
-    its own ``stage_masks`` for this split; the decoder rebuilds the identical
-    schedule from the header dims alone.
+    Each dyadic level is split into three codec sub-stages, run antidiagonally
+    so every stage predicts from the maximum of already-reconstructed priors:
+    horizontal midpoints (interpolate along x), then vertical midpoints (along
+    y), then the diagonal centers. Because they are separate stages the codec
+    quantizes each into ``recon`` before the next reads it — SZ3's interleaved
+    quantize/predict order. By the time the centers run, both their vertical
+    neighbours (h-midpoints) and horizontal neighbours (v-midpoints) are
+    reconstructed, so a center predicts from 4 reconstructed priors (averaged
+    x/y interpolation) instead of the 2 it would see in a single y-pass. The
+    predictor supplies its own ``stage_masks``; the decoder rebuilds the
+    identical schedule from the header dims alone.
 
     Tile-free: SZ3's interpolation has no fixed input size (unlike MAT), so the
     codec runs it over the whole image as a single region — no padding, no
@@ -103,9 +106,9 @@ class InterpPredictor:
 
     def _build(self, h: int, w: int) -> tuple[list, dict]:
         """Return (masks, schedule) for an (h, w) region. ``masks`` is the split
-        stage list [anchor, lvl1-horizontal, lvl1-vert/diag, lvl2-h, ...];
-        ``schedule`` maps |known so far| -> (stride, phase) so ``predict`` knows
-        which sub-pass to run. Cached per shape (the codec reuses one region)."""
+        stage list [anchor, lvl1-h, lvl1-v, lvl1-d, lvl2-h, ...]; ``schedule``
+        maps |known so far| -> (stride, phase) so ``predict`` knows which
+        sub-pass to run. Cached per shape (the codec reuses one region)."""
         key = (h, w)
         if key in self._cache:
             return self._cache[key]
@@ -125,10 +128,11 @@ class InterpPredictor:
             coarse_w = (iw % (2 * s)) == 0
             mid_w = ((iw % s) == 0) & ~coarse_w
             m_h = (coarse_h[:, None] & mid_w[None, :]) & ~covered    # horizontal
-            m_vd = (mid_h[:, None] & (((iw % s) == 0)[None, :])) & ~covered  # vert+diag
+            m_v = (mid_h[:, None] & coarse_w[None, :]) & ~covered    # vertical
+            m_d = (mid_h[:, None] & mid_w[None, :]) & ~covered        # diagonal
             if k == self.levels:  # last level: absorb any remainder (small tiles)
-                m_vd |= ~covered & ~m_h
-            for mask, phase in ((m_h, "h"), (m_vd, "vd")):
+                m_d |= ~covered & ~m_h & ~m_v
+            for mask, phase in ((m_h, "h"), (m_v, "v"), (m_d, "d")):
                 if mask.any():
                     schedule[int(covered.sum())] = (s, phase)
                 masks.append(mask)
@@ -146,9 +150,14 @@ class InterpPredictor:
             raise ValueError("known mask does not match the interp schedule")
         s, phase = entry
         W = recon.astype(np.float64)
-        # 'h': horizontal midpoints from known coarse columns (along x, axis 2).
-        # 'vd': vertical + diagonal midpoints along y (axis 1); the diagonals read
-        # the horizontal midpoints already reconstructed into `recon` this level.
-        axis = 2 if phase == "h" else 1
-        return _interp_axis(W, axis, s, self.order).astype(np.float32)
+        # 'h': horizontal midpoints from coarse columns (along x, axis 2).
+        # 'v': vertical midpoints from coarse rows (along y, axis 1).
+        # 'd': diagonal centers — average the x and y interpolations; both axes
+        # read midpoints already reconstructed this level (4 priors, not 2).
+        if phase == "d":
+            out = 0.5 * (_interp_axis(W, 1, s, self.order)
+                         + _interp_axis(W, 2, s, self.order))
+        else:
+            out = _interp_axis(W, 2 if phase == "h" else 1, s, self.order)
+        return out.astype(np.float32)
 
