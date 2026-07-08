@@ -54,7 +54,9 @@ def build_predictor(args, header: Header):
         raise ValueError("stream needs a predictor factory the CLI can't build")
     from .gnn_predictor import GNNPredictor
     pred = GNNPredictor(args.gnn_checkpoint, header.vmin, header.vmax,
-                        tile_size=header.tile_size)
+                        tile_size=header.tile_size, levels=header.levels,
+                        anchor_stride=header.anchor_stride,
+                        anchor_block=header.anchor_block)
     if pred.checkpoint_hash != header.ckpt_hash:
         print("warning: checkpoint hash differs from the one used to compress; "
               "decoded output may violate the error bound", file=sys.stderr)
@@ -72,6 +74,13 @@ def add_common(ap):
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--zstd-level", type=int, default=9)
+    ap.add_argument("--eb-ratio", type=float, default=None,
+                    help="per-level eb decay; omit to use --tune")
+    ap.add_argument("--tune", choices=("fast", "size", "rd"), default="fast",
+                    help="auto search when --eb-ratio is omitted")
+    ap.add_argument("--tune-size-slack", type=float, default=1.05,
+                    help="for --tune rd, may spend up to this size factor for "
+                         "lower reconstruction SSE")
     ap.add_argument("--predictor",
                     choices=("mock", "gnn", "interp", "interp-linear"),
                     default="interp",
@@ -102,11 +111,17 @@ def run_compress(img: np.ndarray, args) -> tuple[bytes, dict]:
     else:  # gnn
         from .gnn_predictor import GNNPredictor
         predictor = GNNPredictor(args.gnn_checkpoint, float(img.min()),
-                                 float(img.max()), tile_size=tile)
+                                 float(img.max()), tile_size=tile,
+                                 levels=args.levels,
+                                 anchor_stride=args.anchor_stride,
+                                 anchor_block=args.anchor_block)
     return compress(img, eb, predictor, levels=args.levels,
                     anchor_stride=args.anchor_stride,
                     anchor_block=args.anchor_block, radius=args.radius,
                     seed=args.seed, zstd_level=args.zstd_level,
+                    eb_ratio=args.eb_ratio,
+                    tune=args.tune,
+                    tune_size_slack=args.tune_size_slack,
                     verbose=args.verbose)
 
 

@@ -101,6 +101,27 @@ def stage_masks(
     return [mask for mask, _, _ in stage_plan(shape, levels, anchor_stride, anchor_block)]
 
 
+def known_counts(
+    shape: tuple[int, ...],
+    levels: int,
+    anchor_stride: int,
+    anchor_block: int = 1,
+) -> list[int]:
+    """Cumulative ``|known|`` *before* each stage (aligned with ``stage_plan``).
+
+    ``counts[s]`` = number of points revealed by stages ``0..s-1``. The codec
+    hands each predictor only the running ``known`` mask, so both interp and GNN
+    key their per-stage state on ``int(known.sum())``; this maps that count back
+    to the stage. Skips are handled by callers (empty stages get no predict
+    call), and non-empty stages have strictly increasing counts, so the map is
+    unambiguous over the stages that are actually predicted."""
+    counts, c = [], 0
+    for mask, _, _ in stage_plan(shape, levels, anchor_stride, anchor_block):
+        counts.append(c)
+        c += int(mask.sum())
+    return counts
+
+
 def stage_ebs(
     shape: tuple[int, ...],
     levels: int,

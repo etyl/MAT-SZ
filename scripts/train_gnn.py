@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from matsz.gnn_predictor import build_model, stage_forward
+from matsz.gnn_predictor import build_model, build_stage_geoms, stage_forward
 from matsz.levels import stage_masks
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".ppm", ".pgm"}
@@ -154,55 +154,58 @@ def residual_rgb(res):
     return cm.get_cmap("seismic")((res / m + 1) / 2)[..., :3]
 
 
-def maskf(m, device):  # flat bool mask on the given device
-    return torch.from_numpy(m.reshape(-1)).to(device)
-
-
-def run_stages(model, x, masks, reveal, d, max_radius, device, eb=None,
-               collect=False):
-    """Run the stage schedule over truth `x` (B, N); return (sum |pred - truth|,
+def run_stages(model, x, geoms, d, device, noise=0.0, eb=None, collect=False):
+    """Run the stage schedule over truth `x` (B, N) using precomputed per-stage
+    geometry `geoms` (from ``build_stage_geoms``); return (sum |pred - truth|,
     n_holes, known_vals, pred_only). Training passes `eb=None` and teacher-forces
-    via `reveal(kv, posf)` (noisy truth). Eval passes an error bound `eb`: the
-    fed-back known values are then the model's own linear-quantised
-    reconstructions (real closed-loop inference, matching the codec), so the
-    reported MAE is the prediction error the codec actually pays to encode.
+    with truth + `noise`. Eval passes an error bound `eb`: the fed-back known
+    values are then the model's own linear-quantised reconstructions (real
+    closed-loop inference, matching the codec), so the reported MAE is the
+    prediction error the codec actually pays to encode.
+
+    Mirrors the codec's evolution: at stage i we finalize the points revealed in
+    stage i-1 into the field, then predict stage i. The head context of stage i-1
+    equals the finalize context of stage i (same field, same geometry), so it is
+    fed back as `finalize_ctx` instead of being pooled twice.
 
     `collect` builds the per-pixel `pred_only` image (raw preds at the holes) for
     logging; it costs a scatter per stage and is only read when logging eval
     images, so training leaves it off and gets `pred_only=None`."""
-    E = torch.zeros(x.shape[0], x.shape[1], d, device=device)
-    m0 = maskf(masks[0], device)
+    B, N = x.shape
+    E = torch.zeros(B, N, d, device=device)
+    a0 = geoms[0].query_idx                      # anchors
+    known_vals = torch.full_like(x, 0.5)
+
+    def reveal(idx):  # teacher-force truth (+ training noise) at `idx`
+        nz = (torch.rand(B, idx.numel(), device=device) * 2 - 1) * noise
+        known_vals[:, idx] = (x[:, idx] + nz).clamp(0, 1)
+
     if eb is None:
-        known_vals = reveal(torch.full_like(x, 0.5), m0)
+        reveal(a0)
     else:  # anchors quantised against pred 0, like the codec's stage 0
-        known_vals = torch.where(m0, qz(torch.zeros_like(x), x, eb),
-                                 torch.full_like(x, 0.5))
-    prev = np.zeros(masks[0].shape, bool)
-    known = masks[0].copy()
+        known_vals[:, a0] = qz(torch.zeros(B, a0.numel(), device=device),
+                               x[:, a0], eb)
     # recon *without* residuals (raw preds at holes); only for image logging
     pred_only = known_vals.clone() if collect else None
 
     abs_err = torch.zeros(())
     npix = 0
-    for pos in masks[1:]:
-        if not pos.any():
-            continue
-        posf = maskf(pos, device)
-        pidx = posf.nonzero(as_tuple=True)[0]  # holes; pred comes back compact
-        pred, E = stage_forward(model, E, prev, known, known_vals,
-                                max_radius, torch, predict_idx=pidx)
-        tgt = x[:, pidx]
+    head_ctx = None
+    for i in range(1, len(geoms)):
+        gp, gh = geoms[i - 1], geoms[i]
+        pred, E, head_ctx = stage_forward(model, E, gp, gh,
+                                          known_vals[:, gp.query_idx], torch,
+                                          finalize_ctx=head_ctx)
+        idx = gh.query_idx
+        tgt = x[:, idx]
         abs_err = abs_err + (pred - tgt).abs().sum()
         npix += tgt.numel()
         if collect:
-            pred_only[:, pidx] = pred
-        prev = known.copy()
-        known = known | pos
+            pred_only[:, idx] = pred
         if eb is None:
-            known_vals = reveal(known_vals, posf)
+            reveal(idx)
         else:
-            known_vals = known_vals.clone()
-            known_vals[:, pidx] = qz(pred, tgt, eb)
+            known_vals[:, idx] = qz(pred, tgt, eb)
     # known_vals = full closed-loop recon; pred_only = same minus the quantised
     # residual added at each hole (residual = known_vals - pred_only).
     return abs_err, npix, known_vals, pred_only
@@ -301,7 +304,9 @@ def main():
     # codec pays. The interp baseline is model-independent -> compute it once and
     # draw it as a reference line.
     eval_x, (eh, ew) = load_eval_plane(args.eval_image, device)
-    eval_masks = stage_masks((eh, ew), 4, 16, anchor_block=1)
+    eval_masks = stage_masks((eh, ew), 4, 16, anchor_block=1)  # interp baseline
+    eval_geoms, _ = build_stage_geoms((eh, ew), 4, 16, 1, args.max_radius,
+                                      torch, device)
 
     be, bn = interp_eval(eval_x, eval_masks, args.eval_eb, args.baseline)
     baseline_mae = be / max(bn, 1)
@@ -338,17 +343,14 @@ def main():
         # on broken schedules (see levels.stage_plan's guard).
         stride = args.stride or random.choice((8, 16, 32))
         levels = args.levels or stride.bit_length() - 1
-        masks = stage_masks((args.crop, args.crop), levels, stride, anchor_block=1)
-
-        def reveal(kv, posf):
-            noise = (torch.rand_like(x) * 2 - 1) * args.noise
-            return torch.where(posf, (x + noise).clamp(0, 1), kv)
+        geoms, _ = build_stage_geoms((args.crop, args.crop), levels, stride, 1,
+                                     args.max_radius, torch, device)
 
         # pixel-weighted MAE: sum absolute error over every hole across all
         # stages, divide by total holes, so each pixel counts once (the dense
         # final stages dominate, matching the L1 the quantizer really pays).
-        abs_err, npix, _, _ = run_stages(model, x, masks, reveal, args.d,
-                                         args.max_radius, device)
+        abs_err, npix, _, _ = run_stages(model, x, geoms, args.d, device,
+                                         noise=args.noise)
         loss = abs_err / max(npix, 1)
         opt.zero_grad()
         loss.backward()
@@ -362,8 +364,8 @@ def main():
             model.eval()
             with torch.no_grad():
                 ae, en, recon, pred_only = run_stages(
-                    model, eval_x, eval_masks, None, args.d, args.max_radius,
-                    device, eb=args.eval_eb, collect=True)
+                    model, eval_x, eval_geoms, args.d, device,
+                    eb=args.eval_eb, collect=True)
             model.train()
             # eval runs the whole image (>>train crop); free its reserved pool
             # so the next train step doesn't OOM on the fragmented remainder.

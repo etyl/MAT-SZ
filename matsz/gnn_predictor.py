@@ -36,6 +36,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .levels import stage_masks
+
 # torch is imported lazily inside the class / model so that importing this
 # module (e.g. for FLAG constants) stays cheap.
 
@@ -49,6 +51,21 @@ def half_directions(ndim: int) -> list[tuple[int, ...]]:
         if first > 0:
             dirs.append(d)
     return dirs
+
+
+def _nearest_steps(pat: np.ndarray, dvec, P: int) -> np.ndarray:
+    """For each residue r in [0,P)^ndim, the smallest step t>=1 along ``dvec``
+    that lands on a True cell of the periodic pattern ``pat`` (period P), or 0
+    if none. The hit sequence along any lattice line is periodic in t with
+    period dividing P, so the global-nearest hit is the first one within [1,P]:
+    a t0(r)+kP tail never beats it. O(P^(ndim+1)) on the tiny period tile."""
+    grids = np.indices(pat.shape)                       # (ndim, P, ...)
+    t0 = np.zeros(pat.shape, np.int64)                  # 0 == no hit yet
+    for t in range(1, P + 1):
+        r = tuple((grids[k] + t * dvec[k]) % P for k in range(pat.ndim))
+        take = (t0 == 0) & pat[r]
+        t0[take] = t
+    return t0
 
 
 def _shift(arr: np.ndarray, offset, fill):
@@ -65,9 +82,7 @@ def _shift(arr: np.ndarray, offset, fill):
 
 
 def _nearest_in_dir(known: np.ndarray, flat: np.ndarray, dvec, max_radius: int):
-    """Nearest known sample stepping along +dvec. Returns (idx, dist, valid):
-    idx = flat index of that neighbour (0 where none), dist = step count,
-    valid = whether a neighbour was found within max_radius."""
+    """Nearest known sample stepping along +dvec. Returns (idx, dist, valid)."""
     found_idx = np.zeros(known.shape, np.int64)
     found_dist = np.ones(known.shape, np.float32)
     found = np.zeros(known.shape, bool)
@@ -86,50 +101,135 @@ def _nearest_in_dir(known: np.ndarray, flat: np.ndarray, dvec, max_radius: int):
     return found_idx, found_dist, found
 
 
-class _Geometry:
-    """Precomputed, param-free neighbour geometry for one `known` mask.
-    Holds per-line gather indices / distances / validity as torch tensors."""
+class _StageGeom:
+    """Neighbour geometry for one stage: the fixed set of ``M`` query points and,
+    per half-direction, the +/- side neighbour's flat index / step distance /
+    validity as torch tensors of length M. Query points only — no full-grid
+    tensors — so memory scales with the stage, not the image."""
 
-    def __init__(self, known: np.ndarray, max_radius: int, torch, device=None):
-        n = known.size
-        flat = np.arange(n, dtype=np.int64).reshape(known.shape)
-        self.shape = known.shape
-        self.lines = []
+    __slots__ = ("lines", "query_idx", "idx_np", "M")
 
-        def t(a):  # numpy -> torch on the target device (indices/masks/dists)
-            x = torch.from_numpy(a.reshape(-1))
+    def __init__(self, pat, query_coords, shape, max_radius, torch, device):
+        ndim = len(shape)
+        P = pat.shape[0]
+        shp = np.asarray(shape)
+        limit = min(max_radius, int(shp.max()))
+        Q = query_coords                                # (M, ndim)
+        self.M = int(len(Q))
+        self.idx_np = (np.ravel_multi_index([Q[:, k] for k in range(ndim)], shape)
+                       if self.M else np.zeros(0, np.int64))
+
+        def t(a):
+            x = torch.from_numpy(np.ascontiguousarray(a))
             return x.to(device) if device is not None else x
 
+        self.query_idx = t(self.idx_np.astype(np.int64))
+        res = tuple((Q[:, k] % P) for k in range(ndim)) if self.M else None
+        self.lines = []
+        for d in half_directions(ndim):
+            ln = {}
+            for side, sd in (("p", np.asarray(d)), ("n", -np.asarray(d))):
+                if not self.M:
+                    ln["i" + side] = t(np.zeros(0, np.int64))
+                    ln["d" + side] = t(np.zeros(0, np.float32))
+                    ln["v" + side] = t(np.zeros(0, bool))
+                    continue
+                step = _nearest_steps(pat, sd, P)[res]          # (M,) infinite-lattice
+                nb = Q + step[:, None] * sd                     # neighbour coords
+                inb = np.all((nb >= 0) & (nb < shp), axis=1)
+                valid = (step >= 1) & (step <= limit) & inb     # legacy: in-bounds & <=limit
+                nbc = np.clip(nb, 0, shp - 1)
+                flat = np.ravel_multi_index([nbc[:, k] for k in range(ndim)], shape)
+                # legacy defaults where no neighbour: idx 0, dist 1.0 (finite, so
+                # log2 stays defined; the pool masks these lines out via `valid`).
+                ln["i" + side] = t(np.where(valid, flat, 0).astype(np.int64))
+                ln["d" + side] = t(np.where(valid, step, 1).astype(np.float32))
+                ln["v" + side] = t(valid)
+            self.lines.append({"ip": ln["ip"], "in": ln["in"], "dp": ln["dp"],
+                               "dn": ln["dn"], "vp": ln["vp"], "vn": ln["vn"]})
+
+
+class _LegacyGeom:
+    """Mask-based geometry for the old stage_forward API. Slower than the
+    schedule-aware `_StageGeom`, but keeps older trainer/eval callers working."""
+
+    __slots__ = ("lines", "query_idx", "idx_np", "M")
+
+    def __init__(self, known, max_radius, torch, device=None, query_idx=None):
+        n = known.size
+        flat = np.arange(n, dtype=np.int64).reshape(known.shape)
+        if query_idx is None:
+            idx = np.arange(n, dtype=np.int64)
+        else:
+            idx = np.asarray(query_idx, np.int64).reshape(-1)
+        self.idx_np = idx
+        self.M = int(len(idx))
+
+        def t(a):
+            x = torch.from_numpy(np.ascontiguousarray(a.reshape(-1)))
+            return x.to(device) if device is not None else x
+
+        self.query_idx = t(idx.astype(np.int64))
+        self.lines = []
         for h in half_directions(known.ndim):
-            neg = tuple(-c for c in h)  # the -h side
+            neg = tuple(-c for c in h)
             ip, dp, vp = _nearest_in_dir(known, flat, h, max_radius)
             in_, dn, vn = _nearest_in_dir(known, flat, neg, max_radius)
             self.lines.append({
-                "ip": t(ip),
-                "in": t(in_),
-                "dp": t(dp),
-                "dn": t(dn),
-                "vp": t(vp),
-                "vn": t(vn),
+                "ip": t(ip.reshape(-1)[idx].astype(np.int64)),
+                "in": t(in_.reshape(-1)[idx].astype(np.int64)),
+                "dp": t(dp.reshape(-1)[idx].astype(np.float32)),
+                "dn": t(dn.reshape(-1)[idx].astype(np.float32)),
+                "vp": t(vp.reshape(-1)[idx]),
+                "vn": t(vn.reshape(-1)[idx]),
             })
+
+
+def _period_prefixes(shape, levels, stride, block):
+    """Periodic `known`-before-stage pattern for every stage, on one period tile
+    (P=stride). Because each schedule mask is a per-axis residue condition mod a
+    divisor of the anchor stride, the real `known` mask satisfies
+    ``known[idx] == pat[idx % P]``; evaluating the schedule on a P-sized grid
+    yields that period tile with no boundary truncation."""
+    P = stride
+    tile = (P,) * len(shape)
+    pats, cum = [], np.zeros(tile, bool)
+    for mask in stage_masks(tile, levels, stride, block):
+        pats.append(cum.copy())                         # known BEFORE this stage
+        cum |= mask
+    return pats
 
 
 _GEOM_CACHE: dict = {}
 
 
-def _geometry(known: np.ndarray, max_radius: int, torch, device=None):
-    """Cached _Geometry. Neighbour geometry is a pure function of (known,
-    max_radius), and both training and the codec reuse a small set of
-    deterministic masks (per stage schedule), so the expensive numpy line-scan
-    runs once per distinct mask instead of twice per stage per step.
-    ponytail: unbounded dict, bounded in practice (a few dozen masks); add an
-    LRU cap if a caller ever feeds unboundedly many distinct masks."""
-    key = (known.shape, known.tobytes(), max_radius, str(device))
-    g = _GEOM_CACHE.get(key)
-    if g is None:
-        g = _Geometry(known, max_radius, torch, device)
-        _GEOM_CACHE[key] = g
-    return g
+def build_stage_geoms(shape, levels, stride, block, max_radius, torch, device=None):
+    """Per-stage `_StageGeom` list (empty stages dropped) plus a
+    ``|known|-before-stage -> list index`` map, for the whole schedule of one
+    region shape. Closed-form lattice geometry, computed at the query points
+    only; cached per (shape, levels, stride, block, max_radius, device) and
+    shared by encoder tuning sweeps, decoder, and the trainer.
+
+    ponytail: unbounded cache, bounded in practice (a handful of shapes/configs);
+    add an LRU cap only if a caller feeds unboundedly many distinct configs."""
+    key = (tuple(int(n) for n in shape), levels, stride, block, max_radius, str(device))
+    hit = _GEOM_CACHE.get(key)
+    if hit is not None:
+        return hit
+    shape = tuple(int(n) for n in shape)
+    masks = stage_masks(shape, levels, stride, block)
+    pats = _period_prefixes(shape, levels, stride, block)
+    geoms, count_to_i, cum = [], {}, 0
+    for s, mask in enumerate(masks):
+        n = int(mask.sum())
+        if n:  # empty stages get no predict call; skipping keeps counts unique
+            Q = np.stack(np.nonzero(mask), axis=1)
+            count_to_i[cum] = len(geoms)
+            geoms.append(_StageGeom(pats[s], Q, shape, max_radius, torch, device))
+        cum += n
+    out = (geoms, count_to_i)
+    _GEOM_CACHE[key] = out
+    return out
 
 
 def _mlp(torch, sizes):
@@ -226,24 +326,20 @@ def build_model(d: int = 32):
             self.head = PredHead()
             self.mix = MixEmbed()
 
-        def _line_messages(self, E, geom: _Geometry, idx=None):
-            """Per-line messages built from neighbour *embeddings* E (not raw
-            values), so trends/periodicity propagate hop by hop. Returns
-            msgs (L, B, M, d) and valid (L, M), where M is the number of query
-            points: all N, or the subset `idx` when given. Messages gather each
-            query's neighbours out of the *full* field E and are computed
-            independently per point, so a subset is bit-identical to the same
-            rows of the full-grid result."""
+        def _line_messages(self, E, geom):
+            """Per-line messages for this stage's M query points, built from
+            neighbour *embeddings* E (not raw values) so trends/periodicity
+            propagate hop by hop. Returns msgs (L, B, M, d) and valid (L, M).
+            geom already holds the +/- neighbour of each query point (the codec
+            only ever consumes one stage's points), so this touches O(M) rows of
+            the field, never the whole grid."""
             B = E.shape[0]
-            M = E.shape[1] if idx is None else idx.shape[0]
+            M = geom.M
             one = torch.ones(B, M, 1, device=E.device)
             msgs, valids = [], []
             for ln in geom.lines:
                 ip, in_, dp, dn = ln["ip"], ln["in"], ln["dp"], ln["dn"]
                 vp, vn = ln["vp"], ln["vn"]
-                if idx is not None:
-                    ip, in_, dp, dn = ip[idx], in_[idx], dp[idx], dn[idx]
-                    vp, vn = vp[idx], vn[idx]
                 ep = E[:, ip]                      # (B, M, d) +side neighbour
                 en = E[:, in_]                     # -side neighbour
                 lp = torch.log2(dp).view(1, M, 1).expand(B, M, 1)
@@ -258,13 +354,12 @@ def build_model(d: int = 32):
                 valids.append(vp | vn)             # (M,)
             return torch.stack(msgs, 0), torch.stack(valids, 0)
 
-        def embed(self, E, geom, idx=None):
-            """Pooled *context* embedding for the query points (all N, or the
-            subset `idx`): single-query attention over the per-line neighbour
-            messages (no self value). For an anchor with no known neighbours
-            every line message is masked out and the pool falls back to the
-            learned null token."""
-            msgs, valid = self._line_messages(E, geom, idx)
+        def embed(self, E, geom):
+            """Pooled *context* embedding at geom's query points: single-query
+            attention over the per-line neighbour messages (no self value). For
+            an anchor with no known neighbours every line message is masked out
+            and the pool falls back to the learned null token."""
+            msgs, valid = self._line_messages(E, geom)
             return self.attn(msgs, valid)                        # (B, M, d)
 
         def finalize(self, ctx, self_val):
@@ -282,41 +377,65 @@ def build_model(d: int = 32):
     return GNN()
 
 
-def stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch,
-                  predict_idx=None):
-    """One codec stage of the propagating GNN, shared by encoder, decoder and
-    trainer so all three evolve the embedding field identically.
+def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
+                         finalize_ctx=None):
+    if geom_prev is not None and geom_prev.M:
+        ctx = finalize_ctx if finalize_ctx is not None else model.embed(E, geom_prev)
+        finalized = model.finalize(ctx, finalize_vals)          # fuse with own value
+        E = E.index_copy(1, geom_prev.query_idx, finalized)     # write newly-known
+    head_ctx = model.embed(E, geom_head)
+    return model.head_of(head_ctx), E, head_ctx
 
-    E: (B, N, d) field from earlier stages. prev_mask / known_mask: bool nd
-    grids of what was known before / is known now (known_mask >= prev_mask;
-    the current stage's targets are NOT yet in known_mask, matching the codec).
-    norm: (B, N) normalized values (only entries under known_mask are read).
-    Returns (values, E_new (B, N, d)); values is (B, N) when predict_idx is None
-    (the codec's full grid) or the compact (B, len(predict_idx)) predictions at
-    those points (the trainer's holes), in predict_idx order.
 
-    Both embeds run over only the query points whose output is used: `finalize`
-    writes just the newly-revealed points, so its context is embedded there; the
-    prediction head is embedded only at `predict_idx`. embed is pointwise across
-    query points, so this is float-equivalent to the full grid at every position
-    anyone reads (encoder and decoder run this same code, so they still agree
-    bitwise). Returning the compact predictions avoids a full-N scatter/gather."""
+def stage_forward(model, E, *args, **kwargs):
+    """One codec stage of the propagating GNN.
+
+    Supports both APIs:
+    - optimized geometry API:
+      ``stage_forward(model, E, geom_prev, geom_head, finalize_vals, torch,
+      finalize_ctx=None) -> (values, E, head_ctx)``
+    - legacy mask API:
+      ``stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch,
+      predict_idx=None) -> (values, E)``
+    """
+    if len(args) < 4:
+        raise TypeError("stage_forward needs either geometry or mask arguments")
+
+    # New path: geometry objects have `M` and `query_idx`; the codec/GNNPredictor
+    # uses this faster schedule-aware form.
+    if args[0] is None or hasattr(args[0], "M"):
+        geom_prev, geom_head, finalize_vals, torch = args[:4]
+        finalize_ctx = kwargs.pop("finalize_ctx", None)
+        if kwargs:
+            raise TypeError(f"unexpected keyword argument {next(iter(kwargs))!r}")
+        return _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals,
+                                    torch, finalize_ctx=finalize_ctx)
+
+    # Legacy path used by older training/eval code.
+    if len(args) < 5:
+        raise TypeError("legacy stage_forward needs max_radius and torch")
+    prev_mask, known_mask, norm, max_radius, torch = args[:5]
+    predict_idx = kwargs.pop("predict_idx", None)
+    if kwargs:
+        raise TypeError(f"unexpected keyword argument {next(iter(kwargs))!r}")
     device = E.device
-    newly = known_mask & ~prev_mask                 # revealed since last stage
+    newly = known_mask & ~prev_mask
     if newly.any():
-        geom_prev = _geometry(prev_mask, max_radius, torch, device)
-        idx = torch.from_numpy(np.nonzero(newly.reshape(-1))[0]).to(device)
-        ctx = model.embed(E, geom_prev, idx)        # context from the prev mask
-        finalized = model.finalize(ctx, norm[:, idx])  # fuse with their own value
-        E = E.index_copy(1, idx, finalized)         # write the newly-known field
-    geom = _geometry(known_mask, max_radius, torch, device)
-    values = model.head_of(model.embed(E, geom, predict_idx))
+        idx_np = np.nonzero(newly.reshape(-1))[0]
+        geom_prev = _LegacyGeom(prev_mask, max_radius, torch, device, idx_np)
+        ctx = model.embed(E, geom_prev)
+        finalized = model.finalize(ctx, norm[:, geom_prev.query_idx])
+        E = E.index_copy(1, geom_prev.query_idx, finalized)
+    geom_head = _LegacyGeom(known_mask, max_radius, torch, device, predict_idx)
+    values = model.head_of(model.embed(E, geom_head))
     return values, E
 
 
 class GNNPredictor:
-    """GNN predictor loaded from a trained checkpoint. `tile_size` defaults to
-    64; `max_radius` caps the neighbour search (anchors always sit closer)."""
+    """GNN predictor loaded from a trained checkpoint. The stage schedule
+    (`levels`, `anchor_stride`, `anchor_block`) must match the codec's, so the
+    precomputed neighbour geometry lines up with the masks the codec feeds in;
+    `max_radius` caps the neighbour distance (anchors always sit closer)."""
 
     from .bitstream import FLAG_GNN as _FLAG
     stream_flag = _FLAG
@@ -324,7 +443,8 @@ class GNNPredictor:
     tunable = True    # encoder sweeps eb_ratio (no centre mode; see codec.encode)
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
-                 tile_size: int = 64, max_radius: int = 64, device: str = "cpu"):
+                 tile_size: int = 64, max_radius: int = 64, device: str = "cpu",
+                 levels: int = 4, anchor_stride: int = 16, anchor_block: int = 1):
         import torch
 
         self._torch = torch
@@ -333,6 +453,9 @@ class GNNPredictor:
         self.vmax = float(vmax)
         self.tile_size = int(tile_size)
         self.max_radius = int(max_radius)
+        self.levels = int(levels)
+        self.anchor_stride = int(anchor_stride)
+        self.anchor_block = int(anchor_block)
 
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.d = ckpt["d"]
@@ -340,42 +463,58 @@ class GNNPredictor:
         self.model.load_state_dict(ckpt["state_dict"])
         self.checkpoint_hash = hashlib.sha256(
             Path(checkpoint_path).read_bytes()).digest()[:16]
-        self._E = None          # persistent embedding field (B, N, d)
-        self._prev = None       # bool nd mask known before the current call
+        self._sched: dict = {}   # shape -> (stage geoms, count->index map)
+        self._reset()
+
+    def _reset(self):
+        self._E = None           # persistent embedding field (C, N, d)
+        self._ctx = None         # last stage's head context (next finalize reuses it)
+        self._stage = None       # list index of the last predicted stage
+
+    def _schedule(self, shape):
+        key = tuple(int(n) for n in shape)
+        g = self._sched.get(key)
+        if g is None:
+            g = build_stage_geoms(key, self.levels, self.anchor_stride,
+                                  self.anchor_block, self.max_radius,
+                                  self._torch, self.device)
+            self._sched[key] = g
+        return g
 
     def predict(self, recon: np.ndarray, known: np.ndarray,
                pos: np.ndarray | None = None) -> np.ndarray:
-        """`pos`, when given, restricts the (expensive, whole-grid-shaped)
-        embed/pool/head pass to just those query points — the codec only ever
-        consumes the current stage's mask, so computing the other points'
-        embeddings every stage is pure waste, and on an untiled whole image
-        (large N) that waste is what blows the memory budget."""
+        """Predict the current stage's holes (`pos`, the codec's stage mask).
+        Everything scales with the stage: geometry is precomputed at the query
+        points only, values are normalized only at the just-revealed points, and
+        the finalize context is inherited from the previous stage's head (same
+        field, same geometry) instead of being pooled twice."""
         torch = self._torch
+        if pos is None:
+            raise ValueError("GNNPredictor.predict requires the stage mask `pos`")
         c = recon.shape[0]
         span = self.vmax - self.vmin
-        norm = (np.clip(recon, self.vmin, self.vmax) - self.vmin) / span
-        norm = np.where(known[None], norm, 0.5).astype(np.float32)
+        geoms, count_to_i = self._schedule(recon.shape[1:])
+        i = count_to_i.get(int(known.sum()))
+        if not i:  # None (unknown count) or 0 (anchors are coded directly)
+            raise ValueError("known mask does not match the GNN stage schedule")
 
-        # New tile / sequence: the field resets whenever `known` is not a strict
-        # superset of the previous call (e.g. the first, anchors-only stage).
-        cont = (self._prev is not None and self._prev.shape == known.shape
-                and known.sum() > self._prev.sum()
-                and bool((known & self._prev == self._prev).all()))
+        cont = self._E is not None and self._stage == i - 1
         if not cont:
             self._E = torch.zeros(c, known.size, self.d, device=self.device)
-            self._prev = np.zeros(known.shape, bool)
+            self._ctx = None
+        geom_prev, geom_head = geoms[i - 1], geoms[i]
 
-        x = torch.from_numpy(norm.reshape(c, -1)).to(self.device)
-        idx = None
-        if pos is not None:
-            idx = torch.from_numpy(np.nonzero(pos.reshape(-1))[0]).to(self.device)
+        # normalized values at the just-revealed points (finalize's input), read
+        # compactly from recon — no full (C, N) clip/scatter each stage.
+        vals = recon.reshape(c, -1)[:, geom_prev.idx_np]
+        fvals = torch.from_numpy(
+            ((np.clip(vals, self.vmin, self.vmax) - self.vmin) / span
+             ).astype(np.float32)).to(self.device)
+        finalize_ctx = self._ctx if cont else None
         with torch.no_grad():
-            values, self._E = stage_forward(self.model, self._E, self._prev,
-                                            known, x, self.max_radius, torch,
-                                            predict_idx=idx)
-        self._prev = known.copy()
-        if idx is None:
-            pred = values.cpu().numpy().reshape(recon.shape) * span + self.vmin
-        else:
-            pred = values.cpu().numpy().reshape(c, -1) * span + self.vmin
+            values, self._E, self._ctx = stage_forward(
+                self.model, self._E, geom_prev, geom_head, fvals, torch,
+                finalize_ctx=finalize_ctx)
+        self._stage = i
+        pred = values.cpu().numpy().reshape(c, -1) * span + self.vmin
         return np.clip(pred, self.vmin, self.vmax).astype(np.float32)

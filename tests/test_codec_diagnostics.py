@@ -25,6 +25,7 @@ def test_stage_diagnostics_account_for_total_float_distortion():
     rec = decompress(stream)
 
     assert rec.dtype == np.float32
+    assert np.array_equal(stats["recon"], rec)
     assert np.abs(img - rec).max() <= eb
     assert sum(stats["stage_codes"]) == img.size
     assert sum(stats["stage_outliers"]) == stats["outliers"]

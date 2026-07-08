@@ -25,7 +25,7 @@ FLAG_INTERP = 1 << 3       # SZ-style interpolation baseline (torch-free)
 FLAG_CUBIC = 1 << 4        # interp order: set = cubic, clear = linear
 FLAG_NOTILE = 1 << 5       # whole image is one tile (no padding, no seam)
 
-_HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHHf"
+_HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHHd"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 
 DTYPE_CODES = {0: np.uint8, 1: np.float32}

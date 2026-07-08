@@ -16,6 +16,8 @@ module load pytorch-gpu
 
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak}
 CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260708-112905-8b8203/gnn_predictor.pt}
+TUNE=${TUNE:-fast}                 # fast | size | rd
+TUNE_SIZE_SLACK=${TUNE_SIZE_SLACK:-1.05}
 
 python scripts/eval_predictors.py \
     --data "$DATA" \
@@ -25,6 +27,8 @@ python scripts/eval_predictors.py \
     --levels 6 \
     --anchor-stride 64 \
     --anchor-block 1 \
+    --tune "$TUNE" \
+    --tune-size-slack "$TUNE_SIZE_SLACK" \
     --device cuda \
     --csv eval.csv \
     --plot eval_rd.png \

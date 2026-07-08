@@ -49,7 +49,9 @@ def make_predictor(method: str, img: np.ndarray, args):
         from matsz.gnn_predictor import GNNPredictor
         return GNNPredictor(args.gnn_checkpoint, float(img.min()), float(img.max()),
                             tile_size=args.gnn_tile, max_radius=args.max_radius,
-                            device=args.device)
+                            device=args.device, levels=args.levels,
+                            anchor_stride=args.anchor_stride,
+                            anchor_block=args.anchor_block)
     order = "linear" if method == "interp-linear" else "cubic"
     return InterpPredictor(args.interp_tile, order, args.levels,
                            args.anchor_stride, args.anchor_block)
@@ -61,7 +63,9 @@ def build_predictor_for_decompress(method: str, hdr: Header, args):
         from matsz.gnn_predictor import GNNPredictor
         return GNNPredictor(args.gnn_checkpoint, hdr.vmin, hdr.vmax,
                             tile_size=hdr.tile_size, max_radius=args.max_radius,
-                            device=args.device)
+                            device=args.device, levels=hdr.levels,
+                            anchor_stride=hdr.anchor_stride,
+                            anchor_block=hdr.anchor_block)
     if hdr.flags & FLAG_MOCK:
         return MockPredictor(hdr.tile_size)
     return InterpPredictor(hdr.tile_size, "cubic" if hdr.flags & FLAG_CUBIC else "linear",
@@ -87,7 +91,9 @@ def eval_matsz(img: np.ndarray, eb: float, method: str, args) -> dict:
                          anchor_stride=args.anchor_stride,
                          anchor_block=args.anchor_block, radius=args.radius,
                          seed=args.seed, zstd_level=args.zstd_level,
-                         eb_ratio=args.eb_ratio)
+                         eb_ratio=args.eb_ratio,
+                         tune=args.tune,
+                         tune_size_slack=args.tune_size_slack)
     t_comp = time.time() - t0
     del pred  # drop the encoder-side embedding field before decode builds its own
     t0 = time.time()
@@ -232,7 +238,13 @@ def main():
     ap.add_argument("--zstd-level", type=int, default=9)
     ap.add_argument("--eb-ratio", type=float, default=None,
                     help="per-level eb decay (coarse tighter); default: interp "
-                         "auto-tunes it + centre mode, 1.0 forces flat classic SZ")
+                         "uses --tune, 1.0 forces flat classic SZ")
+    ap.add_argument("--tune", choices=("fast", "size", "rd"), default="fast",
+                    help="auto search when --eb-ratio is omitted: fast=one "
+                         "candidate, size=min bytes, rd=lowest SSE within slack")
+    ap.add_argument("--tune-size-slack", type=float, default=1.05,
+                    help="for --tune rd, choose the lowest-SSE candidate within "
+                         "this factor of the smallest stream")
     ap.add_argument("--gnn-tile", type=int, default=64,
                     help="tile size for the GNN predictor")
     ap.add_argument("--interp-tile", type=int, default=512,

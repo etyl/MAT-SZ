@@ -31,16 +31,18 @@ def compress(
     seed: int = 1234,
     zstd_level: int = 9,
     eb_ratio: float | None = None,
+    tune: str = "fast",
     tune_size_slack: float = 1.05,
     verbose: bool = False,
 ) -> tuple[bytes, dict]:
     """Compress an (H, W) or (H, W, C) array. Returns (stream bytes, stats).
 
     ``eb_ratio`` scales the per-level error bound (coarse levels tighter, see
-    ``levels.stage_ebs``): pass a value in (0, 1] to fix it. Leave ``None`` to
-    let a tunable predictor sweep ratio + centre mode and pick the lowest
-    reconstruction SSE among candidates within ``tune_size_slack`` of the
-    smallest compressed stream. 1.0 reproduces flat-eb classic SZ."""
+    ``levels.stage_ebs``): pass a value in (0, 1] to fix it. With ``eb_ratio``
+    omitted, ``tune`` controls the search: ``fast`` runs one candidate, ``size``
+    sweeps candidates and keeps the smallest stream, and ``rd`` keeps the
+    lowest reconstruction SSE within ``tune_size_slack`` of the smallest stream.
+    1.0 reproduces flat-eb classic SZ."""
     if img.ndim == 2:
         img = img[..., None]
     h, w, c = img.shape
@@ -117,18 +119,23 @@ def compress(
                       n_tiles_y=ty, n_tiles_x=tx, flags=flags,
                       interp_center=center, eb_ratio=ratio)
 
-    # Encoder-side tuning: sweep per-level eb ratio (coarse-error damping) and,
-    # for interp, centre-combine mode. The finest level always carries the full
-    # eb, so every candidate satisfies the bound. Choosing pure minimum size
-    # systematically leaves PSNR on the table; instead, among candidates within
-    # a small compressed-size slack of the smallest stream, keep the lowest SSE.
+    if tune not in ("fast", "size", "rd"):
+        raise ValueError("tune must be 'fast', 'size', or 'rd'")
+
+    # Encoder-side tuning: optionally sweep per-level eb ratio (coarse-error
+    # damping) and, for interp, centre-combine mode. The finest level always
+    # carries the full eb, so every candidate satisfies the bound.
     tunable = getattr(predictor, "tunable", False)
     has_center = hasattr(predictor, "center")
-    ratio_cands = [eb_ratio] if eb_ratio is not None else \
-        ([1.0, 0.9, 0.8, 0.7, 0.6, 0.5] if tunable else [1.0])
+    if eb_ratio is not None:
+        ratio_cands = [eb_ratio]
+    elif tunable and tune != "fast":
+        ratio_cands = [1.0, 0.9, 0.8, 0.7]
+    else:
+        ratio_cands = [1.0]
     base_center = getattr(predictor, "center", 0)
     center_cands = [base_center]
-    if tunable and has_center:
+    if tunable and has_center and tune != "fast" and eb_ratio is None:
         center_cands += [c for c in (0, 1, 2) if c != base_center]
 
     candidates = []
@@ -147,7 +154,7 @@ def compress(
             candidates.append((len(stream), st["recon_sse"], ratio, center,
                                stream, rc, st))
 
-    if eb_ratio is None and tunable and len(candidates) > 1:
+    if tune == "rd" and eb_ratio is None and tunable and len(candidates) > 1:
         min_size = min(c[0] for c in candidates)
         size_limit = min_size * tune_size_slack
         feasible = [c for c in candidates if c[0] <= size_limit]
@@ -160,7 +167,9 @@ def compress(
         predictor.center = chosen_center
     stats["eb_ratio"] = chosen_ratio
     stats["interp_center"] = chosen_center
-    stats["tune_size_slack"] = tune_size_slack if eb_ratio is None and tunable else 1.0
+    stats["tune"] = tune
+    stats["tune_size_slack"] = (tune_size_slack if tune == "rd"
+                                and eb_ratio is None and tunable else 1.0)
     if verbose:
         print(f"tuned: eb_ratio={chosen_ratio} center={chosen_center} "
               f"compressed={len(stream)} bytes raw={stats['raw_payload_bytes']} bytes "

@@ -43,22 +43,20 @@ class MockPredictor:
         return out if pos is None else out[:, pos]
 
 
-def _bcast(mask1d: np.ndarray, axis: int, ndim: int) -> np.ndarray:
-    shape = [1] * ndim
-    shape[axis] = mask1d.shape[0]
-    return mask1d.reshape(shape)
-
-
-def _interp_axis(V: np.ndarray, axis: int, s: int, order: str) -> np.ndarray:
-    """Predict the odd-stride midpoints along ``axis`` from the even-stride
-    (known) samples: SZ3's 1D interpolation — cubic weights [-1, 9, 9, -1]/16
-    over the four nearest same-line samples, dropping to linear then to an edge
-    copy where the ±3s / ±s neighbours fall outside the tile."""
-    n = V.shape[axis]
-
-    def gather(off):
-        j = np.arange(n) + off
-        return np.take(V, np.clip(j, 0, n - 1), axis=axis), (j >= 0) & (j < n)
+def _interp_axis_at(W, coords, axis, s, order, shape):
+    """SZ3's 1D interpolation of the query points ``coords`` (a tuple of per-axis
+    index arrays into the spatial grid) along ``axis``: cubic weights
+    [-1, 9, 9, -1]/16 over the four nearest same-line samples, dropping to linear
+    then to an edge copy where the ±3s / ±s neighbours fall outside the tile.
+    Operates only on the M query points (``W`` is (C, *S) float64), so it never
+    materializes a whole-grid temporary — but is bit-identical to evaluating the
+    old full-grid form and slicing these positions out."""
+    def gather(off):  # neighbour value at coord[axis]+off (edge-clamped) + validity
+        ca = coords[axis] + off
+        valid = (ca >= 0) & (ca < shape[axis])
+        idx = list(coords)
+        idx[axis] = np.clip(ca, 0, shape[axis] - 1)
+        return W[(slice(None), *idx)], valid          # (C, M), (M,)
 
     Lm1, vm1 = gather(-s)
     Lp1, vp1 = gather(+s)
@@ -67,10 +65,10 @@ def _interp_axis(V: np.ndarray, axis: int, s: int, order: str) -> np.ndarray:
         Lm3, vm3 = gather(-3 * s)
         Lp3, vp3 = gather(+3 * s)
         cub = (-Lm3 + 9 * Lm1 + 9 * Lp1 - Lp3) / 16.0
-        pred = np.where(_bcast(vm3 & vp3, axis, V.ndim), cub, pred)
-    both = _bcast(vm1 & vp1, axis, V.ndim)
-    only_left = _bcast(vm1 & ~vp1, axis, V.ndim)
-    return np.where(both, pred, np.where(only_left, Lm1, Lp1))
+        pred = np.where((vm3 & vp3)[None], cub, pred)
+    both = (vm1 & vp1)[None]
+    only_left = (vm1 & ~vp1)[None]
+    return np.where(both, pred, np.where(only_left, Lm1, Lp1))     # (C, M)
 
 
 class InterpPredictor:
@@ -147,18 +145,22 @@ class InterpPredictor:
         if entry is None:
             raise ValueError("known mask does not match the interp schedule")
         s, axes = entry
+        shape = recon.shape[1:]
         W = recon.astype(np.float64)
-        # Interpolate along each odd axis of this sub-stage (array axes offset
-        # by the leading channel dim). Every ±stride neighbour on those lines
-        # was reconstructed in an earlier, lower-weight sub-stage of the same
-        # level, so an edge-midpoint (one odd axis) reads 2 priors and a 2-D
-        # centre (two odd axes) reads 4. ``center`` picks how a multi-odd-axis
-        # point combines them: averaged (0) or single-direction (1/2).
+        # Query points of this sub-stage, in the codec's recon[:, pos] order.
+        coords = np.nonzero(pos) if pos is not None else np.indices(shape).reshape(
+            len(shape), -1)
+        # Interpolate each odd axis from its ±stride neighbours (already
+        # reconstructed in an earlier, lower-weight sub-stage of the same level):
+        # an edge-midpoint (one odd axis) reads 2 priors, a 2-D centre (two odd
+        # axes) reads 4. ``center`` picks how a multi-odd-axis point combines
+        # them: averaged (0) or single-direction (1/2).
         if self.center == 0 or len(axes) == 1:
-            out = sum(_interp_axis(W, a + 1, s, self.order) for a in axes) / len(axes)
+            out = sum(_interp_axis_at(W, coords, a, s, self.order, shape)
+                      for a in axes) / len(axes)
         else:
             a = axes[0] if self.center == 1 else axes[-1]
-            out = _interp_axis(W, a + 1, s, self.order)
-        out = out.astype(np.float32)
-        return out if pos is None else out[:, pos]
+            out = _interp_axis_at(W, coords, a, s, self.order, shape)
+        out = out.astype(np.float32)                              # (C, M)
+        return out if pos is not None else out.reshape(recon.shape)
 
