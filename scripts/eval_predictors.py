@@ -31,12 +31,16 @@ from matsz.predictor import InterpPredictor, MockPredictor
 METHODS = ("gnn", "interp", "interp-linear", "sz3")
 
 
+def default_error_bounds() -> list[float]:
+    """Default ABS bounds for images loaded in normalized [0, 1] units."""
+    return [1.0 / 255.0, 2.0 / 255.0, 4.0 / 255.0]
+
+
 def load_image(path: Path) -> np.ndarray:
+    """Grayscale, [0,1]-normalised float32 (2D)."""
     from PIL import Image
-    im = Image.open(path)
-    if im.mode not in ("RGB", "L"):
-        im = im.convert("RGB")
-    return np.asarray(im)
+    im = Image.open(path).convert("L")
+    return np.asarray(im, np.float32) / 255.0
 
 
 def make_predictor(method: str, img: np.ndarray, args):
@@ -82,8 +86,10 @@ def eval_matsz(img: np.ndarray, eb: float, method: str, args) -> dict:
     stream, _ = compress(img, eb, pred, levels=args.levels,
                          anchor_stride=args.anchor_stride,
                          anchor_block=args.anchor_block, radius=args.radius,
-                         seed=args.seed, zstd_level=args.zstd_level)
+                         seed=args.seed, zstd_level=args.zstd_level,
+                         eb_ratio=args.eb_ratio)
     t_comp = time.time() - t0
+    del pred  # drop the encoder-side embedding field before decode builds its own
     t0 = time.time()
     rec = decompress(stream, lambda hdr: build_predictor_for_decompress(method, hdr, args))
     t_dec = time.time() - t0
@@ -112,18 +118,18 @@ def print_tables(rows: list[dict], methods: list[str]) -> None:
     ebs = sorted({r["eb"] for r in rows})
 
     print("\n=== Per-image results ===")
-    hdr = (f"{'image':<12} {'eb':>4} {'method':<13} "
-           f"{'bpp':>7} {'PSNR':>8} {'maxErr':>7} {'ok':>4} {'tComp':>7}")
+    hdr = (f"{'image':<12} {'eb':>6} {'method':<13} "
+           f"{'bpp':>7} {'PSNR':>8} {'maxErr':>9} {'ok':>4} {'tComp':>7}")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         ok = "PASS" if r["bound_ok"] else "FAIL"
-        print(f"{r['image']:<12} {r['eb']:>4.0f} {r['method']:<13} "
-              f"{r['bpp']:>7.3f} {r['psnr']:>8.2f} {r['max_err']:>7.2f} "
+        print(f"{r['image']:<12} {r['eb']:>6g} {r['method']:<13} "
+              f"{r['bpp']:>7.3f} {r['psnr']:>8.2f} {r['max_err']:>9.5f} "
               f"{ok:>4} {r['t_comp']:>7.2f}")
 
     print("\n=== Averages over dataset (per method / eb) ===")
-    hdr2 = (f"{'method':<13} {'eb':>4} {'bpp':>7} {'PSNR':>8} "
+    hdr2 = (f"{'method':<13} {'eb':>6} {'bpp':>7} {'PSNR':>8} "
             f"{'PASS%':>6} {'tComp':>7} {'vs sz3 bpp':>11}")
     print(hdr2)
     print("-" * len(hdr2))
@@ -144,7 +150,7 @@ def print_tables(rows: list[dict], methods: list[str]) -> None:
             ref = sz3_bpp.get(eb, float("nan"))
             rel = 100 * (avg_bpp / ref - 1) if ref and np.isfinite(ref) else float("nan")
             rel_str = "—" if method == "sz3" else fmt(rel, "+10.1f")
-            print(f"{method:<13} {eb:>4.0f} {avg_bpp:>7.3f} {avg_psnr:>8.2f} "
+            print(f"{method:<13} {eb:>6g} {avg_bpp:>7.3f} {avg_psnr:>8.2f} "
                   f"{pass_pct:>6.1f} {avg_tcomp:>7.2f} {rel_str:>11}")
 
 
@@ -214,14 +220,19 @@ def main():
                     help="GNN checkpoint (.pt) for the gnn method")
     ap.add_argument("--methods", nargs="+", default=["gnn", "interp", "sz3"],
                     choices=METHODS, help="predictors to evaluate")
-    ap.add_argument("--eb", type=float, nargs="+", default=[1.0, 2.0, 4.0],
-                    help="absolute error bounds to sweep")
+    ap.add_argument("--eb", type=float, nargs="+",
+                    default=default_error_bounds(),
+                    help="absolute error bounds to sweep in the normalized "
+                         "[0,1] image units (defaults: 1, 2, 4 gray levels)")
     ap.add_argument("--levels", type=int, default=4)
     ap.add_argument("--anchor-stride", type=int, default=16)
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--zstd-level", type=int, default=9)
+    ap.add_argument("--eb-ratio", type=float, default=None,
+                    help="per-level eb decay (coarse tighter); default: interp "
+                         "auto-tunes it + centre mode, 1.0 forces flat classic SZ")
     ap.add_argument("--gnn-tile", type=int, default=64,
                     help="tile size for the GNN predictor")
     ap.add_argument("--interp-tile", type=int, default=512,
@@ -231,11 +242,26 @@ def main():
     ap.add_argument("--device", default="cpu", help="torch device for the GNN")
     ap.add_argument("--images", nargs="*", default=None,
                     help="specific image filenames (default: all in --data)")
-    ap.add_argument("--csv", default=None, help="save per-image CSV to this path")
+    ap.add_argument("--csv", default="eval.csv",
+                    help="per-image CSV filename (bare name -> run dir)")
     ap.add_argument("--plot", nargs="?", const="eval_rd.png", default="eval_rd.png",
-                    help="RD-curve PNG output path (pass without value to skip)")
+                    help="RD-curve PNG filename (bare name -> run dir)")
     ap.add_argument("--no-plot", action="store_true", help="disable the RD plot")
     args = ap.parse_args()
+
+    # per-run dir: outputs/eval/<date>-<config-hash>/ holds the CSV, RD plot,
+    # and a config.json snapshot, mirroring train_gnn's runs/ layout.
+    import hashlib
+    import json
+    cfg_hash = hashlib.sha1(repr(sorted(vars(args).items())).encode()).hexdigest()[:6]
+    run_dir = ROOT / "outputs" / "eval" / f"{time.strftime('%Y%m%d-%H%M%S')}-{cfg_hash}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "config.json").write_text(json.dumps(vars(args), indent=2))
+    print(f"run dir: {run_dir}")
+    if args.csv and not Path(args.csv).is_absolute():
+        args.csv = str(run_dir / args.csv)
+    if args.plot and not Path(args.plot).is_absolute():
+        args.plot = str(run_dir / args.plot)
 
     data_dir = Path(args.data)
     images = sorted(data_dir.glob("kodim*.png")) or sorted(data_dir.glob("*.png"))
@@ -278,6 +304,14 @@ def main():
                 ok = "PASS" if r["bound_ok"] else "FAIL"
                 print(f"bpp={r['bpp']:.3f} PSNR={r['psnr']:.2f}dB "
                       f"maxErr={r['max_err']:.1f} [{ok}] {r['t_comp']:.2f}s")
+                # GNN runs untiled (whole image = one region), so its embedding
+                # field is O(image size) instead of O(tile size); release it
+                # and any cached CUDA blocks before the next image/eb.
+                if method == "gnn" and args.device.startswith("cuda"):
+                    import gc
+                    import torch
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
     if not rows:
         sys.exit("No results — check errors above.")

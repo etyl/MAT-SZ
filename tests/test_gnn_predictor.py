@@ -30,7 +30,7 @@ def _run(model, recon, known, max_radius=64):
 
 def test_2d_smoke_and_determinism():
     model = build_model(d=16).eval()
-    masks = stage_masks((64, 64), 3, 16, anchor_block=4)
+    masks = stage_masks((64, 64), 4, 16, anchor_block=4)  # levels==log2(stride)
     known = masks[0]  # anchors known, predict everything else
     recon = np.random.RandomState(0).rand(2, 64, 64).astype(np.float32)
     recon = recon * known[None]  # only known positions meaningful

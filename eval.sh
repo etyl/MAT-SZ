@@ -11,27 +11,20 @@
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.out
 
-# Usage:
-#   ./eval.sh                              # defaults below
-#   ./eval.sh --data /path/to/kodak --gnn-checkpoint data/gnn_predictor.pt
-#   sbatch eval.sh --eb 1 2 4 8 --csv eval.csv
-# Extra flags after the defaults ("$@") override them.
-
 module purge
 module load pytorch-gpu
 
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak}
-CKPT=${CKPT:-data/gnn_predictor.pt}
+CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260708-112905-8b8203/gnn_predictor.pt}
 
 python scripts/eval_predictors.py \
     --data "$DATA" \
     --gnn-checkpoint "$CKPT" \
     --methods gnn interp sz3 \
-    --eb 1 2 4 \
-    --levels 4 \
-    --anchor-stride 16 \
+    --eb 0.03 0.06 0.1 0.2 \
+    --levels 6 \
+    --anchor-stride 64 \
     --anchor-block 1 \
-    --gnn-tile 64 \
     --device cuda \
     --csv eval.csv \
     --plot eval_rd.png \

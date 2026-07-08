@@ -11,16 +11,24 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np  # keep before any pysz import (libstdc++ load order)
 
+_pysz_warned = False
+
 
 def _sz3_pysz(channel: np.ndarray, eb: float) -> tuple[int, np.ndarray] | None:
+    global _pysz_warned
     try:
         from pysz import sz, szConfig, szErrorBoundMode
-    except ImportError:
+    except ImportError as exc:
+        if not _pysz_warned:  # ponytail: warn once, not once per channel
+            print(f"[sz3] pysz unavailable ({exc}); `pip install pysz` or "
+                  "build tools/sz3/bin/sz3", file=sys.stderr)
+            _pysz_warned = True
         return None
     config = szConfig()
     config.errorBoundMode = szErrorBoundMode.ABS

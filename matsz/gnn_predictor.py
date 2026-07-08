@@ -320,6 +320,8 @@ class GNNPredictor:
 
     from .bitstream import FLAG_GNN as _FLAG
     stream_flag = _FLAG
+    tile_free = True  # runs on the whole tensor as one region, no tiling
+    tunable = True    # encoder sweeps eb_ratio (no centre mode; see codec.encode)
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
                  tile_size: int = 64, max_radius: int = 64, device: str = "cpu"):
@@ -341,7 +343,13 @@ class GNNPredictor:
         self._E = None          # persistent embedding field (B, N, d)
         self._prev = None       # bool nd mask known before the current call
 
-    def predict(self, recon: np.ndarray, known: np.ndarray) -> np.ndarray:
+    def predict(self, recon: np.ndarray, known: np.ndarray,
+               pos: np.ndarray | None = None) -> np.ndarray:
+        """`pos`, when given, restricts the (expensive, whole-grid-shaped)
+        embed/pool/head pass to just those query points — the codec only ever
+        consumes the current stage's mask, so computing the other points'
+        embeddings every stage is pure waste, and on an untiled whole image
+        (large N) that waste is what blows the memory budget."""
         torch = self._torch
         c = recon.shape[0]
         span = self.vmax - self.vmin
@@ -358,9 +366,16 @@ class GNNPredictor:
             self._prev = np.zeros(known.shape, bool)
 
         x = torch.from_numpy(norm.reshape(c, -1)).to(self.device)
+        idx = None
+        if pos is not None:
+            idx = torch.from_numpy(np.nonzero(pos.reshape(-1))[0]).to(self.device)
         with torch.no_grad():
             values, self._E = stage_forward(self.model, self._E, self._prev,
-                                            known, x, self.max_radius, torch)
+                                            known, x, self.max_radius, torch,
+                                            predict_idx=idx)
         self._prev = known.copy()
-        pred = values.cpu().numpy().reshape(recon.shape) * span + self.vmin
+        if idx is None:
+            pred = values.cpu().numpy().reshape(recon.shape) * span + self.vmin
+        else:
+            pred = values.cpu().numpy().reshape(c, -1) * span + self.vmin
         return np.clip(pred, self.vmin, self.vmax).astype(np.float32)

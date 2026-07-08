@@ -14,7 +14,10 @@ counts once, so the dense stages dominate). Checkpoint -> data/gnn_predictor.pt.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import random
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -263,9 +266,19 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    # per-run dir: <out-parent>/runs/<date>-<config-hash>/ holds the checkpoint
+    # and a config.json snapshot, so concurrent/repeated runs never clobber.
+    cfg_hash = hashlib.sha1(repr(sorted(vars(args).items())).encode()).hexdigest()[:6]
+    run_dir = (Path(args.out).resolve().parent / "runs"
+               / f"{time.strftime('%Y%m%d-%H%M%S')}-{cfg_hash}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "config.json").write_text(json.dumps(vars(args), indent=2))
+    out = run_dir / Path(args.out).name
+    print(f"run dir: {run_dir}")
+
     import wandb
     wandb.init(project=args.wandb_project, name=args.run_name,
-               mode=args.wandb_mode, config=vars(args))
+               mode=args.wandb_mode, config=vars(args), dir=str(run_dir))
 
     device = torch.device(args.device)
     paths = list_images(args.data)
@@ -320,8 +333,11 @@ def main():
     bar = tqdm(range(1, args.steps + 1), desc="train")
     for step in bar:
         x = next(batches).to(device)  # (B, N) truth, decoded on a worker thread
-        levels = args.levels or random.choice((3, 4, 5))
+        # stride and levels must be paired so the schedule densifies to stride 1
+        # (levels == log2(stride)); independent draws mismatch and train the net
+        # on broken schedules (see levels.stage_plan's guard).
         stride = args.stride or random.choice((8, 16, 32))
+        levels = args.levels or stride.bit_length() - 1
         masks = stage_masks((args.crop, args.crop), levels, stride, anchor_block=1)
 
         def reveal(kv, posf):
@@ -349,6 +365,10 @@ def main():
                     model, eval_x, eval_masks, None, args.d, args.max_radius,
                     device, eb=args.eval_eb, collect=True)
             model.train()
+            # eval runs the whole image (>>train crop); free its reserved pool
+            # so the next train step doesn't OOM on the fragmented remainder.
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             last_eval = ae.item() / max(en, 1)
             log = {"eval/mae": last_eval,
                    "eval/mae_vs_baseline": last_eval / baseline_mae}
@@ -378,8 +398,6 @@ def main():
         print("wrote trace.json (open in chrome://tracing or perfetto.dev)")
         return
 
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "d": args.d}, out)
     print(f"saved {out}")
     wandb.save(str(out))

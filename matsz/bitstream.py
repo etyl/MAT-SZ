@@ -16,7 +16,7 @@ import numpy as np
 import zstandard
 
 MAGIC = b"MATSZ01\0"
-VERSION = 1
+VERSION = 3
 
 FLAG_MOCK = 1 << 0
 FLAG_GRAY = 1 << 1
@@ -25,7 +25,7 @@ FLAG_INTERP = 1 << 3       # SZ-style interpolation baseline (torch-free)
 FLAG_CUBIC = 1 << 4        # interp order: set = cubic, clear = linear
 FLAG_NOTILE = 1 << 5       # whole image is one tile (no padding, no seam)
 
-_HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHH"
+_HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHHf"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 
 DTYPE_CODES = {0: np.uint8, 1: np.float32}
@@ -51,6 +51,8 @@ class Header:
     n_tiles_y: int = 1
     n_tiles_x: int = 1
     flags: int = 0
+    interp_center: int = 0  # interp multi-axis mode: 0=avg both, 1=axis0, 2=axis1
+    eb_ratio: float = 1.0   # per-level error-bound decay (coarse tighter); 1=flat
     version: int = VERSION
 
     def pack(self) -> bytes:
@@ -58,16 +60,16 @@ class Header:
             _HEADER_FMT, MAGIC, self.version, self.flags,
             self.orig_h, self.orig_w, self.channels, self.src_dtype,
             self.eb, self.levels, self.anchor_stride, self.anchor_block,
-            0,  # reserved
+            self.interp_center,
             self.tile_size, self.radius, self.seed, self.vmin, self.vmax,
-            self.ckpt_hash, self.n_tiles_y, self.n_tiles_x,
+            self.ckpt_hash, self.n_tiles_y, self.n_tiles_x, self.eb_ratio,
         )
 
     @classmethod
     def unpack(cls, buf: bytes) -> "Header":
         (magic, version, flags, orig_h, orig_w, channels, src_dtype, eb,
-         levels, anchor_stride, anchor_block, _reserved, tile_size, radius,
-         seed, vmin, vmax, ckpt_hash, n_tiles_y, n_tiles_x
+         levels, anchor_stride, anchor_block, interp_center, tile_size, radius,
+         seed, vmin, vmax, ckpt_hash, n_tiles_y, n_tiles_x, eb_ratio
          ) = struct.unpack_from(_HEADER_FMT, buf, 0)
         if magic != MAGIC:
             raise ValueError(f"not a MAT-SZ stream (bad magic {magic!r})")
@@ -79,7 +81,8 @@ class Header:
                    tile_size=tile_size, radius=radius, seed=seed,
                    vmin=vmin, vmax=vmax, ckpt_hash=ckpt_hash,
                    n_tiles_y=n_tiles_y, n_tiles_x=n_tiles_x,
-                   flags=flags, version=version)
+                   flags=flags, interp_center=interp_center,
+                   eb_ratio=eb_ratio, version=version)
 
 
 def write_stream(header: Header, tile_payloads: list[bytes], zstd_level: int = 9) -> bytes:

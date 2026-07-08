@@ -53,6 +53,13 @@ def stage_plan(
         raise ValueError("anchor_stride must be a power of two >= 2")
     if not 1 <= anchor_block <= anchor_stride:
         raise ValueError("anchor_block must be in [1, anchor_stride]")
+    # The dyadic levels must reach stride 1, i.e. levels >= log2(anchor_stride);
+    # otherwise the finest pixels never become midpoints and get dumped into the
+    # remainder clause below as one huge, badly-predicted stage (60-90% bloat).
+    if (1 << levels) < anchor_stride:
+        raise ValueError(f"levels={levels} too small for anchor_stride="
+                         f"{anchor_stride}: need levels >= log2(anchor_stride) = "
+                         f"{anchor_stride.bit_length() - 1} to densify to stride 1")
 
     coords = [np.arange(n) for n in shape]
     covered = np.zeros(shape, bool)
@@ -92,3 +99,24 @@ def stage_masks(
     anchor_block: int = 1,
 ) -> list[np.ndarray]:
     return [mask for mask, _, _ in stage_plan(shape, levels, anchor_stride, anchor_block)]
+
+
+def stage_ebs(
+    shape: tuple[int, ...],
+    levels: int,
+    anchor_stride: int,
+    anchor_block: int,
+    eb: float,
+    eb_ratio: float,
+) -> list[float]:
+    """Per-stage absolute error bound, aligned with ``stage_plan`` order.
+
+    Coarser (larger-stride) levels get a tighter bound ``eb * eb_ratio**depth``,
+    ``depth`` = log2(stride / finest stride), so their quantization error
+    propagates less into the finer levels interpolated from them (QoZ-style
+    level-wise error budgeting). The finest level keeps the full ``eb``, so the
+    global ``|x - recon| <= eb`` bound still holds unconditionally. ``eb_ratio``
+    1.0 -> flat ``eb`` everywhere (classic SZ)."""
+    plan = stage_plan(shape, levels, anchor_stride, anchor_block)
+    finest = min(stride for _, stride, _ in plan)
+    return [eb * eb_ratio ** np.log2(stride / finest) for _, stride, _ in plan]

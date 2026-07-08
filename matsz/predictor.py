@@ -1,11 +1,13 @@
 """Predictors: the pluggable stage that replaces SZ's Lorenzo/spline prediction.
 
 Both predictors share the interface
-    predict(recon, known) -> pred
-with recon float32 (C, T, T) in original data units, known bool (T, T);
-returns float32 (C, T, T) predictions for the whole tile (only hole positions
-are consumed by the codec). Predictions must be a pure function of
-(recon * known, known) so the decoder can reproduce them exactly.
+    predict(recon, known, pos=None) -> pred
+with recon float32 (C, T, T) in original data units, known bool (T, T), and
+pos an optional bool (T, T) mask of the points actually being predicted this
+stage. With pos given, pred is the compact float32 (C, pos.sum()) prediction
+at just those points; with pos=None, pred covers the whole tile. Predictions
+must be a pure function of (recon * known, known) so the decoder can
+reproduce them exactly.
 """
 
 from __future__ import annotations
@@ -26,16 +28,19 @@ class MockPredictor:
         self.tile_size = tile_size
         self.checkpoint_hash = b"\0" * 16
 
-    def predict(self, recon: np.ndarray, known: np.ndarray) -> np.ndarray:
+    def predict(self, recon: np.ndarray, known: np.ndarray,
+               pos: np.ndarray | None = None) -> np.ndarray:
         from scipy.ndimage import distance_transform_edt, uniform_filter
 
         if not known.any():
-            return np.zeros_like(recon)
+            out = np.zeros_like(recon)
+            return out if pos is None else out[:, pos]
         _, (ii, jj) = distance_transform_edt(~known, return_indices=True)
         filled = recon[:, ii, jj]
         smooth = uniform_filter(filled, size=(1, 3, 3), mode="nearest")
         # keep exact values at known pixels, smooth only the filled region
-        return np.where(known[None], filled, smooth).astype(np.float32)
+        out = np.where(known[None], filled, smooth).astype(np.float32)
+        return out if pos is None else out[:, pos]
 
 
 def _bcast(mask1d: np.ndarray, axis: int, ndim: int) -> np.ndarray:
@@ -91,15 +96,21 @@ class InterpPredictor:
     """
 
     tile_free = True  # codec compresses the whole image as one region
+    tunable = True    # encoder sweeps (eb_ratio, center) and keeps the smallest
 
     def __init__(self, tile_size: int = 512, order: str = "cubic",
-                 levels: int = 4, anchor_stride: int = 16, anchor_block: int = 4):
+                 levels: int = 4, anchor_stride: int = 16, anchor_block: int = 4,
+                 center: int = 0):
         if order not in ("linear", "cubic"):
             raise ValueError("order must be 'linear' or 'cubic'")
         self.order = order
         self.levels = levels
         self.anchor_stride = anchor_stride
         self.anchor_block = anchor_block
+        # multi-odd-axis ("centre") prediction: 0 avg both axes (best on most
+        # data), 1/2 interpolate along the first/last odd axis only (SZ3's
+        # single-direction centre — wins on strongly anisotropic content).
+        self.center = center
         self.stream_flag = FLAG_INTERP | (FLAG_CUBIC if order == "cubic" else 0)
         self.checkpoint_hash = b"\0" * 16
         self._cache: dict[tuple[int, ...], tuple[list, dict]] = {}
@@ -130,17 +141,24 @@ class InterpPredictor:
     def stage_masks(self, shape, levels, anchor_stride, anchor_block) -> list:
         return self._build(shape)[0]
 
-    def predict(self, recon: np.ndarray, known: np.ndarray) -> np.ndarray:
+    def predict(self, recon: np.ndarray, known: np.ndarray,
+               pos: np.ndarray | None = None) -> np.ndarray:
         entry = self._build(recon.shape[1:])[1].get(int(known.sum()))
         if entry is None:
             raise ValueError("known mask does not match the interp schedule")
         s, axes = entry
         W = recon.astype(np.float64)
-        # Average the single-axis interpolation over each odd axis of this
-        # sub-stage (array axes offset by the leading channel dim). Every
-        # ±stride neighbour on those lines was reconstructed in an earlier,
-        # lower-weight sub-stage of the same level, so an edge-midpoint reads 2
-        # priors and a 2-D centre reads 4.
-        out = sum(_interp_axis(W, a + 1, s, self.order) for a in axes) / len(axes)
-        return out.astype(np.float32)
+        # Interpolate along each odd axis of this sub-stage (array axes offset
+        # by the leading channel dim). Every ±stride neighbour on those lines
+        # was reconstructed in an earlier, lower-weight sub-stage of the same
+        # level, so an edge-midpoint (one odd axis) reads 2 priors and a 2-D
+        # centre (two odd axes) reads 4. ``center`` picks how a multi-odd-axis
+        # point combines them: averaged (0) or single-direction (1/2).
+        if self.center == 0 or len(axes) == 1:
+            out = sum(_interp_axis(W, a + 1, s, self.order) for a in axes) / len(axes)
+        else:
+            a = axes[0] if self.center == 1 else axes[-1]
+            out = _interp_axis(W, a + 1, s, self.order)
+        out = out.astype(np.float32)
+        return out if pos is None else out[:, pos]
 

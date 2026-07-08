@@ -8,3 +8,6 @@ __pycache__/
 .claude/settings.local.json
 data/
 .vscode/
+outputs/
+.agents/
+.codex/

@@ -18,7 +18,7 @@ python scripts/train_gnn.py \
     --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
     --out data/gnn_predictor.pt \
     --steps 10000 \
-    --batch 16 \
+    --batch 12 \
     --crop 128 \
     --d 128 \
     --lr 0.0001 \
@@ -29,5 +29,4 @@ python scripts/train_gnn.py \
     --run-name gnn-sz \
     "$@"
 
-# checkpoint  -> data/gnn_predictor.pt
-# loss curve  -> data/gnn_predictor.csv (+ .png if matplotlib is installed)
+# per-run dir -> data/runs/<date>-<hash>/ (checkpoint + config.json)
