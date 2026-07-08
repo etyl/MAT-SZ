@@ -18,9 +18,9 @@ python scripts/train_gnn.py \
     --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
     --out data/gnn_predictor.pt \
     --steps 10000 \
-    --batch 4 \
+    --batch 16 \
     --crop 128 \
-    --d 64 \
+    --d 128 \
     --lr 0.0001 \
     --eval-every 100 \
     --img-every 500 \
