@@ -1,4 +1,4 @@
-"""Lightweight, dimension-agnostic GNN predictor for the MAT-SZ closed loop.
+"""Lightweight, dimension-agnostic GNN predictor for the DeepSZ closed loop.
 
 Same interface as the other predictors (see predictor.py):
     predict(recon, known) -> pred
@@ -19,11 +19,10 @@ stage schedule, which progressively densifies `known`):
   * pool the per-line messages with a single-query attention layer (AttnPool)
     into a *context* embedding, then read out the value (PredHead);
   * once a point's own value is revealed — known, but carrying the small error
-    left by residual coding — embed it plus a scalar error-tolerance prior with
-    InitEmbed and fuse it into the pooled context with MixEmbed to form that
-    point's finalized embedding (the one stored in the propagating field). In
-    training the revealed value is the truth plus noise, so MixEmbed learns to
-    trust it only up to that error.
+    left by residual coding — embed it with InitEmbed and fuse it into the
+    pooled context with MixEmbed to form that point's finalized embedding (the
+    one stored in the propagating field). In training the revealed value is the
+    truth plus noise, so MixEmbed learns to trust it only up to that error.
 
 The six modules are exposed as separate nn.Modules as requested.
 """
@@ -242,7 +241,7 @@ def _mlp(torch, sizes):
     return nn.Sequential(*layers)
 
 
-def build_model(d: int = 32, error_prior: bool = True):
+def build_model(d: int = 32):
     """Construct the GNN (its five sub-modules held as attributes)."""
     import torch
     import torch.nn as nn
@@ -250,21 +249,9 @@ def build_model(d: int = 32, error_prior: bool = True):
     class InitEmbed(nn.Module):
         def __init__(self):
             super().__init__()
-            self.use_error_prior = bool(error_prior)
-            self.net = _mlp(torch, [2 if self.use_error_prior else 1, d, d])
+            self.net = _mlp(torch, [1, d, d])
 
-        def forward(self, v, prior=None):  # v: (..., 1), prior: normalized eb/noise
-            if self.use_error_prior:
-                if prior is None:
-                    prior = torch.zeros_like(v)
-                elif not torch.is_tensor(prior):
-                    prior = torch.as_tensor(prior, dtype=v.dtype, device=v.device)
-                else:
-                    prior = prior.to(device=v.device, dtype=v.dtype)
-                while prior.ndim < v.ndim:
-                    prior = prior.unsqueeze(-1)
-                prior = prior.expand_as(v).clamp_min(0)
-                v = torch.cat([v, prior], dim=-1)
+        def forward(self, v):  # v: (..., 1) normalized value
             return self.net(v)
 
     class DirEmbed(nn.Module):
@@ -332,7 +319,6 @@ def build_model(d: int = 32, error_prior: bool = True):
         def __init__(self):
             super().__init__()
             self.d = d
-            self.error_prior = bool(error_prior)
             self.init = InitEmbed()
             self.dir = DirEmbed()
             self.bidir = BiDirEmbed()
@@ -376,13 +362,13 @@ def build_model(d: int = 32, error_prior: bool = True):
             msgs, valid = self._line_messages(E, geom)
             return self.attn(msgs, valid)                        # (B, M, d)
 
-        def finalize(self, ctx, self_val, error_prior=None):
+        def finalize(self, ctx, self_val):
             """Finalized embedding for points whose value has just been
             revealed: embed the (noisy) known value with InitEmbed and fuse it
             with the pooled context via MixEmbed. `self_val` is the
             reconstructed value — truth + noise in training, the quantised
             recon at inference — so the mix learns to trust it up to eb."""
-            value_emb = self.init(self_val.unsqueeze(-1), error_prior)  # (B, N, d)
+            value_emb = self.init(self_val.unsqueeze(-1))        # (B, N, d)
             return self.mix(ctx, value_emb)                      # (B, N, d)
 
         def head_of(self, pooled):
@@ -392,10 +378,10 @@ def build_model(d: int = 32, error_prior: bool = True):
 
 
 def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
-                         finalize_ctx=None, error_prior=None):
+                         finalize_ctx=None):
     if geom_prev is not None and geom_prev.M:
         ctx = finalize_ctx if finalize_ctx is not None else model.embed(E, geom_prev)
-        finalized = model.finalize(ctx, finalize_vals, error_prior)
+        finalized = model.finalize(ctx, finalize_vals)
         E = E.index_copy(1, geom_prev.query_idx, finalized)     # write newly-known
     head_ctx = model.embed(E, geom_head)
     return model.head_of(head_ctx), E, head_ctx
@@ -407,7 +393,7 @@ def stage_forward(model, E, *args, **kwargs):
     Supports both APIs:
     - optimized geometry API:
       ``stage_forward(model, E, geom_prev, geom_head, finalize_vals, torch,
-      finalize_ctx=None, error_prior=None) -> (values, E, head_ctx)``
+      finalize_ctx=None) -> (values, E, head_ctx)``
     - legacy mask API:
       ``stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch,
       predict_idx=None) -> (values, E)``
@@ -420,19 +406,16 @@ def stage_forward(model, E, *args, **kwargs):
     if args[0] is None or hasattr(args[0], "M"):
         geom_prev, geom_head, finalize_vals, torch = args[:4]
         finalize_ctx = kwargs.pop("finalize_ctx", None)
-        error_prior = kwargs.pop("error_prior", None)
         if kwargs:
             raise TypeError(f"unexpected keyword argument {next(iter(kwargs))!r}")
         return _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals,
-                                    torch, finalize_ctx=finalize_ctx,
-                                    error_prior=error_prior)
+                                    torch, finalize_ctx=finalize_ctx)
 
     # Legacy path used by older training/eval code.
     if len(args) < 5:
         raise TypeError("legacy stage_forward needs max_radius and torch")
     prev_mask, known_mask, norm, max_radius, torch = args[:5]
     predict_idx = kwargs.pop("predict_idx", None)
-    error_prior = kwargs.pop("error_prior", None)
     if kwargs:
         raise TypeError(f"unexpected keyword argument {next(iter(kwargs))!r}")
     device = E.device
@@ -441,7 +424,7 @@ def stage_forward(model, E, *args, **kwargs):
         idx_np = np.nonzero(newly.reshape(-1))[0]
         geom_prev = _LegacyGeom(prev_mask, max_radius, torch, device, idx_np)
         ctx = model.embed(E, geom_prev)
-        finalized = model.finalize(ctx, norm[:, geom_prev.query_idx], error_prior)
+        finalized = model.finalize(ctx, norm[:, geom_prev.query_idx])
         E = E.index_copy(1, geom_prev.query_idx, finalized)
     geom_head = _LegacyGeom(known_mask, max_radius, torch, device, predict_idx)
     values = model.head_of(model.embed(E, geom_head))
@@ -477,25 +460,12 @@ class GNNPredictor:
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.d = ckpt["d"]
         state_dict = ckpt["state_dict"]
-        # Older checkpoints embedded only the reconstructed value. Newer ones
-        # concatenate a normalized error-tolerance prior in InitEmbed.
-        uses_error_prior = ckpt.get("error_prior")
-        if uses_error_prior is None:
-            uses_error_prior = state_dict["init.net.0.weight"].shape[1] == 2
-        self.model = build_model(self.d, error_prior=uses_error_prior).eval().to(self.device)
+        self.model = build_model(self.d).eval().to(self.device)
         self.model.load_state_dict(state_dict)
         self.checkpoint_hash = hashlib.sha256(
             Path(checkpoint_path).read_bytes()).digest()[:16]
         self._sched: dict = {}   # shape -> (stage geoms, count->index map)
-        self._error_prior = 0.0
         self._reset()
-
-    def set_error_tolerance(self, eb: float) -> None:
-        """Set the absolute error tolerance of the values that will be finalized
-        on the next predict() call. The model operates on normalized values, so
-        store the tolerance in normalized units."""
-        span = max(self.vmax - self.vmin, 1e-12)
-        self._error_prior = max(0.0, float(eb) / span)
 
     def _reset(self):
         self._E = None           # persistent embedding field (C, N, d)
@@ -545,7 +515,7 @@ class GNNPredictor:
         with torch.no_grad():
             values, self._E, self._ctx = stage_forward(
                 self.model, self._E, geom_prev, geom_head, fvals, torch,
-                finalize_ctx=finalize_ctx, error_prior=self._error_prior)
+                finalize_ctx=finalize_ctx)
         self._stage = i
         pred = values.cpu().numpy().reshape(c, -1) * span + self.vmin
         return np.clip(pred, self.vmin, self.vmax).astype(np.float32)

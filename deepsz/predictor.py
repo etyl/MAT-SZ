@@ -72,7 +72,7 @@ def _interp_axis_at(W, coords, axis, s, order, shape):
 
 
 class InterpPredictor:
-    """SZ3-style interpolation baseline dropped into MAT-SZ's closed loop, so
+    """SZ3-style interpolation baseline dropped into DeepSZ's closed loop, so
     MAT/GNN vs. classical interpolation is isolated to the predictor (identical
     quantizer + Huffman/zstd stage, matching SZ3's own pipeline). Torch- and
     checkpoint-free, so streams decode without a model.

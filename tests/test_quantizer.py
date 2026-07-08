@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from matsz.quantizer import dequantize, quantize
+from deepsz.quantizer import dequantize, quantize
 
 
 @pytest.mark.parametrize("scale,eb", [(1.0, 0.01), (255.0, 2.0), (1e6, 1e-3), (1e-3, 1e-7)])

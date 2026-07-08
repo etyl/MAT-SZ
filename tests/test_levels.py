@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from matsz.levels import stage_masks
+from deepsz.levels import stage_masks
 
 
 # all levels == log2(stride) so the schedule densifies to stride 1 (guard)

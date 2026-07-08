@@ -1,4 +1,4 @@
-"""Evaluate MAT-SZ predictors (GNN vs. interpolation) against SZ3 on Kodak.
+"""Evaluate DeepSZ predictors (GNN vs. interpolation) against SZ3 on Kodak.
 
 Runs each method through the same closed-loop codec (identical quantizer +
 Huffman/zstd stage) so the comparison isolates the predictor, and reports
@@ -23,10 +23,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from matsz.baselines import sz3_roundtrip
-from matsz.bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_INTERP, FLAG_MOCK, Header
-from matsz.codec import compress, decompress
-from matsz.predictor import InterpPredictor, MockPredictor
+from deepsz.baselines import sz3_roundtrip
+from deepsz.bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_INTERP, FLAG_MOCK, Header
+from deepsz.codec import compress, decompress
+from deepsz.predictor import InterpPredictor, MockPredictor
 
 METHODS = ("gnn", "interp", "interp-linear", "sz3")
 
@@ -44,9 +44,9 @@ def load_image(path: Path) -> np.ndarray:
 
 
 def make_predictor(method: str, img: np.ndarray, args):
-    """Encoder-side predictor for a MAT-SZ closed-loop method."""
+    """Encoder-side predictor for a DeepSZ closed-loop method."""
     if method == "gnn":
-        from matsz.gnn_predictor import GNNPredictor
+        from deepsz.gnn_predictor import GNNPredictor
         return GNNPredictor(args.gnn_checkpoint, float(img.min()), float(img.max()),
                             tile_size=args.gnn_tile, max_radius=args.max_radius,
                             device=args.device, levels=args.levels,
@@ -60,7 +60,7 @@ def make_predictor(method: str, img: np.ndarray, args):
 def build_predictor_for_decompress(method: str, hdr: Header, args):
     """Decoder-side predictor; params come from the stream header."""
     if hdr.flags & FLAG_GNN:
-        from matsz.gnn_predictor import GNNPredictor
+        from deepsz.gnn_predictor import GNNPredictor
         return GNNPredictor(args.gnn_checkpoint, hdr.vmin, hdr.vmax,
                             tile_size=hdr.tile_size, max_radius=args.max_radius,
                             device=args.device, levels=hdr.levels,
@@ -84,7 +84,7 @@ def _quality(img: np.ndarray, rec: np.ndarray, n_bytes: int, eb: float) -> dict:
                 bound_ok=max_err <= eb)
 
 
-def eval_matsz(img: np.ndarray, eb: float, method: str, args) -> dict:
+def eval_deepsz(img: np.ndarray, eb: float, method: str, args) -> dict:
     pred = make_predictor(method, img, args)
     t0 = time.time()
     stream, _ = compress(img, eb, pred, levels=args.levels,
@@ -304,7 +304,7 @@ def main():
                       end=" ", flush=True)
                 try:
                     r = eval_sz3(img, eb) if method == "sz3" else \
-                        eval_matsz(img, eb, method, args)
+                        eval_deepsz(img, eb, method, args)
                 except Exception as exc:
                     print(f"ERROR: {exc}")
                     continue

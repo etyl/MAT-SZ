@@ -1,4 +1,4 @@
-"""MAT-SZ container format.
+"""DeepSZ container format.
 
 File = fixed struct-packed little-endian header, then a u32 per-tile payload
 size table, then one zstd frame holding the concatenated tile payloads.
@@ -72,7 +72,7 @@ class Header:
          seed, vmin, vmax, ckpt_hash, n_tiles_y, n_tiles_x, eb_ratio
          ) = struct.unpack_from(_HEADER_FMT, buf, 0)
         if magic != MAGIC:
-            raise ValueError(f"not a MAT-SZ stream (bad magic {magic!r})")
+            raise ValueError(f"not a DeepSZ stream (bad magic {magic!r})")
         if version != VERSION:
             raise ValueError(f"unsupported version {version}")
         return cls(orig_h=orig_h, orig_w=orig_w, channels=channels,

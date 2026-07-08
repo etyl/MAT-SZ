@@ -16,14 +16,15 @@ module load pytorch-gpu
 
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak}
 CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260708-112905-8b8203/gnn_predictor.pt}
-TUNE=${TUNE:-fast}                 # fast | size | rd
+# CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260708-153735-dea221/gnn_predictor.pt}
+TUNE=${TUNE:-rd}                 # fast | size | rd
 TUNE_SIZE_SLACK=${TUNE_SIZE_SLACK:-1.05}
 
 python scripts/eval_predictors.py \
     --data "$DATA" \
     --gnn-checkpoint "$CKPT" \
     --methods gnn interp sz3 \
-    --eb 0.03 0.06 0.1 0.2 \
+    --eb 0.02 0.08 0.14 0.2 \
     --levels 6 \
     --anchor-stride 64 \
     --anchor-block 1 \

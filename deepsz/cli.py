@@ -1,9 +1,9 @@
-"""MAT-SZ command line: compress / decompress / eval.
+"""DeepSZ command line: compress / decompress / eval.
 
 Examples:
-    python -m matsz.cli compress photo.png photo.msz --eb 2
-    python -m matsz.cli decompress photo.msz rec.png
-    python -m matsz.cli eval photo.png --eb 2 --levels 3
+    deepsz compress photo.png photo.msz --eb 2
+    deepsz decompress photo.msz rec.png
+    deepsz eval photo.png --eb 2 --levels 3
 Use --mock for the torch-free nearest-neighbor predictor (fast, for testing).
 """
 
@@ -196,7 +196,7 @@ def cmd_eval(args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="matsz", description=__doc__)
+    ap = argparse.ArgumentParser(prog="deepsz", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("compress", help="compress an image to a .msz stream")

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepsz"
+version = "0.1.0"
+description = "Error-bounded SZ-style compression with interpolation and GNN predictors."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "DeepSZ contributors" }
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "zstandard",
+]
+
+[project.optional-dependencies]
+image = ["pillow"]
+gnn = ["torch"]
+eval = ["pysz"]
+test = ["pytest", "pillow", "torch"]
+all = ["pillow", "torch", "pysz"]
+
+[project.scripts]
+deepsz = "deepsz.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["deepsz*"]

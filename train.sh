@@ -20,10 +20,10 @@ python scripts/train_gnn.py \
     --steps 10000 \
     --batch 12 \
     --crop 128 \
-    --d 128 \
+    --d 256 \
     --lr 0.0001 \
-    --noise-range 0.0039215686 0.0313725490 \
-    --eval-eb 0.0078431373 \
+    --noise-range 0.0001 0.05 \
+    --eval-eb 0.01 \
     --eval-every 100 \
     --img-every 500 \
     --device cuda \

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from matsz.bitstream import (Header, pack_stage, read_stream, unpack_stage,
+from deepsz.bitstream import (Header, pack_stage, read_stream, unpack_stage,
                              write_stream)
 
 

@@ -3,9 +3,9 @@
 import numpy as np
 import pytest
 
-from matsz.codec import compress, decompress
-from matsz.levels import stage_plan
-from matsz.predictor import InterpPredictor
+from deepsz.codec import compress, decompress
+from deepsz.levels import stage_plan
+from deepsz.predictor import InterpPredictor
 from tests.test_codec_mock import smooth_image
 
 

@@ -1,4 +1,4 @@
-"""Benchmark MAT-SZ on the Kodak dataset.
+"""Benchmark DeepSZ on the Kodak dataset.
 
 Usage:
     python scripts/benchmark_kodak.py                          # default ebs 1 2 4
@@ -18,10 +18,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from matsz.codec import compress, decompress
-from matsz.predictor import InterpPredictor, MockPredictor
-from matsz.bitstream import FLAG_MOCK, Header
-from matsz.baselines import sz3_roundtrip
+from deepsz.codec import compress, decompress
+from deepsz.predictor import InterpPredictor, MockPredictor
+from deepsz.bitstream import FLAG_MOCK, Header
+from deepsz.baselines import sz3_roundtrip
 
 KODAK_DIR = ROOT / "data" / "kodak"
 
@@ -189,7 +189,7 @@ def main():
         sys.exit(f"No images found in {KODAK_DIR}")
 
     predictor_name = "MockNN" if args.mock else "interp"
-    print(f"Benchmarking MAT-SZ ({predictor_name}) on {len(images)} Kodak images")
+    print(f"Benchmarking DeepSZ ({predictor_name}) on {len(images)} Kodak images")
     print(f"Error bounds: {args.eb}  |  levels={args.levels}")
     print(f"Images: {KODAK_DIR}\n")
 

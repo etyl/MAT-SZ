@@ -1,4 +1,4 @@
-"""Closed-loop MAT-SZ codec: tiling, progressive prediction, quantization.
+"""Closed-loop DeepSZ codec: tiling, progressive prediction, quantization.
 
 The encoder simulates the decoder: reconstructions fed back into the predictor
 are built exclusively from dequantize() outputs, never from the original data,
@@ -182,7 +182,7 @@ def compress(
 
 
 def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
-    """Decompress a MAT-SZ stream. ``predictor_factory(header) -> predictor``;
+    """Decompress a DeepSZ stream. ``predictor_factory(header) -> predictor``;
     defaults to the torch-free MockPredictor / InterpPredictor for their streams
     (GNN streams need a factory that builds a GNNPredictor from the checkpoint)."""
     header, payloads = read_stream(stream)
@@ -232,8 +232,6 @@ def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats):
             pred = np.zeros((c, n), np.float32)
         else:
             t0 = time.time()
-            if hasattr(predictor, "set_error_tolerance"):
-                predictor.set_error_tolerance(ebs[stage_idx - 1])
             pred = predictor.predict(recon, known, pos)
             stats["predict_s"] += time.time() - t0
         t0 = time.time()
@@ -277,8 +275,6 @@ def _decompress_tile(payload, masks, ebs, header, predictor):
         if stage_idx == 0:
             pred = np.zeros((c, n), np.float32)
         else:
-            if hasattr(predictor, "set_error_tolerance"):
-                predictor.set_error_tolerance(ebs[stage_idx - 1])
             pred = predictor.predict(recon, known, pos)
         recon[:, pos] = dequantize(pred, codes, outliers, ebs[stage_idx],
                                    header.radius).reshape(c, n)

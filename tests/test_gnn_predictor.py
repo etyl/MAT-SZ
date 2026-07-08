@@ -5,10 +5,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from matsz.gnn_predictor import (build_model, build_stage_geoms,
+from deepsz.gnn_predictor import (build_model, build_stage_geoms,
                                  half_directions, stage_forward)
-from matsz.gnn_predictor import _LegacyGeom
-from matsz.levels import stage_masks
+from deepsz.gnn_predictor import _LegacyGeom
+from deepsz.levels import stage_masks
 
 
 @pytest.mark.parametrize("shape,levels,stride,block,max_radius", [
@@ -92,15 +92,14 @@ def test_no_neighbour_is_finite():
     assert np.isfinite(out).all()
 
 
-def test_init_embed_uses_error_prior():
-    """The tolerance prior is part of each revealed point's initial embedding."""
+def test_init_embed_uses_value_only():
+    """The revealed-point embedding is conditioned only on the known value."""
     torch.manual_seed(0)
     model = build_model(d=16).eval()
     v = torch.full((2, 5, 1), 0.5)
-    low = model.init(v, torch.zeros(2))
-    high = model.init(v, torch.full((2,), 0.1))
-    assert low.shape == high.shape == (2, 5, model.d)
-    assert not torch.allclose(low, high)
+    out = model.init(v)
+    assert out.shape == (2, 5, model.d)
+    assert model.init.net[0].in_features == 1
 
 
 def test_legacy_stage_forward_accepts_predict_idx():

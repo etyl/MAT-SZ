@@ -1,4 +1,4 @@
-# MAT-SZ
+# DeepSZ
 
 An SZ-style **error-bounded lossy compressor** in which the classic prediction
 stage (Lorenzo in SZ1/2, spline interpolation in SZ3) is replaced by **MAT** —
@@ -16,7 +16,48 @@ Current target: natural images (RGB/grayscale, uint8), where the pretrained
 Places512 checkpoint predicts well. The codec core is dtype-general
 (float32 arrays work through the same path).
 
-## Setup
+## Install
+
+From the repository root:
+
+```bash
+pip install .
+```
+
+For GNN checkpoint compression:
+
+```bash
+pip install ".[gnn]"
+```
+
+For the image CLI and tests:
+
+```bash
+pip install ".[image,test]"
+```
+
+Editable development install:
+
+```bash
+pip install -e ".[test]"
+```
+
+## Python API
+
+```python
+from deepsz import GNNCodec
+
+codec = GNNCodec("path/to/gnn_checkpoint.pt", error_bound=1e-3)
+
+compressed = codec.compress(array_or_tensor)  # numpy array or torch tensor, any rank
+reconstructed = codec.uncompress(compressed)  # torch.Tensor
+```
+
+`GNNCodec` stores the tensor shape, dtype, error bound, codec parameters, and
+checkpoint hash in the binary stream. Decoding verifies the checkpoint hash by
+default.
+
+## Legacy Setup Notes
 
 ```bash
 # conda base env already has torch 2.6.0+cu118, numpy, scipy, zstandard, pillow
@@ -33,9 +74,9 @@ https://github.com/fenglinglwb/MAT).
 ## Usage
 
 ```bash
-python -m matsz.cli compress photo.png photo.msz --eb 2        # eb in 0-255 units
-python -m matsz.cli decompress photo.msz reconstructed.png
-python -m matsz.cli eval photo.png --eb 2                      # roundtrip + metrics
+deepsz compress photo.png photo.msz --eb 2        # eb in 0-255 units
+deepsz decompress photo.msz reconstructed.png
+deepsz eval photo.png --eb 2                      # roundtrip + metrics
 ```
 
 Useful flags: `--levels N` (progressive refinement stages), `--anchor-stride`
@@ -94,13 +135,13 @@ the worst case, shows up as a bound violation measurable with `eval`.
 ## Layout
 
 ```
-matsz/quantizer.py   linear-scaling quantization + outliers (pure numpy)
-matsz/huffman.py     canonical Huffman coder (numpy + heapq)
-matsz/levels.py      progressive stage schedule shared by encoder/decoder
-matsz/bitstream.py   header + tile payloads + zstd frame
-matsz/predictor.py   MATPredictor (spandrel) and MockPredictor (scipy EDT)
-matsz/codec.py       closed-loop compress/decompress, tiling
-matsz/cli.py         compress / decompress / eval
+deepsz/quantizer.py   linear-scaling quantization + outliers (pure numpy)
+deepsz/huffman.py     canonical Huffman coder (numpy + heapq)
+deepsz/levels.py      progressive stage schedule shared by encoder/decoder
+deepsz/bitstream.py   header + tile payloads + zstd frame
+deepsz/predictor.py   MATPredictor (spandrel) and MockPredictor (scipy EDT)
+deepsz/codec.py       closed-loop compress/decompress, tiling
+deepsz/cli.py         compress / decompress / eval
 scripts/sanity_check_mat.py  spike: load, timing, polarity, determinism, OOD probe
 ```
 
@@ -140,10 +181,10 @@ denser context and predict correspondingly better.
 
 | codec | eb | ratio | bpp | PSNR (dB) | max err | time c/d |
 |-----------|---:|------:|----:|----------:|--------:|---------:|
-| MAT-SZ (MAT) | 1 | 1.21 | 19.80 | 51.19 | 1 PASS | 420 s / 482 s |
-| MAT-SZ (MAT) | 2 | 1.54 | 15.56 | 46.41 | 2 PASS | 408 s / 495 s |
-| MAT-SZ (MAT) | 4 | 2.14 | 11.22 | 40.78 | 4 PASS | 452 s / 429 s |
-| MAT-SZ (mock NN) | 2 | 3.40 | 7.05 | 46.48 | 2 PASS | 1.6 s / 5.0 s |
+| DeepSZ (MAT) | 1 | 1.21 | 19.80 | 51.19 | 1 PASS | 420 s / 482 s |
+| DeepSZ (MAT) | 2 | 1.54 | 15.56 | 46.41 | 2 PASS | 408 s / 495 s |
+| DeepSZ (MAT) | 4 | 2.14 | 11.22 | 40.78 | 4 PASS | 452 s / 429 s |
+| DeepSZ (mock NN) | 2 | 3.40 | 7.05 | 46.48 | 2 PASS | 1.6 s / 5.0 s |
 | **SZ3** | 1 | 2.68 | 8.96 | 51.18 | 1 | ~0.1 s |
 | **SZ3** | 2 | 3.96 | 6.06 | 46.51 | 2 | ~0.1 s |
 | **SZ3** | 4 | 6.61 | 3.63 | 41.54 | 4 | ~0.1 s |
