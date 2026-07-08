@@ -22,6 +22,8 @@ python scripts/train_gnn.py \
     --crop 128 \
     --d 128 \
     --lr 0.0001 \
+    --noise-range 0.0039215686 0.0313725490 \
+    --eval-eb 0.0078431373 \
     --eval-every 100 \
     --img-every 500 \
     --device cuda \

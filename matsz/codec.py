@@ -232,6 +232,8 @@ def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats):
             pred = np.zeros((c, n), np.float32)
         else:
             t0 = time.time()
+            if hasattr(predictor, "set_error_tolerance"):
+                predictor.set_error_tolerance(ebs[stage_idx - 1])
             pred = predictor.predict(recon, known, pos)
             stats["predict_s"] += time.time() - t0
         t0 = time.time()
@@ -275,6 +277,8 @@ def _decompress_tile(payload, masks, ebs, header, predictor):
         if stage_idx == 0:
             pred = np.zeros((c, n), np.float32)
         else:
+            if hasattr(predictor, "set_error_tolerance"):
+                predictor.set_error_tolerance(ebs[stage_idx - 1])
             pred = predictor.predict(recon, known, pos)
         recon[:, pos] = dequantize(pred, codes, outliers, ebs[stage_idx],
                                    header.radius).reshape(c, n)

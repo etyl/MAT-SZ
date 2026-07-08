@@ -92,6 +92,17 @@ def test_no_neighbour_is_finite():
     assert np.isfinite(out).all()
 
 
+def test_init_embed_uses_error_prior():
+    """The tolerance prior is part of each revealed point's initial embedding."""
+    torch.manual_seed(0)
+    model = build_model(d=16).eval()
+    v = torch.full((2, 5, 1), 0.5)
+    low = model.init(v, torch.zeros(2))
+    high = model.init(v, torch.full((2,), 0.1))
+    assert low.shape == high.shape == (2, 5, model.d)
+    assert not torch.allclose(low, high)
+
+
 def test_legacy_stage_forward_accepts_predict_idx():
     """Older trainer/eval code passes a compact prediction index; keep that
     call form working while the codec uses precomputed stage geometry."""

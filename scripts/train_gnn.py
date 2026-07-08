@@ -154,7 +154,25 @@ def residual_rgb(res):
     return cm.get_cmap("seismic")((res / m + 1) / 2)[..., :3]
 
 
-def run_stages(model, x, geoms, d, device, noise=0.0, eb=None, collect=False):
+def _batch_scalar(value, batch, device):
+    if torch.is_tensor(value):
+        value = value.to(device=device, dtype=torch.float32).reshape(-1)
+        if value.numel() == 1:
+            return value.expand(batch)
+        return value.reshape(batch)
+    return torch.full((batch,), float(value), dtype=torch.float32, device=device)
+
+
+def sample_noise_prior(batch, args, device):
+    """Per-sample normalized tolerance used for both noise and the GNN prior."""
+    if args.noise_range is None:
+        return _batch_scalar(args.noise, batch, device)
+    lo, hi = args.noise_range
+    return torch.empty(batch, device=device).uniform_(float(lo), float(hi))
+
+
+def run_stages(model, x, geoms, d, device, noise=0.0, eb=None,
+               error_prior=None, collect=False):
     """Run the stage schedule over truth `x` (B, N) using precomputed per-stage
     geometry `geoms` (from ``build_stage_geoms``); return (sum |pred - truth|,
     n_holes, known_vals, pred_only). Training passes `eb=None` and teacher-forces
@@ -172,12 +190,17 @@ def run_stages(model, x, geoms, d, device, noise=0.0, eb=None, collect=False):
     logging; it costs a scatter per stage and is only read when logging eval
     images, so training leaves it off and gets `pred_only=None`."""
     B, N = x.shape
+    noise = _batch_scalar(noise, B, device)
+    if error_prior is None:
+        error_prior = _batch_scalar(eb if eb is not None else noise, B, device)
+    else:
+        error_prior = _batch_scalar(error_prior, B, device)
     E = torch.zeros(B, N, d, device=device)
     a0 = geoms[0].query_idx                      # anchors
     known_vals = torch.full_like(x, 0.5)
 
     def reveal(idx):  # teacher-force truth (+ training noise) at `idx`
-        nz = (torch.rand(B, idx.numel(), device=device) * 2 - 1) * noise
+        nz = (torch.rand(B, idx.numel(), device=device) * 2 - 1) * noise[:, None]
         known_vals[:, idx] = (x[:, idx] + nz).clamp(0, 1)
 
     if eb is None:
@@ -195,7 +218,8 @@ def run_stages(model, x, geoms, d, device, noise=0.0, eb=None, collect=False):
         gp, gh = geoms[i - 1], geoms[i]
         pred, E, head_ctx = stage_forward(model, E, gp, gh,
                                           known_vals[:, gp.query_idx], torch,
-                                          finalize_ctx=head_ctx)
+                                          finalize_ctx=head_ctx,
+                                          error_prior=error_prior)
         idx = gh.query_idx
         tgt = x[:, idx]
         abs_err = abs_err + (pred - tgt).abs().sum()
@@ -232,7 +256,12 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--d", type=int, default=32)
     ap.add_argument("--noise", type=float, default=0.01,
-                    help="uniform +/- noise on known values (mimics eb)")
+                    help="fixed uniform +/- noise on known values, in normalized "
+                         "[0,1] units; also used as the GNN error prior")
+    ap.add_argument("--noise-range", type=float, nargs=2, metavar=("MIN", "MAX"),
+                    default=None,
+                    help="sample each training example's +/- noise and GNN error "
+                         "prior uniformly from [MIN, MAX], overriding --noise")
     ap.add_argument("--max-radius", type=int, default=64)
     ap.add_argument("--baseline", choices=("cubic", "linear"), default="cubic",
                     help="SZ-style interpolation used for the reference line")
@@ -264,6 +293,10 @@ def main():
                     help="profile this many steps with torch.profiler, print "
                          "the op table + write trace.json, then exit")
     args = ap.parse_args()
+    if args.noise_range is not None:
+        lo, hi = args.noise_range
+        if lo < 0 or hi < lo:
+            raise SystemExit("--noise-range must satisfy 0 <= MIN <= MAX")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -349,15 +382,17 @@ def main():
         # pixel-weighted MAE: sum absolute error over every hole across all
         # stages, divide by total holes, so each pixel counts once (the dense
         # final stages dominate, matching the L1 the quantizer really pays).
+        noise = sample_noise_prior(x.shape[0], args, device)
         abs_err, npix, _, _ = run_stages(model, x, geoms, args.d, device,
-                                         noise=args.noise)
+                                         noise=noise, error_prior=noise)
         loss = abs_err / max(npix, 1)
         opt.zero_grad()
         loss.backward()
         opt.step()
         sched.step()
         run_loss += loss.item()
-        wandb.log({"train/mae": loss.item(), "lr": sched.get_last_lr()[0]},
+        wandb.log({"train/mae": loss.item(), "train/noise": noise.mean().item(),
+                   "lr": sched.get_last_lr()[0]},
                   step=step)
 
         if step % args.eval_every == 0:
@@ -400,7 +435,8 @@ def main():
         print("wrote trace.json (open in chrome://tracing or perfetto.dev)")
         return
 
-    torch.save({"state_dict": model.state_dict(), "d": args.d}, out)
+    torch.save({"state_dict": model.state_dict(), "d": args.d,
+                "error_prior": True}, out)
     print(f"saved {out}")
     wandb.save(str(out))
     wandb.finish()
