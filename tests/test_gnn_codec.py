@@ -6,7 +6,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from deepsz import GNNCompressorCodec
-from deepsz.gnn_predictor import build_model
+from deepsz.gnn_predictor import CKPT_VERSION, build_model
 
 
 @pytest.fixture()
@@ -17,7 +17,7 @@ def tiny_checkpoint(tmp_path):
     torch.save({
         "d": model.d,
         "state_dict": model.state_dict(),
-        "version": 2,
+        "version": CKPT_VERSION,
     }, path)
     return path
 

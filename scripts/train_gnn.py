@@ -30,7 +30,8 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from deepsz.gnn_predictor import build_model, build_stage_geoms, stage_forward
+from deepsz.gnn_predictor import (CKPT_VERSION, build_model, build_stage_geoms,
+                                  stage_forward)
 from deepsz.levels import stage_masks
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".ppm", ".pgm"}
@@ -236,7 +237,7 @@ def run_stages(model, x, geoms, d, device, eb, teacher_force=False,
     images, so training leaves it off and gets `pred_only=None`."""
     B, N = x.shape
     eb = _batch_scalar(eb, B, device)
-    E = torch.zeros(B, N, d, device=device)
+    E = torch.zeros(B, N, geoms[0].ndim, d, device=device)
     a0 = geoms[0].query_idx                      # anchors
     known_vals = torch.full_like(x, 0.5)
 
@@ -491,7 +492,11 @@ def main():
         print("wrote trace.json (open in chrome://tracing or perfetto.dev)")
         return
 
-    torch.save({"state_dict": model.state_dict(), "d": args.d, "version": 2}, out)
+    torch.save({
+        "state_dict": model.state_dict(),
+        "d": args.d,
+        "version": CKPT_VERSION,
+    }, out)
     print(f"saved {out}")
     wandb.save(str(out))
     wandb.finish()

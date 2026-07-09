@@ -5,8 +5,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from deepsz.gnn_predictor import (GNNPredictor, build_model, build_stage_geoms,
-                                 half_directions, stage_forward)
+from deepsz.gnn_predictor import (CKPT_VERSION, GNNPredictor, build_model,
+                                  build_stage_geoms, half_directions,
+                                  stage_forward)
 from deepsz.gnn_predictor import _LegacyGeom
 from deepsz.levels import stage_masks
 
@@ -31,9 +32,16 @@ def test_geometry_matches_scan(shape, levels, stride, block, max_radius):
             qidx = np.ravel_multi_index(np.nonzero(mask), shape)
             ref = _LegacyGeom(cum, max_radius, torch, query_idx=qidx)
             assert np.array_equal(g.query_idx.numpy(), qidx)
-            for gl, rl in zip(g.lines, ref.lines):
-                for k in ("ip", "in", "dp", "dn", "vp", "vn"):
-                    assert np.array_equal(gl[k].numpy(), rl[k].numpy()), (k, gi)
+            for k in ("ip", "in_", "dp", "dn", "vp", "vn"):
+                assert np.array_equal(
+                    getattr(g, k).numpy(), getattr(ref, k).numpy()), (k, gi)
+            dirs = np.asarray(half_directions(len(shape)), np.float32)
+            nnz = np.count_nonzero(dirs, axis=1).astype(np.float32)
+            expected_cos = dirs / np.sqrt(nnz)[:, None]
+            expected_lognnz = (0.5 * np.log2(nnz))[:, None]
+            assert np.allclose(g.cos.numpy(), expected_cos)
+            assert np.allclose(g.lognnz.numpy(), expected_lognnz)
+            assert g.ndim == len(shape)
             gi += 1
         cum |= mask
     assert gi == len(geoms)
@@ -51,7 +59,7 @@ def _run(model, recon, known, max_radius=64):
     c = recon.shape[0]
     N = known.size
     x = torch.from_numpy(recon.reshape(c, -1).astype(np.float32))
-    E = torch.zeros(c, N, model.d)
+    E = torch.zeros(c, N, known.ndim, model.d)
     prev = np.zeros(known.shape, bool)
     with torch.no_grad():
         (values, log_b), _ = stage_forward(model, E, prev, known, x, max_radius,
@@ -115,7 +123,7 @@ def test_legacy_stage_forward_accepts_predict_idx():
     pos[2::4, ::4] = True
     idx = torch.from_numpy(np.nonzero(pos.reshape(-1))[0])
     x = torch.from_numpy(np.random.RandomState(2).rand(1, known.size).astype(np.float32))
-    E = torch.zeros(1, known.size, model.d)
+    E = torch.zeros(1, known.size, known.ndim, model.d)
 
     with torch.no_grad():
         (values, log_b), E2 = stage_forward(model, E, prev, known, x, 16, torch,
@@ -127,19 +135,23 @@ def test_legacy_stage_forward_accepts_predict_idx():
     assert np.isfinite(values.numpy()).all()
 
 
-def test_gnn_predictor_rejects_v1_checkpoint(tmp_path):
+@pytest.mark.parametrize("version", [None, 2, 3])
+def test_gnn_predictor_rejects_old_checkpoint(tmp_path, version):
     model = build_model(d=8).eval()
-    path = tmp_path / "v1.pt"
-    torch.save({"d": model.d, "state_dict": model.state_dict()}, path)
+    path = tmp_path / f"v{version or 1}.pt"
+    checkpoint = {"d": model.d, "state_dict": model.state_dict()}
+    if version is not None:
+        checkpoint["version"] = version
+    torch.save(checkpoint, path)
 
-    with pytest.raises(ValueError, match="format v2"):
+    with pytest.raises(ValueError, match="format v4"):
         GNNPredictor(path, 0.0, 1.0, levels=2, anchor_stride=4, anchor_block=1)
 
 
 def test_gnn_predictors_share_loaded_inference_model(tmp_path):
-    path = tmp_path / "v2.pt"
+    path = tmp_path / "v3.pt"
     torch.save({
-        "version": 2,
+        "version": CKPT_VERSION,
         "d": 8,
         "state_dict": build_model(8).state_dict(),
     }, path)
@@ -150,3 +162,50 @@ def test_gnn_predictors_share_loaded_inference_model(tmp_path):
         path, 0.0, 2.0, levels=2, anchor_stride=4, anchor_block=1)
 
     assert first.model is second.model
+
+
+def test_finalize_ctx_reuse_equivalence():
+    torch.manual_seed(0)
+    model = build_model(d=8).eval()
+    geoms, _ = build_stage_geoms((16, 16), 2, 4, 1, 16, torch)
+    gp, gh = geoms[:2]
+    E = torch.zeros(2, 16 * 16, gp.ndim, model.d)
+    vals = torch.rand(2, gp.M)
+
+    with torch.no_grad():
+        finalize_ctx = model.embed(E, gp)
+        implicit, E_implicit, head_implicit = stage_forward(
+            model, E, gp, gh, vals, torch, eb=0.01)
+        explicit, E_explicit, head_explicit = stage_forward(
+            model, E, gp, gh, vals, torch, finalize_ctx=finalize_ctx, eb=0.01)
+
+    assert finalize_ctx.shape == (2, gp.M, gp.ndim, model.d)
+    assert torch.equal(E_implicit, E_explicit)
+    assert torch.equal(head_implicit, head_explicit)
+    assert all(torch.equal(a, b) for a, b in zip(implicit, explicit))
+
+
+def test_rope_axis_symmetry():
+    """Axes differ *only* through the rotary phase. In the closed loop the
+    propagating field is identical across axes (it starts at zeros), so with
+    the frequency bank zeroed every axis context stays identical; with the
+    default bank the per-axis rotation breaks the symmetry."""
+    torch.manual_seed(0)
+    model = build_model(d=8).eval()
+    geoms, _ = build_stage_geoms((16, 16), 2, 4, 1, 16, torch)
+    gp = geoms[1]                                # a stage with valid neighbours
+    # Field identical across the axis dim, as it is in the real loop.
+    E = torch.randn(2, 16 * 16, 1, model.d).expand(-1, -1, gp.ndim, -1)
+    E = E.contiguous()
+
+    with torch.no_grad():
+        _, valid = model._line_messages(E, gp)
+        assert bool(valid.any())                 # guard: the test is meaningful
+
+        model.rope.freq.zero_()
+        ctx = model.embed(E, gp)                 # (B, M, ndim, d)
+        assert torch.allclose(ctx[..., 0, :], ctx[..., 1, :])
+
+        model.rope.freq.copy_(build_model(d=8).rope.freq)
+        ctx = model.embed(E, gp)
+        assert not torch.allclose(ctx[..., 0, :], ctx[..., 1, :])

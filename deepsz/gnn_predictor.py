@@ -13,19 +13,26 @@ stage schedule, which progressively densifies `known`):
 
   * for every *line* through a point (the (3^n - 1)/2 axis and diagonal
     directions) find the nearest known sample on each side;
-  * embed each neighbour value (InitEmbed), turn a two-sided pair into a
-    trend/curvature message (BiDirEmbed) or a one-sided neighbour into an
-    extrapolation message (DirEmbed);
-  * pool the per-line messages with a single-query attention layer (AttnPool)
-    into a *context* embedding, then read out a Laplacian mean/scale
-    (PredHead), conditioned on the normalized error bound;
+  * store one embedding per lattice axis at every point. Per axis k
+    independently, rotate each neighbour's axis-k embedding (RoPE) by a phase
+    proportional to cos(line direction, axis k) — signed per side — so the
+    axis-k channel reads its neighbours through their angle to axis k;
+  * turn a two-sided pair into a trend/curvature message (BiDirEmbed) or a
+    one-sided neighbour into an extrapolation message (DirEmbed);
+  * pool the per-line messages into one context per axis with single-query
+    attention, then pool axes with a second single-query attention before
+    reading out a Laplacian mean/scale (PredHead), conditioned on the
+    normalized error bound;
   * once a point's own value is revealed — known, but carrying the small error
     left by residual coding — embed it with InitEmbed and fuse it into the
-    pooled context with MixEmbed to form that point's finalized embedding (the
-    one stored in the propagating field). In training the revealed value is the
-    truth plus noise, so MixEmbed learns to trust it only up to that error.
+    per-axis contexts with MixEmbed to form that point's finalized embeddings
+    (the ones stored in the propagating field). In training the revealed value
+    is the truth plus noise, so MixEmbed learns to trust it only up to that
+    error.
 
-The six modules are exposed as separate nn.Modules as requested.
+Axes never mix during propagation; direction enters only as the rotary phase,
+so with the frequency bank zeroed every axis channel is identical — the axial
+structure is a pure inductive bias layered on the direction-blind model.
 """
 
 from __future__ import annotations
@@ -41,6 +48,8 @@ from .levels import stage_masks
 
 # torch is imported lazily inside the class / model so that importing this
 # module (e.g. for FLAG constants) stays cheap.
+
+CKPT_VERSION = 4
 
 
 def half_directions(ndim: int) -> list[tuple[int, ...]]:
@@ -102,16 +111,25 @@ def _nearest_in_dir(known: np.ndarray, flat: np.ndarray, dvec, max_radius: int):
     return found_idx, found_dist, found
 
 
+def _line_static(dvec, torch, device=None):
+    """Unit line direction and its Euclidean log-distance correction."""
+    vec = torch.as_tensor(dvec, dtype=torch.float32, device=device)
+    nnz = (vec != 0).sum().to(torch.float32)
+    return vec / torch.sqrt(nnz), 0.5 * torch.log2(nnz)
+
+
 class _StageGeom:
     """Neighbour geometry for one stage: the fixed set of ``M`` query points and,
     per half-direction, the +/- side neighbour's flat index / step distance /
     validity as torch tensors of length M. Query points only — no full-grid
     tensors — so memory scales with the stage, not the image."""
 
-    __slots__ = ("lines", "query_idx", "idx_np", "M")
+    __slots__ = ("ip", "in_", "dp", "dn", "vp", "vn", "cos", "lognnz",
+                 "query_idx", "idx_np", "M", "ndim")
 
     def __init__(self, pat, query_coords, shape, max_radius, torch, device):
         ndim = len(shape)
+        self.ndim = ndim
         P = pat.shape[0]
         shp = np.asarray(shape)
         limit = min(max_radius, int(shp.max()))
@@ -126,7 +144,8 @@ class _StageGeom:
 
         self.query_idx = t(self.idx_np.astype(np.int64))
         res = tuple((Q[:, k] % P) for k in range(ndim)) if self.M else None
-        self.lines = []
+        line_data = {k: [] for k in ("ip", "in_", "dp", "dn", "vp", "vn")}
+        cos, lognnz = [], []
         for d in half_directions(ndim):
             ln = {}
             for side, sd in (("p", np.asarray(d)), ("n", -np.asarray(d))):
@@ -146,18 +165,31 @@ class _StageGeom:
                 ln["i" + side] = t(np.where(valid, flat, 0).astype(np.int64))
                 ln["d" + side] = t(np.where(valid, step, 1).astype(np.float32))
                 ln["v" + side] = t(valid)
-            self.lines.append({"ip": ln["ip"], "in": ln["in"], "dp": ln["dp"],
-                               "dn": ln["dn"], "vp": ln["vp"], "vn": ln["vn"]})
+            line_data["ip"].append(ln["ip"])
+            line_data["in_"].append(ln["in"])
+            line_data["dp"].append(ln["dp"])
+            line_data["dn"].append(ln["dn"])
+            line_data["vp"].append(ln["vp"])
+            line_data["vn"].append(ln["vn"])
+            c, ld = _line_static(d, torch, device)
+            cos.append(c)
+            lognnz.append(ld)
+        for name, values in line_data.items():
+            setattr(self, name, torch.stack(values, dim=0))
+        self.cos = torch.stack(cos, dim=0)
+        self.lognnz = torch.stack(lognnz, dim=0).unsqueeze(1)
 
 
 class _LegacyGeom:
     """Mask-based geometry for the old stage_forward API. Slower than the
     schedule-aware `_StageGeom`, but keeps older trainer/eval callers working."""
 
-    __slots__ = ("lines", "query_idx", "idx_np", "M")
+    __slots__ = ("ip", "in_", "dp", "dn", "vp", "vn", "cos", "lognnz",
+                 "query_idx", "idx_np", "M", "ndim")
 
     def __init__(self, known, max_radius, torch, device=None, query_idx=None):
         n = known.size
+        self.ndim = known.ndim
         flat = np.arange(n, dtype=np.int64).reshape(known.shape)
         if query_idx is None:
             idx = np.arange(n, dtype=np.int64)
@@ -167,23 +199,29 @@ class _LegacyGeom:
         self.M = int(len(idx))
 
         def t(a):
-            x = torch.from_numpy(np.ascontiguousarray(a.reshape(-1)))
+            x = torch.from_numpy(np.ascontiguousarray(a))
             return x.to(device) if device is not None else x
 
         self.query_idx = t(idx.astype(np.int64))
-        self.lines = []
+        line_data = {k: [] for k in ("ip", "in_", "dp", "dn", "vp", "vn")}
+        cos, lognnz = [], []
         for h in half_directions(known.ndim):
             neg = tuple(-c for c in h)
             ip, dp, vp = _nearest_in_dir(known, flat, h, max_radius)
             in_, dn, vn = _nearest_in_dir(known, flat, neg, max_radius)
-            self.lines.append({
-                "ip": t(ip.reshape(-1)[idx].astype(np.int64)),
-                "in": t(in_.reshape(-1)[idx].astype(np.int64)),
-                "dp": t(dp.reshape(-1)[idx].astype(np.float32)),
-                "dn": t(dn.reshape(-1)[idx].astype(np.float32)),
-                "vp": t(vp.reshape(-1)[idx]),
-                "vn": t(vn.reshape(-1)[idx]),
-            })
+            line_data["ip"].append(t(ip.reshape(-1)[idx].astype(np.int64)))
+            line_data["in_"].append(t(in_.reshape(-1)[idx].astype(np.int64)))
+            line_data["dp"].append(t(dp.reshape(-1)[idx].astype(np.float32)))
+            line_data["dn"].append(t(dn.reshape(-1)[idx].astype(np.float32)))
+            line_data["vp"].append(t(vp.reshape(-1)[idx]))
+            line_data["vn"].append(t(vn.reshape(-1)[idx]))
+            c, ld = _line_static(h, torch, device)
+            cos.append(c)
+            lognnz.append(ld)
+        for name, values in line_data.items():
+            setattr(self, name, torch.stack(values, dim=0))
+        self.cos = torch.stack(cos, dim=0)
+        self.lognnz = torch.stack(lognnz, dim=0).unsqueeze(1)
 
 
 def _period_prefixes(shape, levels, stride, block):
@@ -244,9 +282,11 @@ def _mlp(torch, sizes):
 
 
 def build_model(d: int = 32):
-    """Construct the GNN (its five sub-modules held as attributes)."""
+    """Construct the axial, dimension-agnostic GNN."""
     import torch
     import torch.nn as nn
+
+    assert d % 2 == 0, "d must be even for rotary axis embeddings"
 
     class InitEmbed(nn.Module):
         def __init__(self):
@@ -255,6 +295,29 @@ def build_model(d: int = 32):
 
         def forward(self, v):  # v: (..., 1) normalized value
             return self.net(v)
+
+    class Rope(nn.Module):
+        """Rotate a neighbour's per-axis embedding by a phase proportional to
+        the signed cosine between the line and each lattice axis. Standard RoPE
+        with a fixed geometric frequency bank, but the "position" is the
+        direction cosine in [-1, 1] rather than an integer token index."""
+
+        def __init__(self):
+            super().__init__()
+            freq = math.pi * 2.0 ** -torch.arange(d // 2, dtype=torch.float32)
+            self.register_buffer("freq", freq)
+
+        def forward(self, e, cos, sign):
+            # e: (B, L, M, K, d); cos: (L, K)
+            # theta broadcasts over B (dim 0) and M (dim 2).
+            theta = (sign * cos)[:, None, :, None] * self.freq  # (L, 1, K, d/2)
+            cs, sn = torch.cos(theta), torch.sin(theta)
+            B, L, M, K, _ = e.shape
+            pairs = e.reshape(B, L, M, K, d // 2, 2)
+            e1, e2 = pairs[..., 0], pairs[..., 1]        # (B, L, M, K, d/2)
+            out = torch.stack((e1 * cs - e2 * sn,
+                               e1 * sn + e2 * cs), dim=-1)
+            return out.reshape(B, L, M, K, d)
 
     class DirEmbed(nn.Module):
         def __init__(self):
@@ -333,65 +396,76 @@ def build_model(d: int = 32):
             super().__init__()
             self.d = d
             self.init = InitEmbed()
+            self.rope = Rope()
             self.dir = DirEmbed()
             self.bidir = BiDirEmbed()
-            self.attn = AttnPool()
+            self.line_pool = AttnPool()
+            self.axis_pool = AttnPool()
             self.head = PredHead()
             self.mix = MixEmbed()
 
         def _line_messages(self, E, geom):
             """Per-line messages for this stage's M query points, built from
             neighbour *embeddings* E (not raw values) so trends/periodicity
-            propagate hop by hop. Returns msgs (L, B, M, d) and valid (L, M).
-            geom already holds the +/- neighbour of each query point (the codec
-            only ever consumes one stage's points), so this touches O(M) rows of
-            the field, never the whole grid."""
+            propagate hop by hop. Returns msgs (L, B, M, K, d) and valid (L, M)
+            — the axis dim K is carried through Dir/BiDir as a batch dim, each
+            axis reading its neighbours through the rotary phase. geom already
+            holds the +/- neighbour of each query point, so this touches O(M)
+            rows of the field, never the whole grid."""
             B = E.shape[0]
-            M = geom.M
-            ip = torch.stack([ln["ip"] for ln in geom.lines], 0)  # (L, M)
-            in_ = torch.stack([ln["in"] for ln in geom.lines], 0)
-            dp = torch.stack([ln["dp"] for ln in geom.lines], 0)
-            dn = torch.stack([ln["dn"] for ln in geom.lines], 0)
-            vp = torch.stack([ln["vp"] for ln in geom.lines], 0)
-            vn = torch.stack([ln["vn"] for ln in geom.lines], 0)
-
             # Batch all directions into the MLPs at once. This turns the old
             # per-line Dir/BiDir calls into three larger matmuls per embed pass,
             # which is much friendlier to GPU inference.
-            ep = E[:, ip]                           # (B, L, M, d)
-            en = E[:, in_]                          # (B, L, M, d)
-            B, L, M, _ = ep.shape
-            lp = torch.log2(dp).view(1, L, M, 1).expand(B, L, M, 1)
-            lnn = torch.log2(dn).view(1, L, M, 1).expand(B, L, M, 1)
-            sign = ep.new_ones(B, L, M, 1)
+            ep = E[:, geom.ip]                      # (B, L, M, K, d)
+            en = E[:, geom.in_]
+            ep = self.rope(ep, geom.cos, 1.0)       # (B, L, M, K, d)
+            en = self.rope(en, geom.cos, -1.0)
+            _, L, M, K, _ = ep.shape
+            lp = (torch.log2(geom.dp) + geom.lognnz
+                  ).view(1, L, M, 1, 1).expand(B, L, M, K, 1)
+            lnn = (torch.log2(geom.dn) + geom.lognnz
+                   ).view(1, L, M, 1, 1).expand(B, L, M, K, 1)
+            sign = ep.new_ones(B, L, M, K, 1)
 
             bidir = self.bidir(en, ep, lnn, lp)
             dpos = self.dir(ep, sign, lp)
             dneg = self.dir(en, -sign, lnn)
-            both = (vp & vn).view(1, L, M, 1)
-            vp_only = (vp & ~vn).view(1, L, M, 1)
+            both = (geom.vp & geom.vn).view(1, L, M, 1, 1)
+            vp_only = (geom.vp & ~geom.vn).view(1, L, M, 1, 1)
             msg = torch.where(both, bidir, torch.where(vp_only, dpos, dneg))
-            return msg.permute(1, 0, 2, 3).contiguous(), (vp | vn)
+            return (msg.permute(1, 0, 2, 3, 4).contiguous(),
+                    geom.vp | geom.vn)
 
         def embed(self, E, geom):
-            """Pooled *context* embedding at geom's query points: single-query
-            attention over the per-line neighbour messages (no self value). For
-            an anchor with no known neighbours every line message is masked out
-            and the pool falls back to the learned null token."""
-            msgs, valid = self._line_messages(E, geom)
-            return self.attn(msgs, valid)                        # (B, M, d)
+            """Per-axis contexts at geom's query points: single-query attention
+            over the per-line neighbour messages (no self value), pooled
+            independently per axis. For an anchor with no known neighbours every
+            line is masked and each axis falls back to the learned null token."""
+            msgs, valid = self._line_messages(E, geom)  # (L, B, M, K, d), (L, M)
+            L, B, M, K, _ = msgs.shape
+            flat = msgs.reshape(L, B, M * K, self.d)
+            vflat = valid.repeat_interleave(K, dim=1)   # (L, M*K)
+            ctx = self.line_pool(flat, vflat)           # (B, M*K, d)
+            return ctx.reshape(B, M, K, self.d)         # (B, M, ndim, d)
 
         def finalize(self, ctx, self_val):
             """Finalized embedding for points whose value has just been
             revealed: embed the (noisy) known value with InitEmbed and fuse it
-            with the pooled context via MixEmbed. `self_val` is the
+            into every axis context via MixEmbed. `self_val` is the
             reconstructed value — truth + noise in training, the quantised
             recon at inference — so the mix learns to trust it up to eb."""
-            value_emb = self.init(self_val.unsqueeze(-1))        # (B, N, d)
-            return self.mix(ctx, value_emb)                      # (B, N, d)
+            if ctx.dim() != 4:
+                raise ValueError(
+                    f"finalize requires axial context (B, M, ndim, d), got "
+                    f"shape {tuple(ctx.shape)}")
+            value_emb = self.init(self_val.unsqueeze(-1)).unsqueeze(2)
+            return self.mix(ctx, value_emb.expand_as(ctx))
 
-        def head_of(self, pooled, eb):
-            return self.head(pooled, eb)                         # (B, N), (B, N)
+        def head_of(self, ctx, eb):
+            K, M = ctx.shape[2], ctx.shape[1]
+            msgs = ctx.permute(2, 0, 1, 3)
+            valid = torch.ones(K, M, dtype=torch.bool, device=ctx.device)
+            return self.head(self.axis_pool(msgs, valid), eb)
 
     return GNN()
 
@@ -407,10 +481,10 @@ def _load_inference_model(checkpoint_path, torch, device):
 
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     version = int(ckpt.get("version", 1))
-    if version != 2:
+    if version != CKPT_VERSION:
         raise ValueError(
-            "GNN checkpoint format v2 is required for the context predictor "
-            "(mean + scale). Retrain with scripts/train_gnn.py."
+            "Rotary axial GNN checkpoint format v4 is required. Retrain with "
+            "scripts/train_gnn.py."
         )
     d = int(ckpt["d"])
     model = build_model(d).eval()
@@ -424,6 +498,7 @@ def _load_inference_model(checkpoint_path, torch, device):
 
 def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
                          finalize_ctx=None, eb=0.01):
+    """Finalize with and return pre-axis-pool contexts for stage reuse."""
     if geom_prev is not None and geom_prev.M:
         ctx = finalize_ctx if finalize_ctx is not None else model.embed(E, geom_prev)
         finalized = model.finalize(ctx, finalize_vals)
@@ -511,7 +586,7 @@ class GNNPredictor:
         self._reset()
 
     def _reset(self):
-        self._E = None           # persistent embedding field (C, N, d)
+        self._E = None           # persistent embedding field (C, N, ndim, d)
         self._ctx = None         # last stage's head context (next finalize reuses it)
         self._stage = None       # list index of the last predicted stage
 
@@ -540,7 +615,7 @@ class GNNPredictor:
         if eb is None:
             eb = getattr(self, "eb", None)
         if eb is None:
-            raise ValueError("GNNPredictor.predict requires `eb` for v2 checkpoints")
+            raise ValueError("GNNPredictor.predict requires `eb`")
         c = recon.shape[0]
         span = self.vmax - self.vmin
         norm_eb = float(eb) / span
@@ -551,7 +626,9 @@ class GNNPredictor:
 
         cont = self._E is not None and self._stage == i - 1
         if not cont:
-            self._E = torch.zeros(c, known.size, self.d, device=self.device)
+            ndim = recon.ndim - 1
+            self._E = torch.zeros(
+                c, known.size, ndim, self.d, device=self.device)
             self._ctx = None
         geom_prev, geom_head = geoms[i - 1], geoms[i]
 
