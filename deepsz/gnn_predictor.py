@@ -288,6 +288,11 @@ def build_model(d: int = 32):
 
     assert d % 2 == 0, "d must be even for rotary axis embeddings"
 
+    # Hidden width of the message/fusion/readout MLPs. Decoupled from d so the
+    # per-axis field (memory ~ ndim * d) stays cheap while these functions keep
+    # capacity — the wide activations are transient, over one stage's points.
+    h = 2 * d
+
     class InitEmbed(nn.Module):
         def __init__(self):
             super().__init__()
@@ -298,13 +303,17 @@ def build_model(d: int = 32):
 
     class Rope(nn.Module):
         """Rotate a neighbour's per-axis embedding by a phase proportional to
-        the signed cosine between the line and each lattice axis. Standard RoPE
-        with a fixed geometric frequency bank, but the "position" is the
-        direction cosine in [-1, 1] rather than an integer token index."""
+        the signed cosine between the line and each lattice axis. RoPE, but the
+        "position" is the direction cosine in [-1, 1] rather than an unbounded
+        token index — so the frequencies are spread linearly over [~0, pi]
+        (a full turn across the cosine range) instead of the usual geometric
+        decay, which for a bounded position leaves almost every channel
+        unrotated. Low pairs stay near pass-through (content), high pairs are
+        strongly direction-sensitive."""
 
         def __init__(self):
             super().__init__()
-            freq = math.pi * 2.0 ** -torch.arange(d // 2, dtype=torch.float32)
+            freq = torch.linspace(math.pi / (d // 2), math.pi, d // 2)
             self.register_buffer("freq", freq)
 
         def forward(self, e, cos, sign):
@@ -322,7 +331,7 @@ def build_model(d: int = 32):
     class DirEmbed(nn.Module):
         def __init__(self):
             super().__init__()
-            self.net = _mlp(torch, [d + 2, d, d])
+            self.net = _mlp(torch, [d + 2, h, d])
 
         def forward(self, e, sign, logd):  # one neighbour + (sign, log2 dist)
             return self.net(torch.cat([e, sign, logd], dim=-1))
@@ -330,7 +339,7 @@ def build_model(d: int = 32):
     class BiDirEmbed(nn.Module):
         def __init__(self):
             super().__init__()
-            self.net = _mlp(torch, [2 * d + 2, d, d])
+            self.net = _mlp(torch, [2 * d + 2, h, d])
 
         def forward(self, e_neg, e_pos, logd_neg, logd_pos):
             return self.net(torch.cat([e_neg, e_pos, logd_neg, logd_pos], dim=-1))
@@ -361,7 +370,7 @@ def build_model(d: int = 32):
     class PredHead(nn.Module):
         def __init__(self):
             super().__init__()
-            self.net = _mlp(torch, [d + 1, d, 2])
+            self.net = _mlp(torch, [d + 1, h, 2])
 
         def forward(self, e, eb):
             B, M, _ = e.shape
@@ -386,7 +395,7 @@ def build_model(d: int = 32):
 
         def __init__(self):
             super().__init__()
-            self.net = _mlp(torch, [2 * d, d, d])
+            self.net = _mlp(torch, [2 * d, h, d])
 
         def forward(self, ctx, value_emb):  # (B, N, d), (B, N, d) -> (B, N, d)
             return self.net(torch.cat([ctx, value_emb], dim=-1))

@@ -16,7 +16,7 @@ module load pytorch-gpu
 
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak}
 # CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260708-112905-8b8203/gnn_predictor.pt}
-CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/.worktrees/axis-embeddings/data/runs/20260709-105949-598c28/gnn_predictor.pt}
+CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/.worktrees/axis-embeddings/data/runs/20260709-150222-de3edf/gnn_predictor.pt}
 TUNE=${TUNE:-rd}               # fast (1 encode) | size/rd (4 encodes)
 TUNE_SIZE_SLACK=${TUNE_SIZE_SLACK:-1.05}
 

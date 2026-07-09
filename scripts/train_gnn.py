@@ -374,7 +374,7 @@ def main():
 
     model = build_model(args.d).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
-    decay_start = int(args.steps * 0.8)  # linear lr decay over the last 20% steps
+    decay_start = int(args.steps * 0.7)  # linear lr decay over the last 30% steps
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(
         1.0, (args.steps - s) / max(args.steps - decay_start, 1)))
     n_params = sum(p.numel() for p in model.parameters())

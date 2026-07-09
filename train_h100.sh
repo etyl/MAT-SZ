@@ -19,10 +19,10 @@ python scripts/train_gnn.py \
     --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
     --out data/gnn_predictor.pt \
     --steps 10000 \
-    --batch 12 \
+    --batch 16 \
     --crop 128 \
     --d 128 \
-    --lr 0.0001 \
+    --lr 0.0005 \
     --noise-range 0.0001 0.05 \
     --eval-image /lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak/17.png \
     --eval-eb 0.01 \
