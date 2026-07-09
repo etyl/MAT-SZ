@@ -14,17 +14,25 @@
 module purge
 module load pytorch-gpu
 
-python scripts/train_gnn.py \
-    --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
-    --out data/gnn_predictor.pt \
-    --batch 4 \
-    --crop 128 \
-    --d 64 \
-    --levels 4 \
-    --stride 16 \
-    --device cuda \
-    --wandb-mode disabled \
-    --profile 1 \
-    "$@"
+CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/.worktrees/context-predictor/data/runs/20260708-180745-f15497/gnn_predictor.pt}
+IMAGE=${IMAGE:-/lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak/17.png}
+EB=${EB:-2}
+LEVELS=${LEVELS:-6}
+ANCHOR_STRIDE=${ANCHOR_STRIDE:-64}
+WARMUP=${WARMUP:-1}
+REPEATS=${REPEATS:-3}
 
-# op table -> job log; chrome trace -> trace.json (open in perfetto.dev)
+python scripts/profile_gnn_inference.py \
+  --checkpoint "$CKPT" \
+  --input "$IMAGE" \
+  --eb "$EB" \
+  --levels "$LEVELS" \
+  --anchor-stride "$ANCHOR_STRIDE" \
+  --device cuda \
+  --mode codec \
+  --warmup "$WARMUP" \
+  --repeats "$REPEATS" \
+  "$@"
+
+# Add --profile --trace inference_trace.json to the sbatch command when an
+# operator-level trace is needed; normal runs report the codec phase timings.

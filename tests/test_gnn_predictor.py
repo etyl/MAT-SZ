@@ -5,7 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from deepsz.gnn_predictor import (build_model, build_stage_geoms,
+from deepsz.gnn_predictor import (GNNPredictor, build_model, build_stage_geoms,
                                  half_directions, stage_forward)
 from deepsz.gnn_predictor import _LegacyGeom
 from deepsz.levels import stage_masks
@@ -54,7 +54,9 @@ def _run(model, recon, known, max_radius=64):
     E = torch.zeros(c, N, model.d)
     prev = np.zeros(known.shape, bool)
     with torch.no_grad():
-        values, _ = stage_forward(model, E, prev, known, x, max_radius, torch)
+        (values, log_b), _ = stage_forward(model, E, prev, known, x, max_radius,
+                                           torch, eb=0.01)
+    assert log_b.shape == values.shape
     return values.numpy().reshape(recon.shape)
 
 
@@ -116,9 +118,35 @@ def test_legacy_stage_forward_accepts_predict_idx():
     E = torch.zeros(1, known.size, model.d)
 
     with torch.no_grad():
-        values, E2 = stage_forward(model, E, prev, known, x, 16, torch,
-                                   predict_idx=idx)
+        (values, log_b), E2 = stage_forward(model, E, prev, known, x, 16, torch,
+                                            predict_idx=idx, eb=0.01)
 
     assert values.shape == (1, int(pos.sum()))
+    assert log_b.shape == values.shape
     assert E2.shape == E.shape
     assert np.isfinite(values.numpy()).all()
+
+
+def test_gnn_predictor_rejects_v1_checkpoint(tmp_path):
+    model = build_model(d=8).eval()
+    path = tmp_path / "v1.pt"
+    torch.save({"d": model.d, "state_dict": model.state_dict()}, path)
+
+    with pytest.raises(ValueError, match="format v2"):
+        GNNPredictor(path, 0.0, 1.0, levels=2, anchor_stride=4, anchor_block=1)
+
+
+def test_gnn_predictors_share_loaded_inference_model(tmp_path):
+    path = tmp_path / "v2.pt"
+    torch.save({
+        "version": 2,
+        "d": 8,
+        "state_dict": build_model(8).state_dict(),
+    }, path)
+
+    first = GNNPredictor(
+        path, 0.0, 1.0, levels=2, anchor_stride=4, anchor_block=1)
+    second = GNNPredictor(
+        path, 0.0, 2.0, levels=2, anchor_stride=4, anchor_block=1)
+
+    assert first.model is second.model

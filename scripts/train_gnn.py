@@ -6,9 +6,9 @@ images. CPU-friendly: the model is ~20k params, a few thousand steps suffice.
 Each step crops random 128x128 patches, picks a random colour plane
 (R / G / B / grayscale luma) so the net trains on grayscale as well as single
 colour channels, teacher-forces the hierarchical stage schedule (levels.py)
-with true values (+ optional quantization-like noise) and minimises pixel-
-weighted MAE over the hole positions of every refinement stage (each pixel
-counts once, so the dense stages dominate). Checkpoint -> data/gnn_predictor.pt.
+with true values (+ quantization-like noise at the sampled error bound) and
+minimises discretized-Laplacian NLL over the hole positions of every refinement
+stage. Checkpoint -> data/gnn_predictor.pt.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import random
 import time
 from collections import deque
@@ -110,6 +111,8 @@ def qz(pred, truth, eb):
     """Linear-quantised reconstruction (deepsz.quantizer): pred + the residual
     snapped to the 2*eb grid, so |recon - truth| <= eb. Works on np or torch."""
     round_ = torch.round if torch.is_tensor(truth) else np.round
+    if torch.is_tensor(eb) and torch.is_tensor(truth) and eb.ndim == 1:
+        eb = eb.reshape(-1, *([1] * (truth.ndim - 1)))
     return pred + 2 * eb * round_((truth - pred) / (2 * eb))
 
 
@@ -172,14 +175,56 @@ def sample_noise(batch, args, device):
     return torch.empty(batch, device=device).uniform_(log_lo, log_hi).exp()
 
 
-def run_stages(model, x, geoms, d, device, noise=0.0, eb=None, collect=False):
+def discretized_laplace_nll(mu, log_b, target, eb):
+    """Mean code length in bits for target under a discretized Laplace cell."""
+    eb = torch.as_tensor(eb, device=target.device, dtype=target.dtype).reshape(-1, 1)
+    b = torch.exp2(log_b).clamp_min(torch.finfo(target.dtype).tiny)
+    log_half = -math.log(2.0)
+    log2e = 1.0 / math.log(2.0)
+
+    abs_r = (target - mu).abs()
+    rho = abs_r / b
+    e = eb / b
+
+    # |residual| >= eb: quantization cell is wholly on one side of zero.
+    tail_mass = torch.log1p(-torch.exp((-2.0 * e).clamp_max(
+        -torch.finfo(target.dtype).eps)))
+    logp_tail = log_half - (rho - e) + tail_mass
+
+    # |residual| < eb: quantization cell straddles zero. Clamp rho to this
+    # branch's domain before evaluating so torch.where's eager branch execution
+    # cannot overflow on far-tail residuals.
+    rho_cross = torch.minimum(rho, e)
+    cross_p = (1.0 - 0.5 * torch.exp(-(e - rho_cross))
+               - 0.5 * torch.exp(-(e + rho_cross)))
+    logp_cross = torch.log(cross_p.clamp_min(1e-30))
+
+    logp = torch.where(abs_r >= eb, logp_tail, logp_cross)
+    return -logp * log2e
+
+
+def entropy_bits_from_codes(codes):
+    """Order-0 entropy H(codes), in bits/symbol."""
+    if not codes:
+        return float("nan")
+    flat = torch.cat([c.reshape(-1).detach().cpu() for c in codes])
+    if flat.numel() == 0:
+        return float("nan")
+    _, counts = torch.unique(flat, return_counts=True)
+    p = counts.to(torch.float64) / flat.numel()
+    return float(-(p * torch.log2(p)).sum())
+
+
+def run_stages(model, x, geoms, d, device, eb, teacher_force=False,
+               collect=False, collect_bins=False):
     """Run the stage schedule over truth `x` (B, N) using precomputed per-stage
-    geometry `geoms` (from ``build_stage_geoms``); return (sum |pred - truth|,
-    n_holes, known_vals, pred_only). Training passes `eb=None` and teacher-forces
-    with truth + `noise`. Eval passes an error bound `eb`: the fed-back known
-    values are then the model's own linear-quantised reconstructions (real
-    closed-loop inference, matching the codec), so the reported MAE is the
-    prediction error the codec actually pays to encode.
+    geometry `geoms` (from ``build_stage_geoms``); return (sum NLL bits,
+    n_holes, known_vals, pred_only, aux). ``aux`` includes summed prediction
+    absolute error for diagnostic MAE logging. Training passes
+    ``teacher_force=True`` and feeds truth plus uniform +/- eb noise. Eval
+    leaves teacher forcing off: the fed-back known values are the model's own
+    linear-quantised reconstructions (real closed-loop inference, matching the
+    codec).
 
     Mirrors the codec's evolution: at stage i we finalize the points revealed in
     stage i-1 into the field, then predict stage i. The head context of stage i-1
@@ -190,16 +235,16 @@ def run_stages(model, x, geoms, d, device, noise=0.0, eb=None, collect=False):
     logging; it costs a scatter per stage and is only read when logging eval
     images, so training leaves it off and gets `pred_only=None`."""
     B, N = x.shape
-    noise = _batch_scalar(noise, B, device)
+    eb = _batch_scalar(eb, B, device)
     E = torch.zeros(B, N, d, device=device)
     a0 = geoms[0].query_idx                      # anchors
     known_vals = torch.full_like(x, 0.5)
 
     def reveal(idx):  # teacher-force truth (+ training noise) at `idx`
-        nz = (torch.rand(B, idx.numel(), device=device) * 2 - 1) * noise[:, None]
+        nz = (torch.rand(B, idx.numel(), device=device) * 2 - 1) * eb[:, None]
         known_vals[:, idx] = (x[:, idx] + nz).clamp(0, 1)
 
-    if eb is None:
+    if teacher_force:
         reveal(a0)
     else:  # anchors quantised against pred 0, like the codec's stage 0
         known_vals[:, a0] = qz(torch.zeros(B, a0.numel(), device=device),
@@ -207,27 +252,33 @@ def run_stages(model, x, geoms, d, device, noise=0.0, eb=None, collect=False):
     # recon *without* residuals (raw preds at holes); only for image logging
     pred_only = known_vals.clone() if collect else None
 
-    abs_err = torch.zeros(())
+    nll_sum = torch.zeros((), device=device)
+    abs_err = torch.zeros((), device=device)
     npix = 0
+    bins = []
     head_ctx = None
     for i in range(1, len(geoms)):
         gp, gh = geoms[i - 1], geoms[i]
-        pred, E, head_ctx = stage_forward(model, E, gp, gh,
-                                          known_vals[:, gp.query_idx], torch,
-                                          finalize_ctx=head_ctx)
+        (pred, log_b), E, head_ctx = stage_forward(
+            model, E, gp, gh, known_vals[:, gp.query_idx], torch,
+            finalize_ctx=head_ctx, eb=eb)
         idx = gh.query_idx
         tgt = x[:, idx]
-        abs_err = abs_err + (pred - tgt).abs().sum()
+        nll = discretized_laplace_nll(pred, log_b, tgt, eb)
+        nll_sum = nll_sum + nll.sum()
+        abs_err = abs_err + (pred.detach() - tgt).abs().sum()
         npix += tgt.numel()
+        if collect_bins:
+            bins.append(torch.round((tgt - pred) / (2 * eb[:, None])).to(torch.int64))
         if collect:
             pred_only[:, idx] = pred
-        if eb is None:
+        if teacher_force:
             reveal(idx)
         else:
             known_vals[:, idx] = qz(pred, tgt, eb)
     # known_vals = full closed-loop recon; pred_only = same minus the quantised
     # residual added at each hole (residual = known_vals - pred_only).
-    return abs_err, npix, known_vals, pred_only
+    return nll_sum, npix, known_vals, pred_only, {"bins": bins, "abs_err": abs_err}
 
 
 def load_eval_plane(path, device):
@@ -264,7 +315,7 @@ def main():
                     .parent / "data" / "kodak" / "kodim17.png"),
                     help="held-out image the model + baseline are evaluated on")
     ap.add_argument("--eval-every", type=int, default=50,
-                    help="evaluate model MAE on the eval image every N steps")
+                    help="evaluate model bpp on the eval image every N steps")
     ap.add_argument("--img-every", type=int, default=500,
                     help="log eval reconstruction images every N steps")
     ap.add_argument("--eval-eb", type=float, default=0.01,
@@ -377,37 +428,43 @@ def main():
         geoms, _ = build_stage_geoms((args.crop, args.crop), levels, stride, 1,
                                      args.max_radius, torch, device)
 
-        # pixel-weighted MAE: sum absolute error over every hole across all
-        # stages, divide by total holes, so each pixel counts once (the dense
-        # final stages dominate, matching the L1 the quantizer really pays).
-        noise = sample_noise(x.shape[0], args, device)
-        abs_err, npix, _, _ = run_stages(model, x, geoms, args.d, device,
-                                         noise=noise)
-        loss = abs_err / max(npix, 1)
+        # Pixel-weighted discretized-Laplacian NLL: the sampled eb both
+        # conditions the head and sets the teacher-forcing noise amplitude.
+        eb = sample_noise(x.shape[0], args, device)
+        nll, npix, _, _, aux = run_stages(model, x, geoms, args.d, device,
+                                          eb=eb, teacher_force=True)
+        loss = nll / max(npix, 1)
+        train_mae = aux["abs_err"].detach() / max(npix, 1)
         opt.zero_grad()
         loss.backward()
         opt.step()
         sched.step()
         run_loss += loss.item()
         wandb.log({
-            "train/mae": loss.item(),
+            "train/bpp": loss.item(),
+            "train/mae": train_mae.item(),
             "lr": sched.get_last_lr()[0],
         }, step=step)
 
         if step % args.eval_every == 0:
             model.eval()
             with torch.no_grad():
-                ae, en, recon, pred_only = run_stages(
+                bits, en, recon, pred_only, aux = run_stages(
                     model, eval_x, eval_geoms, args.d, device,
-                    eb=args.eval_eb, collect=True)
+                    eb=args.eval_eb, collect=True, collect_bins=True)
             model.train()
             # eval runs the whole image (>>train crop); free its reserved pool
             # so the next train step doesn't OOM on the fragmented remainder.
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-            last_eval = ae.item() / max(en, 1)
-            log = {"eval/mae": last_eval,
-                   "eval/mae_vs_baseline": last_eval / baseline_mae}
+            last_eval = bits.item() / max(en, 1)
+            eval_mae = aux["abs_err"].item() / max(en, 1)
+            marginal = entropy_bits_from_codes(aux["bins"])
+            log = {"eval/bpp_model": last_eval,
+                   "eval/bpp_marginal": marginal,
+                   "eval/bpp_gain_frac": ((marginal - last_eval) / marginal
+                                          if marginal > 0 else float("nan"))}
+            log["eval/mae"] = eval_mae
             if step % args.img_every == 0:  # img-every: use a multiple of eval-every
                 recon = recon.detach().cpu().numpy().reshape(eh, ew)
                 pred_only = pred_only.detach().cpu().numpy().reshape(eh, ew)
@@ -418,8 +475,8 @@ def main():
             wandb.log(log, step=step)
 
         if step % 100 == 0:
-            bar.set_postfix(mae=f"{run_loss / 100:.5f}",
-                            eval=f"{last_eval:.5f}")
+            bar.set_postfix(bpp=f"{run_loss / 100:.5f}",
+                            eval_bpp=f"{last_eval:.5f}")
             run_loss = 0.0
 
         if prof is not None:
@@ -434,7 +491,7 @@ def main():
         print("wrote trace.json (open in chrome://tracing or perfetto.dev)")
         return
 
-    torch.save({"state_dict": model.state_dict(), "d": args.d}, out)
+    torch.save({"state_dict": model.state_dict(), "d": args.d, "version": 2}, out)
     print(f"saved {out}")
     wandb.save(str(out))
     wandb.finish()

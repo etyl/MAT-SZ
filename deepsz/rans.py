@@ -1,0 +1,219 @@
+"""Context-adaptive ANS coding for quantization bins.
+
+Symbols are grouped by their predicted scale level and coded with compiled
+``constriction`` categorical models. The groups are pushed in reverse order so
+the ANS stack decodes them in ascending scale-level order.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class RansTables:
+    cdfs: np.ndarray
+    precision: int
+    eb: float
+    radius: int
+    scale_grid: np.ndarray
+
+    @property
+    def total(self) -> int:
+        return 1 << self.precision
+
+    @property
+    def alphabet(self) -> int:
+        return 2 * self.radius
+
+
+def scale_to_level(scale: np.ndarray, eb: float, n_levels: int = 64) -> np.ndarray:
+    """Quantize Laplacian scale values to the shared 64-level log grid."""
+    scale = np.asarray(scale, np.float32)
+    lo = float(eb) / 16.0
+    hi = float(eb) * 64.0
+    if eb <= 0:
+        raise ValueError("eb must be > 0")
+    t = (np.log(np.clip(scale, lo, hi)) - np.log(lo)) / (np.log(hi) - np.log(lo))
+    return np.rint(t * (n_levels - 1)).clip(0, n_levels - 1).astype(np.uint8)
+
+
+def build_laplace_tables(
+    eb: float,
+    radius: int,
+    *,
+    n_levels: int = 64,
+    precision: int = 24,
+) -> RansTables:
+    """Precompute integer CDFs for the scale grid at one stage eb/radius."""
+    eb = float(eb)
+    radius = int(radius)
+    n_levels = int(n_levels)
+    precision = int(precision)
+    if eb <= 0:
+        raise ValueError("eb must be > 0")
+    cdfs = _build_laplace_cdfs_cached(radius, n_levels, precision)
+    lo = eb / 16.0
+    hi = eb * 64.0
+    grid = np.exp(np.linspace(np.log(lo), np.log(hi), n_levels)).astype(np.float32)
+    return RansTables(cdfs=cdfs, precision=precision, eb=eb, radius=radius,
+                      scale_grid=grid)
+
+
+@lru_cache(maxsize=128)
+def _build_laplace_cdfs_cached(
+    radius: int,
+    n_levels: int,
+    precision: int,
+) -> np.ndarray:
+    """CDFs in normalized units; invariant to the absolute error bound."""
+    alphabet = 2 * radius
+    total = 1 << precision
+    if alphabet > total:
+        raise ValueError("precision is too small for the quantizer alphabet")
+
+    eb = 1.0
+    lo = eb / 16.0
+    hi = eb * 64.0
+    grid = np.exp(np.linspace(np.log(lo), np.log(hi), n_levels)).astype(np.float64)
+    q = np.arange(alphabet, dtype=np.float64) - float(radius)
+    left = q * (2.0 * eb) - eb
+    right = q * (2.0 * eb) + eb
+
+    cdfs = np.empty((n_levels, alphabet + 1), np.uint32)
+    for i, b in enumerate(grid):
+        weights = _laplace_cdf_np(right, b) - _laplace_cdf_np(left, b)
+        weights[0] = max(weights[0], weights.max() * 1e-9)  # outlier marker
+        pmf = _quantize_pmf(weights, total)
+        cdf = np.empty(alphabet + 1, np.uint32)
+        cdf[0] = 0
+        cdf[1:] = np.cumsum(pmf, dtype=np.uint64)
+        cdfs[i] = cdf
+    return cdfs
+
+
+def model_bits(codes: np.ndarray, levels64: np.ndarray, tables: RansTables) -> float:
+    codes = np.asarray(codes, np.uint32).ravel()
+    levels = np.asarray(levels64, np.uint8).ravel()
+    if codes.shape != levels.shape:
+        raise ValueError("codes and levels must have the same flattened length")
+    if len(codes) == 0:
+        return 0.0
+    probs = np.empty(len(codes), np.float64)
+    for level in range(tables.cdfs.shape[0]):
+        idx = np.flatnonzero(levels == level)
+        if len(idx):
+            syms = codes[idx].astype(np.int64)
+            cdf = tables.cdfs[level]
+            probs[idx] = (cdf[syms + 1].astype(np.int64)
+                          - cdf[syms].astype(np.int64))
+    return float((-np.log2(probs / tables.total)).sum())
+
+
+def rans_encode(codes: np.ndarray, levels64: np.ndarray, tables: RansTables) -> bytes:
+    import constriction
+
+    codes = np.asarray(codes, np.uint32).ravel()
+    levels = np.asarray(levels64, np.uint8).ravel()
+    if codes.shape != levels.shape:
+        raise ValueError("codes and levels must have the same flattened length")
+    if len(codes) == 0:
+        return b""
+    if int(codes.max(initial=0)) >= tables.alphabet:
+        raise ValueError("code exceeds table alphabet")
+    n_levels = tables.cdfs.shape[0]
+    if int(levels.max(initial=0)) >= n_levels:
+        raise ValueError("scale level exceeds table count")
+
+    models = _ans_models(tables.radius, n_levels, tables.precision)
+    enc = constriction.stream.stack.AnsCoder()
+    codes_i32 = codes.astype(np.int32, copy=False)
+    for level in range(n_levels - 1, -1, -1):
+        idx = np.flatnonzero(levels == level)
+        if len(idx):
+            enc.encode_reverse(codes_i32[idx], models[level])
+    words = enc.get_compressed()
+    return words.astype("<u4", copy=False).tobytes()
+
+
+def rans_decode(blob: bytes, levels64: np.ndarray, tables: RansTables) -> np.ndarray:
+    import constriction
+
+    levels = np.asarray(levels64, np.uint8).ravel()
+    out = np.empty(len(levels), np.uint32)
+    if len(levels) == 0:
+        if blob:
+            raise ValueError("non-empty rANS blob for an empty stage")
+        return out
+    if len(blob) % 4:
+        raise ValueError("rANS payload is not aligned to 32-bit words")
+    n_levels = tables.cdfs.shape[0]
+    if int(levels.max(initial=0)) >= n_levels:
+        raise ValueError("scale level exceeds table count")
+
+    words = np.frombuffer(blob, dtype="<u4").astype(np.uint32, copy=False)
+    dec = constriction.stream.stack.AnsCoder(words)
+    models = _ans_models(tables.radius, n_levels, tables.precision)
+    for level in range(n_levels):
+        idx = np.flatnonzero(levels == level)
+        if len(idx):
+            out[idx] = dec.decode(models[level], len(idx)).astype(
+                np.uint32, copy=False)
+    if not dec.is_empty():
+        raise ValueError("trailing data in rANS payload")
+    return out
+
+
+@lru_cache(maxsize=16)
+def _ans_models(radius: int, n_levels: int, precision: int):
+    """Build reusable compiled models.
+
+    The discretized Laplace PMFs are invariant to ``eb`` because both bin
+    boundaries and the scale grid grow linearly with it.
+    """
+    import constriction
+
+    cdfs = _build_laplace_cdfs_cached(
+        int(radius), int(n_levels), int(precision))
+    return tuple(
+        constriction.stream.model.Categorical(
+            np.diff(cdf.astype(np.int64)).astype(np.float32), perfect=False)
+        for cdf in cdfs
+    )
+
+
+def _laplace_cdf_np(x, b):
+    z = np.clip(x / b, -700.0, 700.0)
+    return np.where(x < 0, 0.5 * np.exp(z), 1.0 - 0.5 * np.exp(-z))
+
+
+def _quantize_pmf(weights: np.ndarray, total: int) -> np.ndarray:
+    w = np.asarray(weights, np.float64)
+    scaled = w / w.sum() * total
+    pmf = np.floor(scaled).astype(np.int64)
+    pmf = np.maximum(pmf, 1)
+    diff = int(total - pmf.sum())
+    frac = scaled - np.floor(scaled)
+    if diff > 0:
+        order = np.argsort(-frac)
+        bulk, rem = divmod(diff, len(pmf))
+        if bulk:
+            pmf += bulk
+        if rem:
+            pmf[order[:rem]] += 1
+    elif diff < 0:
+        order = np.argsort(frac)
+        need = -diff
+        for idx in order:
+            take = min(need, int(pmf[idx] - 1))
+            if take:
+                pmf[idx] -= take
+                need -= take
+                if need == 0:
+                    break
+        if need:
+            raise ValueError("could not normalize PMF at requested precision")
+    return pmf.astype(np.uint32)

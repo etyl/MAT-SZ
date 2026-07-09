@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=gnn-sz
 #SBATCH --qos=qos_gpu-t3
-#SBATCH --time=8:00:00
+#SBATCH --time=6:00:00
 #SBATCH --partition=gpu_p13
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -23,12 +23,13 @@ python scripts/train_gnn.py \
     --d 256 \
     --lr 0.0001 \
     --noise-range 0.0001 0.05 \
+    --eval-image /lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak/17.png \
     --eval-eb 0.01 \
     --eval-every 100 \
     --img-every 500 \
     --device cuda \
     --wandb-mode offline \
-    --run-name gnn-sz \
+    --run-name gnn-context \
     "$@"
 
 # per-run dir -> data/runs/<date>-<hash>/ (checkpoint + config.json)

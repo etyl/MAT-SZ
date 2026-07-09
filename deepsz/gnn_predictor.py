@@ -17,7 +17,8 @@ stage schedule, which progressively densifies `known`):
     trend/curvature message (BiDirEmbed) or a one-sided neighbour into an
     extrapolation message (DirEmbed);
   * pool the per-line messages with a single-query attention layer (AttnPool)
-    into a *context* embedding, then read out the value (PredHead);
+    into a *context* embedding, then read out a Laplacian mean/scale
+    (PredHead), conditioned on the normalized error bound;
   * once a point's own value is revealed — known, but carrying the small error
     left by residual coding — embed it with InitEmbed and fuse it into the
     pooled context with MixEmbed to form that point's finalized embedding (the
@@ -201,6 +202,7 @@ def _period_prefixes(shape, levels, stride, block):
 
 
 _GEOM_CACHE: dict = {}
+_MODEL_CACHE: dict = {}
 
 
 def build_stage_geoms(shape, levels, stride, block, max_radius, torch, device=None):
@@ -296,10 +298,21 @@ def build_model(d: int = 32):
     class PredHead(nn.Module):
         def __init__(self):
             super().__init__()
-            self.net = _mlp(torch, [d, d, 1])
+            self.net = _mlp(torch, [d + 1, d, 2])
 
-        def forward(self, e):
-            return torch.sigmoid(self.net(e)).squeeze(-1)  # (..,) in [0,1]
+        def forward(self, e, eb):
+            B, M, _ = e.shape
+            eb = torch.as_tensor(eb, dtype=e.dtype, device=e.device).reshape(-1)
+            if eb.numel() == 1:
+                eb = eb.expand(B)
+            elif eb.numel() != B:
+                raise ValueError(f"eb has {eb.numel()} entries for batch {B}")
+            log_eb = torch.log2(eb.clamp_min(torch.finfo(e.dtype).tiny))
+            cond = log_eb.view(B, 1, 1).expand(B, M, 1)
+            out = self.net(torch.cat([e, cond], dim=-1))
+            mu = torch.sigmoid(out[..., 0])
+            log_b = out[..., 1].clamp(-8.0, 0.0)
+            return mu, log_b
 
     class MixEmbed(nn.Module):
         """Fuse a point's pooled neighbour context with the embedding of its
@@ -335,24 +348,30 @@ def build_model(d: int = 32):
             the field, never the whole grid."""
             B = E.shape[0]
             M = geom.M
-            one = torch.ones(B, M, 1, device=E.device)
-            msgs, valids = [], []
-            for ln in geom.lines:
-                ip, in_, dp, dn = ln["ip"], ln["in"], ln["dp"], ln["dn"]
-                vp, vn = ln["vp"], ln["vn"]
-                ep = E[:, ip]                      # (B, M, d) +side neighbour
-                en = E[:, in_]                     # -side neighbour
-                lp = torch.log2(dp).view(1, M, 1).expand(B, M, 1)
-                lnn = torch.log2(dn).view(1, M, 1).expand(B, M, 1)
-                bidir = self.bidir(en, ep, lnn, lp)
-                dpos = self.dir(ep, one, lp)
-                dneg = self.dir(en, -one, lnn)
-                both = (vp & vn).view(1, M, 1)
-                vp_only = (vp & ~vn).view(1, M, 1)
-                msg = torch.where(both, bidir, torch.where(vp_only, dpos, dneg))
-                msgs.append(msg)
-                valids.append(vp | vn)             # (M,)
-            return torch.stack(msgs, 0), torch.stack(valids, 0)
+            ip = torch.stack([ln["ip"] for ln in geom.lines], 0)  # (L, M)
+            in_ = torch.stack([ln["in"] for ln in geom.lines], 0)
+            dp = torch.stack([ln["dp"] for ln in geom.lines], 0)
+            dn = torch.stack([ln["dn"] for ln in geom.lines], 0)
+            vp = torch.stack([ln["vp"] for ln in geom.lines], 0)
+            vn = torch.stack([ln["vn"] for ln in geom.lines], 0)
+
+            # Batch all directions into the MLPs at once. This turns the old
+            # per-line Dir/BiDir calls into three larger matmuls per embed pass,
+            # which is much friendlier to GPU inference.
+            ep = E[:, ip]                           # (B, L, M, d)
+            en = E[:, in_]                          # (B, L, M, d)
+            B, L, M, _ = ep.shape
+            lp = torch.log2(dp).view(1, L, M, 1).expand(B, L, M, 1)
+            lnn = torch.log2(dn).view(1, L, M, 1).expand(B, L, M, 1)
+            sign = ep.new_ones(B, L, M, 1)
+
+            bidir = self.bidir(en, ep, lnn, lp)
+            dpos = self.dir(ep, sign, lp)
+            dneg = self.dir(en, -sign, lnn)
+            both = (vp & vn).view(1, L, M, 1)
+            vp_only = (vp & ~vn).view(1, L, M, 1)
+            msg = torch.where(both, bidir, torch.where(vp_only, dpos, dneg))
+            return msg.permute(1, 0, 2, 3).contiguous(), (vp | vn)
 
         def embed(self, E, geom):
             """Pooled *context* embedding at geom's query points: single-query
@@ -371,20 +390,46 @@ def build_model(d: int = 32):
             value_emb = self.init(self_val.unsqueeze(-1))        # (B, N, d)
             return self.mix(ctx, value_emb)                      # (B, N, d)
 
-        def head_of(self, pooled):
-            return self.head(pooled)                             # (B, N)
+        def head_of(self, pooled, eb):
+            return self.head(pooled, eb)                         # (B, N), (B, N)
 
     return GNN()
 
 
+def _load_inference_model(checkpoint_path, torch, device):
+    """Load immutable inference weights once per checkpoint revision/device."""
+    path = Path(checkpoint_path).resolve()
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size, str(device))
+    hit = _MODEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    version = int(ckpt.get("version", 1))
+    if version != 2:
+        raise ValueError(
+            "GNN checkpoint format v2 is required for the context predictor "
+            "(mean + scale). Retrain with scripts/train_gnn.py."
+        )
+    d = int(ckpt["d"])
+    model = build_model(d).eval()
+    model.load_state_dict(ckpt["state_dict"])
+    model.to(device)
+    checkpoint_hash = hashlib.sha256(path.read_bytes()).digest()[:16]
+    out = (d, model, checkpoint_hash)
+    _MODEL_CACHE[key] = out
+    return out
+
+
 def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
-                         finalize_ctx=None):
+                         finalize_ctx=None, eb=0.01):
     if geom_prev is not None and geom_prev.M:
         ctx = finalize_ctx if finalize_ctx is not None else model.embed(E, geom_prev)
         finalized = model.finalize(ctx, finalize_vals)
         E = E.index_copy(1, geom_prev.query_idx, finalized)     # write newly-known
     head_ctx = model.embed(E, geom_head)
-    return model.head_of(head_ctx), E, head_ctx
+    return model.head_of(head_ctx, eb), E, head_ctx
 
 
 def stage_forward(model, E, *args, **kwargs):
@@ -393,7 +438,7 @@ def stage_forward(model, E, *args, **kwargs):
     Supports both APIs:
     - optimized geometry API:
       ``stage_forward(model, E, geom_prev, geom_head, finalize_vals, torch,
-      finalize_ctx=None) -> (values, E, head_ctx)``
+      finalize_ctx=None, eb=...) -> ((mu, log_b), E, head_ctx)``
     - legacy mask API:
       ``stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch,
       predict_idx=None) -> (values, E)``
@@ -406,16 +451,18 @@ def stage_forward(model, E, *args, **kwargs):
     if args[0] is None or hasattr(args[0], "M"):
         geom_prev, geom_head, finalize_vals, torch = args[:4]
         finalize_ctx = kwargs.pop("finalize_ctx", None)
+        eb = kwargs.pop("eb", 0.01)
         if kwargs:
             raise TypeError(f"unexpected keyword argument {next(iter(kwargs))!r}")
         return _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals,
-                                    torch, finalize_ctx=finalize_ctx)
+                                    torch, finalize_ctx=finalize_ctx, eb=eb)
 
     # Legacy path used by older training/eval code.
     if len(args) < 5:
         raise TypeError("legacy stage_forward needs max_radius and torch")
     prev_mask, known_mask, norm, max_radius, torch = args[:5]
     predict_idx = kwargs.pop("predict_idx", None)
+    eb = kwargs.pop("eb", 0.01)
     if kwargs:
         raise TypeError(f"unexpected keyword argument {next(iter(kwargs))!r}")
     device = E.device
@@ -427,7 +474,7 @@ def stage_forward(model, E, *args, **kwargs):
         finalized = model.finalize(ctx, norm[:, geom_prev.query_idx])
         E = E.index_copy(1, geom_prev.query_idx, finalized)
     geom_head = _LegacyGeom(known_mask, max_radius, torch, device, predict_idx)
-    values = model.head_of(model.embed(E, geom_head))
+    values = model.head_of(model.embed(E, geom_head), eb)
     return values, E
 
 
@@ -441,6 +488,7 @@ class GNNPredictor:
     stream_flag = _FLAG
     tile_free = True  # runs on the whole tensor as one region, no tiling
     tunable = True    # encoder sweeps eb_ratio (no centre mode; see codec.encode)
+    provides_scale = True
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
                  tile_size: int = 64, max_radius: int = 64, device: str = "cpu",
@@ -457,13 +505,8 @@ class GNNPredictor:
         self.anchor_stride = int(anchor_stride)
         self.anchor_block = int(anchor_block)
 
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        self.d = ckpt["d"]
-        state_dict = ckpt["state_dict"]
-        self.model = build_model(self.d).eval().to(self.device)
-        self.model.load_state_dict(state_dict)
-        self.checkpoint_hash = hashlib.sha256(
-            Path(checkpoint_path).read_bytes()).digest()[:16]
+        self.d, self.model, self.checkpoint_hash = _load_inference_model(
+            checkpoint_path, torch, self.device)
         self._sched: dict = {}   # shape -> (stage geoms, count->index map)
         self._reset()
 
@@ -483,17 +526,24 @@ class GNNPredictor:
         return g
 
     def predict(self, recon: np.ndarray, known: np.ndarray,
-               pos: np.ndarray | None = None) -> np.ndarray:
+               pos: np.ndarray | None = None, eb: float | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Predict the current stage's holes (`pos`, the codec's stage mask).
         Everything scales with the stage: geometry is precomputed at the query
         points only, values are normalized only at the just-revealed points, and
         the finalize context is inherited from the previous stage's head (same
-        field, same geometry) instead of being pooled twice."""
+        field, same geometry) instead of being pooled twice. Returns
+        ``(pred, scale)`` in original data units, where ``scale`` is the
+        Laplacian ``b`` parameter predicted by the second head."""
         torch = self._torch
         if pos is None:
             raise ValueError("GNNPredictor.predict requires the stage mask `pos`")
+        if eb is None:
+            eb = getattr(self, "eb", None)
+        if eb is None:
+            raise ValueError("GNNPredictor.predict requires `eb` for v2 checkpoints")
         c = recon.shape[0]
         span = self.vmax - self.vmin
+        norm_eb = float(eb) / span
         geoms, count_to_i = self._schedule(recon.shape[1:])
         i = count_to_i.get(int(known.sum()))
         if not i:  # None (unknown count) or 0 (anchors are coded directly)
@@ -513,9 +563,11 @@ class GNNPredictor:
              ).astype(np.float32)).to(self.device)
         finalize_ctx = self._ctx if cont else None
         with torch.no_grad():
-            values, self._E, self._ctx = stage_forward(
+            (values, log_b), self._E, self._ctx = stage_forward(
                 self.model, self._E, geom_prev, geom_head, fvals, torch,
-                finalize_ctx=finalize_ctx)
+                finalize_ctx=finalize_ctx, eb=norm_eb)
         self._stage = i
         pred = values.cpu().numpy().reshape(c, -1) * span + self.vmin
-        return np.clip(pred, self.vmin, self.vmax).astype(np.float32)
+        scale = np.exp2(log_b.cpu().numpy().reshape(c, -1)) * span
+        return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
+                scale.astype(np.float32))

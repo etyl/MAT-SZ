@@ -15,10 +15,11 @@ from .gnn_predictor import GNNPredictor
 from .levels import stage_ebs, stage_masks
 from .quantizer import dequantize
 from .bitstream import unpack_stage
+from .rans import build_laplace_tables, scale_to_level
 
 
 _MAGIC = b"MATSZGNN"
-_VERSION = 1
+_VERSION = 2
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
 
@@ -84,6 +85,7 @@ def _empty_stats(n_stages: int) -> dict[str, Any]:
         "stage_codes": [0] * n_stages,
         "stage_outliers": [0] * n_stages,
         "stage_payload_bytes": [0] * n_stages,
+        "stage_model_bits": [0.0] * n_stages,
         "stage_pred_sae": [0.0] * n_stages,
         "stage_pred_sse": [0.0] * n_stages,
         "stage_recon_sae": [0.0] * n_stages,
@@ -99,19 +101,40 @@ def _decompress_region(
     ebs: list[float],
     radius: int,
     predictor: GNNPredictor,
+    use_rans: bool,
 ) -> np.ndarray:
     recon = np.zeros((1, *shape), np.float32)
     known = np.zeros(shape, bool)
     off = 0
     for stage_idx, pos in enumerate(masks):
-        codes, outliers, off = unpack_stage(payload, off)
         n = int(pos.sum())
         if n == 0:
+            if use_rans:
+                tables = build_laplace_tables(ebs[stage_idx], radius)
+                codes, outliers, off = unpack_stage(
+                    payload, off, rans_levels=np.zeros(0, np.uint8),
+                    rans_tables=tables)
+            else:
+                codes, outliers, off = unpack_stage(payload, off)
             continue
         if stage_idx == 0:
             pred = np.zeros((1, n), np.float32)
+            scale = np.full((1, n), ebs[stage_idx], np.float32)
         else:
-            pred = predictor.predict(recon, known, pos)
+            if use_rans:
+                pred, scale = predictor.predict(recon, known, pos,
+                                                eb=ebs[stage_idx])
+            else:
+                got = predictor.predict(recon, known, pos, eb=ebs[stage_idx])
+                pred = got[0] if isinstance(got, tuple) else got
+                scale = None
+        if use_rans:
+            tables = build_laplace_tables(ebs[stage_idx], radius)
+            levels64 = scale_to_level(scale, ebs[stage_idx]).reshape(-1)
+            codes, outliers, off = unpack_stage(
+                payload, off, rans_levels=levels64, rans_tables=tables)
+        else:
+            codes, outliers, off = unpack_stage(payload, off)
         recon[:, pos] = dequantize(pred, codes, outliers, ebs[stage_idx],
                                    radius).reshape(1, n)
         known |= pos
@@ -207,6 +230,7 @@ class GNNCompressorCodec:
                 "vmin": vmin,
                 "vmax": vmax,
                 "eb_ratio": ratio,
+                "entropy_coder": "rans",
                 "checkpoint_hash": self.checkpoint_hash.hex(),
             }
             stream = _write_stream(meta, payload, self.zstd_level)
@@ -238,8 +262,9 @@ class GNNCompressorCodec:
         ebs = stage_ebs(shape, int(meta["levels"]), int(meta["anchor_stride"]),
                         int(meta["anchor_block"]), float(meta["error_bound"]),
                         float(meta["eb_ratio"]))
+        use_rans = meta.get("entropy_coder", "huffman") == "rans"
         values = _decompress_region(payload, shape, masks, ebs, int(meta["radius"]),
-                                    predictor)
+                                    predictor, use_rans)
         out = _restore_dtype(values.reshape(original_shape), dtype)
         return torch.as_tensor(out)
 

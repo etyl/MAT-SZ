@@ -3,6 +3,7 @@
 numpy
 scipy
 zstandard
+constriction~=0.4.2
 pillow
 pytest
 pysz   # SZ3 baseline for `eval` (imagecodecs needs glibc>=2.28; this box has 2.27)

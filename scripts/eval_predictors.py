@@ -28,7 +28,7 @@ from deepsz.bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_INTERP, FLAG_MOCK, Heade
 from deepsz.codec import compress, decompress
 from deepsz.predictor import InterpPredictor, MockPredictor
 
-METHODS = ("gnn", "interp", "interp-linear", "sz3")
+METHODS = ("gnn-rans", "gnn", "interp", "interp-linear", "sz3")
 
 
 def default_error_bounds() -> list[float]:
@@ -45,7 +45,7 @@ def load_image(path: Path) -> np.ndarray:
 
 def make_predictor(method: str, img: np.ndarray, args):
     """Encoder-side predictor for a DeepSZ closed-loop method."""
-    if method == "gnn":
+    if method in ("gnn", "gnn-rans"):
         from deepsz.gnn_predictor import GNNPredictor
         return GNNPredictor(args.gnn_checkpoint, float(img.min()), float(img.max()),
                             tile_size=args.gnn_tile, max_radius=args.max_radius,
@@ -80,27 +80,49 @@ def _quality(img: np.ndarray, rec: np.ndarray, n_bytes: int, eb: float) -> dict:
     peak = 255.0 if img.dtype == np.uint8 else max(float(img.max()) - float(img.min()), 1.0)
     psnr = 10 * np.log10(peak ** 2 / mse) if mse > 0 else float("inf")
     bpp = 8 * n_bytes / (img.shape[0] * img.shape[1])
+    # Quantization is performed in float32 and enforces float32(eb). Comparing
+    # against the narrower Python float (e.g. 0.2) can report a false failure.
+    bound_ok = max_err <= float(np.float32(eb))
     return dict(n_bytes=n_bytes, bpp=bpp, psnr=psnr, max_err=max_err,
-                bound_ok=max_err <= eb)
+                bound_ok=bound_ok)
 
 
 def eval_deepsz(img: np.ndarray, eb: float, method: str, args) -> dict:
-    pred = make_predictor(method, img, args)
     t0 = time.time()
-    stream, _ = compress(img, eb, pred, levels=args.levels,
-                         anchor_stride=args.anchor_stride,
-                         anchor_block=args.anchor_block, radius=args.radius,
-                         seed=args.seed, zstd_level=args.zstd_level,
-                         eb_ratio=args.eb_ratio,
-                         tune=args.tune,
-                         tune_size_slack=args.tune_size_slack)
+    pred = make_predictor(method, img, args)
+    t_encode_setup = time.time() - t0
+    t0 = time.time()
+    stream, stats = compress(img, eb, pred, levels=args.levels,
+                             anchor_stride=args.anchor_stride,
+                             anchor_block=args.anchor_block, radius=args.radius,
+                             seed=args.seed, zstd_level=args.zstd_level,
+                             eb_ratio=args.eb_ratio,
+                             tune=args.tune,
+                             tune_size_slack=args.tune_size_slack)
     t_comp = time.time() - t0
     del pred  # drop the encoder-side embedding field before decode builds its own
+    decode_setup = [0.0]
+
+    def predictor_factory(hdr):
+        setup_start = time.time()
+        predictor = build_predictor_for_decompress(method, hdr, args)
+        decode_setup[0] += time.time() - setup_start
+        return predictor
+
     t0 = time.time()
-    rec = decompress(stream, lambda hdr: build_predictor_for_decompress(method, hdr, args))
+    rec = decompress(stream, predictor_factory)
     t_dec = time.time() - t0
     r = _quality(img, rec, len(stream), eb)
-    r.update(t_comp=t_comp, t_dec=t_dec)
+    r.update(
+        t_comp=t_comp,
+        t_dec=t_dec,
+        t_encode_setup=t_encode_setup,
+        t_decode_setup=decode_setup[0],
+        tune_candidates=stats["tune_candidates"],
+        t_predict=stats["search_predict_s"],
+        t_quantize=stats["search_quantize_s"],
+        t_entropy=stats["search_entropy_s"],
+    )
     return r
 
 
@@ -209,7 +231,8 @@ def plot_rd(rows: list[dict], methods: list[str], path: str) -> None:
 def save_csv(rows: list[dict], path: str) -> None:
     import csv
     fields = ["image", "method", "eb", "n_bytes", "bpp", "psnr", "max_err",
-              "bound_ok", "t_comp", "t_dec"]
+              "bound_ok", "t_encode_setup", "t_comp", "t_decode_setup", "t_dec",
+              "tune_candidates", "t_predict", "t_quantize", "t_entropy"]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -224,7 +247,7 @@ def main():
                     help="directory of Kodak images (kodim*.png)")
     ap.add_argument("--gnn-checkpoint", default=str(ROOT / "data" / "gnn_predictor.pt"),
                     help="GNN checkpoint (.pt) for the gnn method")
-    ap.add_argument("--methods", nargs="+", default=["gnn", "interp", "sz3"],
+    ap.add_argument("--methods", nargs="+", default=["gnn-rans", "interp", "sz3"],
                     choices=METHODS, help="predictors to evaluate")
     ap.add_argument("--eb", type=float, nargs="+",
                     default=default_error_bounds(),
@@ -282,13 +305,14 @@ def main():
     if not images:
         sys.exit(f"No images found in {data_dir}")
 
-    if "gnn" in args.methods and not Path(args.gnn_checkpoint).exists():
+    uses_gnn = any(m in ("gnn", "gnn-rans") for m in args.methods)
+    if uses_gnn and not Path(args.gnn_checkpoint).exists():
         sys.exit(f"GNN checkpoint not found: {args.gnn_checkpoint}")
 
     print(f"Evaluating {args.methods} on {len(images)} images from {data_dir}")
     print(f"Error bounds: {args.eb}  |  levels={args.levels} "
           f"anchor_stride={args.anchor_stride} anchor_block={args.anchor_block}")
-    if "gnn" in args.methods:
+    if uses_gnn:
         print(f"GNN checkpoint: {args.gnn_checkpoint}  (tile={args.gnn_tile}, "
               f"device={args.device})\n")
 
@@ -316,10 +340,18 @@ def main():
                 ok = "PASS" if r["bound_ok"] else "FAIL"
                 print(f"bpp={r['bpp']:.3f} PSNR={r['psnr']:.2f}dB "
                       f"maxErr={r['max_err']:.1f} [{ok}] {r['t_comp']:.2f}s")
+                if method in ("gnn", "gnn-rans"):
+                    print(f"    GNN search: {r['tune_candidates']} candidate(s), "
+                          f"setup={r['t_encode_setup']:.2f}s, "
+                          f"predict={r['t_predict']:.2f}s "
+                          f"quantize={r['t_quantize']:.2f}s "
+                          f"entropy={r['t_entropy']:.2f}s; "
+                          f"decode={r['t_dec']:.2f}s "
+                          f"(setup={r['t_decode_setup']:.2f}s)")
                 # GNN runs untiled (whole image = one region), so its embedding
                 # field is O(image size) instead of O(tile size); release it
                 # and any cached CUDA blocks before the next image/eb.
-                if method == "gnn" and args.device.startswith("cuda"):
+                if method in ("gnn", "gnn-rans") and args.device.startswith("cuda"):
                     import gc
                     import torch
                     gc.collect()

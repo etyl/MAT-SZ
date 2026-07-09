@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from scripts.train_gnn import sample_noise
+from scripts.train_gnn import discretized_laplace_nll, sample_noise
 
 
 def test_noise_range_samples_log_uniformly():
@@ -27,3 +27,18 @@ def test_noise_without_range_stays_fixed():
     noise = sample_noise(4, args, "cpu")
 
     assert torch.equal(noise, torch.full((4,), args.noise))
+
+
+def test_discretized_laplace_nll_stays_finite_in_tails():
+    mu = torch.tensor([[0.0, 1.0, 0.5, 0.999999]], requires_grad=True)
+    target = torch.tensor([[1.0, 0.0, 0.5001, 0.0]])
+    log_b = torch.full_like(mu, -8.0, requires_grad=True)
+    eb = torch.tensor([1e-4])
+
+    nll = discretized_laplace_nll(mu, log_b, target, eb)
+    loss = nll.mean()
+    loss.backward()
+
+    assert torch.isfinite(nll).all()
+    assert torch.isfinite(mu.grad).all()
+    assert torch.isfinite(log_b.grad).all()

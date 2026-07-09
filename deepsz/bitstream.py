@@ -4,7 +4,10 @@ File = fixed struct-packed little-endian header, then a u32 per-tile payload
 size table, then one zstd frame holding the concatenated tile payloads.
 
 Tile payload (produced by codec, opaque here) = per stage:
-  [n_codes u32][huffman blob len u64][huffman blob][n_outliers u32][outliers f32...]
+  [n_codes u32][entropy blob len u64][entropy blob][n_outliers u32][outliers f32...]
+
+For legacy streams the entropy blob is canonical Huffman. Streams whose header
+sets FLAG_RANS use scale-conditioned context coding over the same code array.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import numpy as np
 import zstandard
 
 MAGIC = b"MATSZ01\0"
-VERSION = 3
+VERSION = 4
 
 FLAG_MOCK = 1 << 0
 FLAG_GRAY = 1 << 1
@@ -24,6 +27,7 @@ FLAG_GNN = 1 << 2
 FLAG_INTERP = 1 << 3       # SZ-style interpolation baseline (torch-free)
 FLAG_CUBIC = 1 << 4        # interp order: set = cubic, clear = linear
 FLAG_NOTILE = 1 << 5       # whole image is one tile (no padding, no seam)
+FLAG_RANS = 1 << 6         # per-symbol scale-conditioned coder for stage bins
 
 _HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHHd"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
@@ -113,20 +117,44 @@ def read_stream(data: bytes) -> tuple[Header, list[bytes]]:
 
 # ---- stage-record helpers used by codec ----
 
-def pack_stage(codes: np.ndarray, outliers: np.ndarray) -> bytes:
+def pack_stage(
+    codes: np.ndarray,
+    outliers: np.ndarray,
+    *,
+    rans_levels: np.ndarray | None = None,
+    rans_tables=None,
+) -> bytes:
     blob_codes = np.asarray(codes, np.uint32)
     out = np.asarray(outliers, np.float32)
-    from .huffman import huffman_encode
-    hblob = huffman_encode(blob_codes)
+    if rans_levels is None:
+        from .huffman import huffman_encode
+        hblob = huffman_encode(blob_codes)
+    else:
+        from .rans import rans_encode
+        if rans_tables is None:
+            raise ValueError("rans_tables are required with rans_levels")
+        hblob = rans_encode(blob_codes, rans_levels, rans_tables)
     return (struct.pack("<IQ", len(blob_codes), len(hblob)) + hblob
             + struct.pack("<I", len(out)) + out.tobytes())
 
 
-def unpack_stage(buf: bytes, off: int) -> tuple[np.ndarray, np.ndarray, int]:
+def unpack_stage(
+    buf: bytes,
+    off: int,
+    *,
+    rans_levels: np.ndarray | None = None,
+    rans_tables=None,
+) -> tuple[np.ndarray, np.ndarray, int]:
     n_codes, hlen = struct.unpack_from("<IQ", buf, off)
     off += 12
-    from .huffman import huffman_decode
-    codes = huffman_decode(buf[off:off + hlen])
+    if rans_levels is None:
+        from .huffman import huffman_decode
+        codes = huffman_decode(buf[off:off + hlen])
+    else:
+        from .rans import rans_decode
+        if rans_tables is None:
+            raise ValueError("rans_tables are required with rans_levels")
+        codes = rans_decode(buf[off:off + hlen], rans_levels, rans_tables)
     if len(codes) != n_codes:
         raise ValueError("stage code count mismatch")
     off += hlen

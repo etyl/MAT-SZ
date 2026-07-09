@@ -17,6 +17,7 @@ def tiny_checkpoint(tmp_path):
     torch.save({
         "d": model.d,
         "state_dict": model.state_dict(),
+        "version": 2,
     }, path)
     return path
 
