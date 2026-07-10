@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=gnn-prof
+#SBATCH --job-name=gnn-profile-batch
 #SBATCH --qos=qos_gpu-dev
 #SBATCH --time=0:20:00
 #SBATCH --partition=gpu_p13
@@ -14,19 +14,14 @@
 module purge
 module load pytorch-gpu
 
-export PYTHONUNBUFFERED=1
+export PYTHONUNBUFFERED=1   # flush the table to the SLURM .out live
 
 CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
 
-# Operator-level trace of one worst-case chunk's GNN forward: shows which ops
-# (matmul/gelu/softmax/index/copy...) dominate CUDA time -> what to optimize.
 python scripts/profile_gnn.py \
     --gnn-checkpoint "$CKPT" \
     --levels 4 \
     --anchor-stride 16 \
-    --profile \
-    --profile-batch 1 \
-    --profile-rows 30 \
-    --fp16 \
-    --compile \
+    --batches 1,2,4,8,16 \
+    --target-shape 119,128,128,128 \
     "$@"

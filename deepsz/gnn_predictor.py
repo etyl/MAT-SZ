@@ -37,9 +37,11 @@ structure is a pure inductive bias layered on the direction-blind model.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +52,15 @@ from .levels import point_levels, stage_masks
 # module (e.g. for FLAG constants) stays cheap.
 
 CKPT_VERSION = 5
+
+# Query-tile for the message pass: caps the transient (B, L, m, K, d) buffers so
+# GPU peak scales with _M_TILE, not the stage's full M (line_pool is per-query,
+# so tiling is math-identical within a stream). Off by default: a fixed tile
+# shreds the whole-tensor path (a big 2D stage has M~150k -> ~150 tiny blocks,
+# ~2x slower/image) and isn't needed now that batch=1 fits (batching is
+# saturated) and fp16 halves the buffers. Set DEEPSZ_M_TILE=1024 only when
+# running big chunk_batch on tight VRAM. Stored in meta so decode replays it.
+_M_TILE = int(os.environ.get("DEEPSZ_M_TILE", 1 << 30))  # effectively no tiling
 
 
 def half_directions(ndim: int) -> list[tuple[int, ...]]:
@@ -63,16 +74,18 @@ def half_directions(ndim: int) -> list[tuple[int, ...]]:
     return dirs
 
 
-def _nearest_steps(pat: np.ndarray, dvec, P: int) -> np.ndarray:
-    """For each residue r in [0,P)^ndim, the smallest step t>=1 along ``dvec``
-    that lands on a True cell of the periodic pattern ``pat`` (period P), or 0
-    if none. The hit sequence along any lattice line is periodic in t with
-    period dividing P, so the global-nearest hit is the first one within [1,P]:
-    a t0(r)+kP tail never beats it. O(P^(ndim+1)) on the tiny period tile."""
-    grids = np.indices(pat.shape)                       # (ndim, P, ...)
-    t0 = np.zeros(pat.shape, np.int64)                  # 0 == no hit yet
+def _nearest_steps(pat: np.ndarray, dvec, P: int, res=None) -> np.ndarray:
+    """Smallest step t>=1 along ``dvec`` landing on a True cell of the periodic
+    pattern ``pat`` (period P), or 0 if none. The hit sequence along any lattice
+    line is periodic in t with period dividing P, so the nearest hit is the first
+    within [1,P]. With ``res`` (a tuple of ndim residue arrays, len M), evaluated
+    only at those M query residues -> O(P*M); without it, at every residue of the
+    P^ndim tile -> O(P^(ndim+1)). Query points are all we ever index, so pass res."""
+    if res is None:
+        res = np.indices(pat.shape)                     # every residue: (ndim, P, ...)
+    t0 = np.zeros(res[0].shape, np.int64)               # 0 == no hit yet
     for t in range(1, P + 1):
-        r = tuple((grids[k] + t * dvec[k]) % P for k in range(pat.ndim))
+        r = tuple((res[k] + t * dvec[k]) % P for k in range(pat.ndim))
         take = (t0 == 0) & pat[r]
         t0[take] = t
     return t0
@@ -154,7 +167,7 @@ class _StageGeom:
                     ln["d" + side] = t(np.zeros(0, np.float32))
                     ln["v" + side] = t(np.zeros(0, bool))
                     continue
-                step = _nearest_steps(pat, sd, P)[res]          # (M,) infinite-lattice
+                step = _nearest_steps(pat, sd, P, res)          # (M,) at query residues
                 nb = Q + step[:, None] * sd                     # neighbour coords
                 inb = np.all((nb >= 0) & (nb < shp), axis=1)
                 valid = (step >= 1) & (step <= limit) & inb     # legacy: in-bounds & <=limit
@@ -285,6 +298,7 @@ def build_model(d: int = 32):
     """Construct the axial, dimension-agnostic GNN."""
     import torch
     import torch.nn as nn
+    F = nn.functional
 
     assert d % 2 == 0, "d must be even for rotary axis embeddings"
 
@@ -334,7 +348,16 @@ def build_model(d: int = 32):
             self.net = _mlp(torch, [d + 2, h, d])
 
         def forward(self, e, sign, logd):  # one neighbour + (sign, log2 dist)
-            return self.net(torch.cat([e, sign, logd], dim=-1))
+            # Split the first Linear over its input blocks instead of concatenating
+            # e (B,L,M,K,d) with the two scalar columns — avoids materializing the
+            # big (…,d+2) buffer (the `cat` was ~14% of GPU time). Same math; net.*
+            # weights are unchanged so checkpoints load as-is.
+            w = self.net[0].weight                       # (h, d+2)
+            x = F.linear(e, w[:, :d], self.net[0].bias) \
+                + F.linear(torch.cat([sign, logd], -1), w[:, d:])
+            for layer in self.net[1:]:
+                x = layer(x)
+            return x
 
     class BiDirEmbed(nn.Module):
         def __init__(self):
@@ -342,7 +365,13 @@ def build_model(d: int = 32):
             self.net = _mlp(torch, [2 * d + 2, h, d])
 
         def forward(self, e_neg, e_pos, logd_neg, logd_pos):
-            return self.net(torch.cat([e_neg, e_pos, logd_neg, logd_pos], dim=-1))
+            w = self.net[0].weight                       # (h, 2d+2)
+            x = F.linear(e_neg, w[:, :d]) \
+                + F.linear(e_pos, w[:, d:2 * d], self.net[0].bias) \
+                + F.linear(torch.cat([logd_neg, logd_pos], -1), w[:, 2 * d:])
+            for layer in self.net[1:]:
+                x = layer(x)
+            return x
 
     class AttnPool(nn.Module):
         def __init__(self):
@@ -430,49 +459,69 @@ def build_model(d: int = 32):
             self.mix = MixEmbed()
             self.coarse = CoarseProj()
 
-        def _line_messages(self, E, geom):
-            """Per-line messages for this stage's M query points, built from
-            neighbour *embeddings* E (not raw values) so trends/periodicity
-            propagate hop by hop. Returns msgs (L, B, M, K, d) and valid (L, M)
-            — the axis dim K is carried through Dir/BiDir as a batch dim, each
-            axis reading its neighbours through the rotary phase. geom already
-            holds the +/- neighbour of each query point, so this touches O(M)
-            rows of the field, never the whole grid."""
+        def _line_messages(self, E, geom, msl=slice(None)):
+            """Per-line messages for a slice ``msl`` of this stage's M query
+            points, built from neighbour *embeddings* E (not raw values) so
+            trends/periodicity propagate hop by hop. Returns msgs (L, B, m, K, d)
+            and valid (L, m) — the axis dim K is carried through Dir/BiDir as a
+            batch dim, each axis reading its neighbours through the rotary phase.
+            geom already holds the +/- neighbour of each query point, so this
+            touches O(m) rows of the field, never the whole grid."""
             B = E.shape[0]
+            ip, in_ = geom.ip[:, msl], geom.in_[:, msl]     # (L, m)
+            dp, dn = geom.dp[:, msl], geom.dn[:, msl]
+            vp, vn = geom.vp[:, msl], geom.vn[:, msl]
             # Batch all directions into the MLPs at once. This turns the old
             # per-line Dir/BiDir calls into three larger matmuls per embed pass,
             # which is much friendlier to GPU inference.
-            ep = E[:, geom.ip]                      # (B, L, M, K, d)
-            en = E[:, geom.in_]
-            ep = self.rope(ep, geom.cos, 1.0)       # (B, L, M, K, d)
+            ep = E[:, ip]                           # (B, L, m, K, d)
+            en = E[:, in_]
+            ep = self.rope(ep, geom.cos, 1.0)       # (B, L, m, K, d)
             en = self.rope(en, geom.cos, -1.0)
             _, L, M, K, _ = ep.shape
-            lp = (torch.log2(geom.dp) + geom.lognnz
+            lp = (torch.log2(dp) + geom.lognnz
                   ).view(1, L, M, 1, 1).expand(B, L, M, K, 1)
-            lnn = (torch.log2(geom.dn) + geom.lognnz
+            lnn = (torch.log2(dn) + geom.lognnz
                    ).view(1, L, M, 1, 1).expand(B, L, M, K, 1)
             sign = ep.new_ones(B, L, M, K, 1)
+            both = (vp & vn).view(1, L, M, 1, 1)
+            vp_only = (vp & ~vn).view(1, L, M, 1, 1)
+            # Build the message in place, one direction MLP at a time, so we never
+            # hold bidir/dpos/dneg (each (B,L,m,K,d)) simultaneously — peak drops by
+            # two such buffers, which dominate GPU memory at the finest stages.
+            msg = self.dir(en, -sign, lnn)                       # vn-only baseline
+            msg = torch.where(vp_only, self.dir(ep, sign, lp), msg)
+            msg = torch.where(both, self.bidir(en, ep, lnn, lp), msg)
+            del ep, en
+            return (msg.permute(1, 0, 2, 3, 4).contiguous(), (vp | vn))
 
-            bidir = self.bidir(en, ep, lnn, lp)
-            dpos = self.dir(ep, sign, lp)
-            dneg = self.dir(en, -sign, lnn)
-            both = (geom.vp & geom.vn).view(1, L, M, 1, 1)
-            vp_only = (geom.vp & ~geom.vn).view(1, L, M, 1, 1)
-            msg = torch.where(both, bidir, torch.where(vp_only, dpos, dneg))
-            return (msg.permute(1, 0, 2, 3, 4).contiguous(),
-                    geom.vp | geom.vn)
+        def _embed_block(self, E, geom, msl):
+            msgs, valid = self._line_messages(E, geom, msl)  # (L,B,m,K,d),(L,m)
+            L, B, m, K, _ = msgs.shape
+            flat = msgs.reshape(L, B, m * K, self.d)
+            vflat = valid.repeat_interleave(K, dim=1)        # (L, m*K)
+            ctx = self.line_pool(flat, vflat)                # (B, m*K, d)
+            return ctx.reshape(B, m, K, self.d)              # (B, m, ndim, d)
 
         def embed(self, E, geom):
             """Per-axis contexts at geom's query points: single-query attention
             over the per-line neighbour messages (no self value), pooled
             independently per axis. For an anchor with no known neighbours every
-            line is masked and each axis falls back to the learned null token."""
-            msgs, valid = self._line_messages(E, geom)  # (L, B, M, K, d), (L, M)
-            L, B, M, K, _ = msgs.shape
-            flat = msgs.reshape(L, B, M * K, self.d)
-            vflat = valid.repeat_interleave(K, dim=1)   # (L, M*K)
-            ctx = self.line_pool(flat, vflat)           # (B, M*K, d)
-            return ctx.reshape(B, M, K, self.d)         # (B, M, ndim, d)
+            line is masked and each axis falls back to the learned null token.
+
+            Tiled over the query dim: the transient (B, L, m, K, d) message
+            buffers and their 2*d-wide MLP activations are the dominant GPU peak
+            at the finest stages, so we cap m at _M_TILE and stream blocks into a
+            small (B, M, K, d) output. line_pool is per-query independent, so
+            this is bit-identical to embedding all M at once."""
+            M = geom.M
+            if M <= _M_TILE:
+                return self._embed_block(E, geom, slice(None))
+            ctx = E.new_empty(E.shape[0], M, geom.ndim, self.d)
+            for m0 in range(0, M, _M_TILE):
+                msl = slice(m0, min(m0 + _M_TILE, M))
+                ctx[:, msl] = self._embed_block(E, geom, msl)
+            return ctx
 
         def finalize(self, ctx, self_val):
             """Finalized embedding for points whose value has just been
@@ -488,10 +537,15 @@ def build_model(d: int = 32):
             return self.mix(ctx, value_emb.expand_as(ctx))
 
         def head_of(self, ctx, eb):
-            K, M = ctx.shape[2], ctx.shape[1]
-            msgs = ctx.permute(2, 0, 1, 3)
-            valid = torch.ones(K, M, dtype=torch.bool, device=ctx.device)
-            return self.head(self.axis_pool(msgs, valid), eb)
+            # The predicted value (mu, log_b) is what gets quantized against, so
+            # keep the readout in fp32 even under fp16 autocast — confines fp16 to
+            # the message pass and protects compression ratio at small eb.
+            with torch.autocast(device_type=ctx.device.type, enabled=False):
+                ctx = ctx.float()
+                K, M = ctx.shape[2], ctx.shape[1]
+                msgs = ctx.permute(2, 0, 1, 3)
+                valid = torch.ones(K, M, dtype=torch.bool, device=ctx.device)
+                return self.head(self.axis_pool(msgs, valid), eb)
 
     return GNN()
 
@@ -527,7 +581,7 @@ def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
     """Finalize with and return pre-axis-pool contexts for stage reuse."""
     if geom_prev is not None and geom_prev.M:
         ctx = finalize_ctx if finalize_ctx is not None else model.embed(E, geom_prev)
-        finalized = model.finalize(ctx, finalize_vals)
+        finalized = model.finalize(ctx, finalize_vals).to(E.dtype)  # fp16 -> E dtype
         E = E.index_copy(1, geom_prev.query_idx, finalized)     # write newly-known
     head_ctx = model.embed(E, geom_head)
     return model.head_of(head_ctx, eb), E, head_ctx
@@ -590,6 +644,24 @@ class GNNPredictor:
     tile_free = True  # runs on the whole tensor as one region, no tiling
     tunable = True    # encoder sweeps eb_ratio (no centre mode; see codec.encode)
     provides_scale = True
+    fp16 = False      # fp16 autocast on the message pass (encode/decode must match)
+    compile = False   # torch.compile the embed pass (encode/decode must match)
+
+    def _maybe_compile(self):
+        # Wrap the embed pass once. It fuses the elementwise message-pass ops
+        # (rope/where/dir/bidir), the ~40% of GPU time not in the GEMMs.
+        # dynamic=True: one graph for every stage/chunk M, no recompile storm.
+        # enc and dec both compile (flag replayed) so their float paths match.
+        if self.compile and not getattr(self, "_compiled", False):
+            self.model.embed = self._torch.compile(self.model.embed, dynamic=True)
+            self._compiled = True
+
+    def _amp(self):
+        self._maybe_compile()
+        if self.fp16 and self.device.type == "cuda":
+            return self._torch.autocast(device_type="cuda",
+                                        dtype=self._torch.float16)
+        return contextlib.nullcontext()
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
                  tile_size: int = 64, max_radius: int = 64, device: str = "cpu",
@@ -665,7 +737,7 @@ class GNNPredictor:
             ((np.clip(vals, self.vmin, self.vmax) - self.vmin) / span
              ).astype(np.float32)).to(self.device)
         finalize_ctx = self._ctx if cont else None
-        with torch.no_grad():
+        with torch.no_grad(), self._amp():
             (values, log_b), self._E, self._ctx = stage_forward(
                 self.model, self._E, geom_prev, geom_head, fvals, torch,
                 finalize_ctx=finalize_ctx, eb=norm_eb)
@@ -719,20 +791,32 @@ class _ChunkGeoms:
         self.chain = [0] + [s for s in range(1, len(self.geoms))
                             if self.geoms[s] is not None]
 
-        pad_flat = np.arange(self.n_padded, dtype=np.int64
-                             ).reshape(self.padded_shape)
-        inner = tuple(slice(stride, stride + n) for n in self.chunk_shape)
-        hmask = np.ones(self.padded_shape, bool)
-        hmask[inner] = False
-        self.halo_flat = pad_flat[hmask]                             # (H,)
-        # chunk-frame coords of halo cells (negative / >= chunk_shape allowed)
-        self.halo_coords = np.stack(np.nonzero(hmask), axis=1) - stride
-        self.interior_flat = pad_flat[inner].reshape(-1)
-        # per-level buckets of interior padded indices, for the coarse means
-        lv = point_levels(list(np.indices(self.chunk_shape).reshape(ndim, -1)),
-                          levels, stride, block)
-        self.level_flat = [self.interior_flat[lv == l]
-                           for l in range(levels + 1)]
+        # Interior padded-flat indices, built directly (O(interior), never the
+        # O(shell) full padded grid). The compact field lays interior first, so
+        # interior cell i has compact index i + 1 (row 0 is a dummy the invalid
+        # / not-yet-decoded neighbour lines point at).
+        idx0 = np.indices(self.chunk_shape).reshape(ndim, -1)     # chunk-frame
+        self.interior_flat = np.ravel_multi_index(idx0 + stride, self.padded_shape)
+        lv = point_levels(list(idx0), levels, stride, block)
+        self.level_pos = [np.nonzero(lv == l)[0].astype(np.int64) + 1
+                          for l in range(levels + 1)]
+
+        # Padded-flat halo cells that appear as a *valid* neighbour of some
+        # stage: the thin band the field must actually hold. Derived from the
+        # stage geometries (O(interior)), so the dead rest of the shell is never
+        # materialised. Its chunk-frame coords let the per-chunk halo pass test
+        # usability without an O(shell) mask.
+        seen = []
+        for g in self.geoms:
+            if g is None:
+                continue
+            seen.append(g.ip[g.vp])
+            seen.append(g.in_[g.vn])
+        ref = (torch.unique(torch.cat(seen)).cpu().numpy() if seen
+               else np.zeros(0, np.int64))
+        self.ref_halo_flat = ref[~np.isin(ref, self.interior_flat)].astype(np.int64)
+        self.ref_halo_coords = (np.stack(
+            np.unravel_index(self.ref_halo_flat, self.padded_shape), 1) - stride)
 
 
 _CHUNK_GEOM_CACHE: dict = {}
@@ -750,35 +834,78 @@ def build_chunk_geoms(chunk_shape, levels, stride, block, torch, device=None):
     return hit
 
 
-class _OverlaidGeom:
-    """A cached padded-frame `_StageGeom` with its periodic validity ANDed with
-    one chunk's runtime usability mask: in-chunk neighbours are always usable
-    (the local schedule reveals them in pattern order), halo neighbours only if
-    their point is actually decoded (already-coded chunk, or a global anchor)
-    and inside the tensor. Shares every other tensor with the base geometry."""
+def _build_remap(present, torch, device):
+    """Map padded-flat index -> compact field row. ``present`` lists the padded
+    cells the field holds (interior first, then usable halo); cell ``present[i]``
+    lives at row ``i + 1`` (row 0 is the dummy that invalid / not-yet-decoded
+    neighbour lines point at). Returns a closure over torch index tensors."""
+    order = np.argsort(present, kind="stable")
+    spres = torch.from_numpy(np.ascontiguousarray(present[order])).to(device)
+    comp = torch.from_numpy((order + 1).astype(np.int64)).to(device)
+    n = spres.numel()
+
+    def remap(flat):                 # (torch int64) -> (torch int64) compact
+        if n == 0:
+            return torch.zeros_like(flat)
+        pos = torch.searchsorted(spres, flat).clamp_(max=n - 1)
+        return torch.where(spres[pos] == flat, comp[pos],
+                           torch.zeros_like(flat))
+    return remap
+
+
+class _CompactGeom:
+    """A `_StageGeom` with its neighbour indices remapped into a chunk's compact
+    field and its periodic validity ANDed with runtime usability. A neighbour is
+    usable iff it landed on a real compact row (remap != 0): interior always
+    does, halo only when that cell is decoded and referenced. Shares every other
+    tensor with the base geometry."""
 
     __slots__ = _StageGeom.__slots__
 
-    def __init__(self, base, usable):
-        for name in ("ip", "in_", "dp", "dn", "cos", "lognnz",
-                     "query_idx", "idx_np", "M", "ndim"):
+    def __init__(self, base, remap):
+        for name in ("dp", "dn", "cos", "lognnz", "idx_np", "M", "ndim"):
             setattr(self, name, getattr(base, name))
-        self.vp = base.vp & usable[base.ip]
-        self.vn = base.vn & usable[base.in_]
+        self.ip = remap(base.ip)
+        self.in_ = remap(base.in_)
+        self.query_idx = remap(base.query_idx)
+        self.vp = base.vp & (self.ip != 0)
+        self.vn = base.vn & (self.in_ != 0)
+
+
+class _CompactFrame:
+    """Per-chunk compact field layout: geoms with remapped indices, and the
+    (contiguous) halo row block plus the metadata to fill it from coarse+value.
+    ``n_compact`` = 1 dummy + interior + usable-referenced halo."""
+
+    __slots__ = ("geoms", "n_interior", "n_compact", "halo_rows",
+                 "h_ids", "h_lv", "h_gflat")
+
+    def __init__(self, cg, origin, shape, edges, grid, coded, torch, device):
+        halo_present, h_ids, h_lv, h_gflat = chunk_halo_info(
+            cg, origin, shape, edges, grid, coded)
+        self.n_interior = int(len(cg.interior_flat))
+        present = np.concatenate([cg.interior_flat, halo_present])
+        self.n_compact = 1 + len(present)
+        remap = _build_remap(present, torch, device)
+        self.geoms = [None if g is None else _CompactGeom(g, remap)
+                      for g in cg.geoms]
+        # halo cells are laid out right after interior, so their rows are a
+        # contiguous slice — no remap needed to fill them.
+        self.halo_rows = slice(self.n_interior + 1, self.n_compact)
+        self.h_ids, self.h_lv, self.h_gflat = h_ids, h_lv, h_gflat
 
 
 def chunk_halo_info(cg, origin, shape, edges, grid, coded):
-    """Usability mask and halo-fill indices for one chunk of a chunk grid.
+    """Usable, referenced halo cells for one chunk of a chunk grid.
 
-    Returns ``(usable, sel_flat, chunk_ids, lv, gflat)``: a bool mask over the
-    padded frame (interior always usable, halo cells only when decoded), and —
-    for the usable halo cells — their padded flat index, owning chunk id,
-    dyadic level and global flat index. Shared by the inference predictor and
-    the trainer so both sides build halo context identically."""
+    Walks only the referenced band ``cg.ref_halo_flat`` (never the O(shell)
+    padded frame). Returns ``(halo_present, chunk_ids, lv, gflat)`` for the band
+    cells that are inside the tensor and already decoded (coded chunk, or a
+    global anchor): their padded flat index, owning chunk id, dyadic level and
+    global flat index. Shared by the inference predictor and the trainer so both
+    build identical context."""
     ndim = len(shape)
-    usable = np.zeros(cg.n_padded, bool)
-    usable[cg.interior_flat] = True
-    gc = cg.halo_coords + np.asarray(origin, np.int64)
+    gc = cg.ref_halo_coords + np.asarray(origin, np.int64)
     shp = np.asarray(shape)
     inb = np.all((gc >= 0) & (gc < shp), axis=1)
     gci = gc[inb]
@@ -787,11 +914,10 @@ def chunk_halo_info(cg, origin, shape, edges, grid, coded):
     lv = point_levels([gci[:, k] for k in range(ndim)],
                       cg.levels, cg.stride, cg.block)
     ok = np.asarray(coded)[chunk_ids] | (lv == 0)
-    sel_flat = cg.halo_flat[inb][ok]
-    usable[sel_flat] = True
+    halo_present = cg.ref_halo_flat[inb][ok]
     gflat = np.ravel_multi_index(
         [gci[ok][:, k] for k in range(ndim)], shape)
-    return usable, sel_flat, chunk_ids[ok], lv[ok], gflat
+    return halo_present, chunk_ids[ok], lv[ok], gflat
 
 
 def anchor_finalize(model, vals, ndim):
@@ -819,10 +945,10 @@ def chunk_coarse(model, E_pad, cg, torch):
     interior point. Returns (B, levels + 1, ndim, d)."""
     B = E_pad.shape[0]
     out = E_pad.new_zeros(B, cg.levels + 1, cg.ndim, model.d)
-    for l, flat in enumerate(cg.level_flat):
-        if not len(flat):
+    for l, pos in enumerate(cg.level_pos):
+        if not len(pos):
             continue
-        idx = torch.from_numpy(flat).to(E_pad.device)
+        idx = torch.from_numpy(pos).to(E_pad.device)         # compact rows
         mean = E_pad.index_select(1, idx).mean(dim=1)        # (B, K, d)
         s = cg.stride if l == 0 else max(cg.stride >> l, 1)
         out[:, l] = model.coarse(mean, math.log2(s))
@@ -852,6 +978,17 @@ class ChunkedGNNPredictor:
     """
 
     provides_scale = True
+    chunk_batch = 1              # sub-batch size chosen by the codec, into meta
+    fp16 = False                # fp16 autocast on the message pass (codec sets it)
+    compile = False             # torch.compile the embed pass (codec sets it)
+
+    def _maybe_compile(self):
+        # Wrap the embed pass once (fuses the elementwise message-pass ops that
+        # aren't in the GEMMs). dynamic=True keeps one graph across all M sizes;
+        # enc and dec both compile (flag replayed) so their float paths match.
+        if self.compile and not getattr(self, "_compiled", False):
+            self.model.embed = self._torch.compile(self.model.embed, dynamic=True)
+            self._compiled = True
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
                  device: str = "cpu", levels: int = 4, anchor_stride: int = 16,
@@ -885,10 +1022,42 @@ class ChunkedGNNPredictor:
         self.n_chunks = int(np.prod(self.grid))
         self.C = int(channels)
         ndim = len(self.shape)
+        self._check_field_budget(ndim, channels)
         self.coarse = torch.zeros(self.C, self.n_chunks, self.levels + 1,
                                   ndim, self.d, device=self.device)
         self.coded = np.zeros(self.n_chunks, bool)
         self._cg = None
+
+    def _check_field_budget(self, ndim, channels):
+        """Fail fast (with numbers + fix) before torch OOMs. Two terms scale with
+        chunk size: the compact field (1 dummy + interior + referenced halo band)
+        and, larger, one stage's message tensor (B, L, M, K, d) where L is the
+        half-direction count ((3^ndim-1)/2, so 40 in 4-D) and M the stage's query
+        count. The activation dominates and only shrinks with the chunk, hence
+        with anchor_stride (chunk edge >= anchor_stride)."""
+        torch = self._torch
+        cshape = tuple(min(e, n) for e, n in zip(self.edges, self.shape))
+        cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
+                               self.anchor_block, torch, self.device)
+        n_interior = int(len(cg.interior_flat))
+        n_band = int(len(cg.ref_halo_flat))          # upper bound (all referenced)
+        field_bytes = channels * (1 + n_interior + n_band) * ndim * self.d * 4
+        M = max((g.M for g in cg.geoms if g is not None), default=0)
+        L = len(half_directions(ndim))
+        act_bytes = 4 * channels * L * M * ndim * self.d * 4  # ~4 live copies
+        need = field_bytes + act_bytes
+        if self.device.type == "cuda":
+            budget = int(0.8 * torch.cuda.mem_get_info(self.device)[0])
+        else:                                # cpu: cap at 64 GiB, still catches it
+            budget = 64 << 30
+        if need > budget:
+            raise MemoryError(
+                f"chunked GNN needs up to {need/1e9:.0f} GB per chunk "
+                f"(field {field_bytes/1e9:.1f} + stage activation "
+                f"{act_bytes/1e9:.0f} GB for M={M:,} queries x L={L} lines, "
+                f"budget {budget/1e9:.0f} GB). Reduce --anchor-stride: the chunk "
+                f"edge (>= anchor_stride) sets M, and the {ndim}-D activation "
+                f"grows as edge^{ndim}. anchor-stride 16 keeps M small.")
 
     def chunk_slices(self, ci: int):
         cidx = np.unravel_index(ci, self.grid)
@@ -903,21 +1072,164 @@ class ChunkedGNNPredictor:
         """Level-0 coarse embeddings for every chunk, right after the global
         anchor pass — so every chunk has anchor context on all sides before any
         chunk is coded. Anchors finalize from the null context, so this is a
-        pure function of their reconstructed values."""
+        pure function of their reconstructed values. Chunks with the same anchor
+        count batch together in the model's B dim (C is always 1 here)."""
         torch = self._torch
         ndim = len(self.shape)
         log_s = math.log2(self.anchor_stride)
+        groups: dict = {}                         # anchor-count -> list of (ci, vals)
+        for ci in range(self.n_chunks):
+            axes = []
+            for sl in self.chunk_slices(ci):
+                c = np.arange(sl.start, sl.stop)
+                axes.append(c[(c % self.anchor_stride) < self.anchor_block])
+            if any(len(a) == 0 for a in axes):
+                continue                          # ragged chunk with no anchors
+            vals = recon[(slice(None), *np.ix_(*axes))].reshape(-1)   # C==1
+            groups.setdefault(len(vals), ([], []))
+            groups[len(vals)][0].append(ci)
+            groups[len(vals)][1].append(vals)
         with torch.no_grad():
-            for ci in range(self.n_chunks):
-                axes = []
-                for sl in self.chunk_slices(ci):
-                    c = np.arange(sl.start, sl.stop)
-                    axes.append(c[(c % self.anchor_stride) < self.anchor_block])
-                if any(len(a) == 0 for a in axes):
-                    continue                     # ragged chunk with no anchors
-                vals = recon[(slice(None), *np.ix_(*axes))].reshape(self.C, -1)
-                fin = anchor_finalize(self.model, self._norm(vals), ndim)
-                self.coarse[:, ci, 0] = self.model.coarse(fin.mean(1), log_s)
+            for ids, vlist in groups.values():
+                v = np.stack(vlist)                             # (G, M_a)
+                fin = anchor_finalize(self.model, self._norm(v), ndim)
+                self.coarse[0, ids, 0] = self.model.coarse(fin.mean(1), log_s)
+
+    # ---- batched wave path (codec): many same-geometry chunks in the B dim ----
+
+    def _amp(self):
+        """fp16 autocast over the message pass when enabled on cuda; the readout
+        (head_of) forces itself back to fp32 so predictions stay precise."""
+        self._maybe_compile()
+        if self.fp16 and self.device.type == "cuda":
+            return self._torch.autocast(device_type="cuda",
+                                        dtype=self._torch.float16)
+        return contextlib.nullcontext()
+
+    def max_batch(self, cshape):
+        """How many same-shape chunks fit in the memory budget at once. Bounded by
+        the finest stage's activation (B, L, M, K, d) plus the compact field, the
+        two terms that scale with B (see `_check_field_budget`)."""
+        torch = self._torch
+        cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
+                               self.anchor_block, torch, self.device)
+        ndim = len(cshape)
+        n_field = 1 + int(len(cg.interior_flat)) + int(len(cg.ref_halo_flat))
+        M = max((g.M for g in cg.geoms if g is not None), default=1)
+        m = min(M, _M_TILE)                                   # embed tiles over M
+        # _line_messages peaks at ~ep + en + msg + one Dir/BiDir (hidden width 2d)
+        # all (B, L, m, K, d)-sized and live at once. ~8x the base buffer covers
+        # those plus the concat/where temporaries; the field E persists alongside.
+        # ponytail: this is a static estimate — the encode/decode progress line
+        # prints the *measured* GPU peak, so lower --chunk-batch if that nears VRAM.
+        per = ((n_field * ndim * self.d)                      # persistent field
+               + 8 * len(half_directions(ndim)) * m * ndim * self.d) * 4
+        if self.device.type == "cuda":
+            budget = int(0.8 * torch.cuda.mem_get_info(self.device)[0])
+        else:
+            budget = 8 << 30                                   # cpu: modest cap
+        return max(1, budget // max(per, 1))
+
+    def start_wave(self, chunk_ids, recon: np.ndarray):
+        """Begin a batch of mutually-independent, identical-geometry chunks. One
+        representative frame drives the shared stage geometry; the halo/interior
+        field values are gathered per chunk into the model's B dim."""
+        torch = self._torch
+        ndim = len(self.shape)
+        B = len(chunk_ids)
+        origins = np.array([[sl.start for sl in self.chunk_slices(ci)]
+                            for ci in chunk_ids], np.int64)     # (B, ndim)
+        cshape = tuple(sl.stop - sl.start
+                       for sl in self.chunk_slices(chunk_ids[0]))
+        cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
+                               self.anchor_block, torch, self.device)
+        frame = _CompactFrame(cg, origins[0], self.shape, self.edges, self.grid,
+                              self.coded, torch, self.device)
+        E = torch.zeros(B, frame.n_compact, ndim, self.d, device=self.device)
+        self._wave_fill_halo(E, frame, origins, recon)
+        # per-chunk global flat indices per stage, for finalize reads from recon
+        self._wave_gidx = []
+        for c in cg.coords:
+            if c is None:
+                self._wave_gidx.append(None)
+                continue
+            g = (c[None, :, :] + origins[:, None, :])          # (B, M, ndim)
+            self._wave_gidx.append(np.ravel_multi_index(
+                [g[:, :, k] for k in range(ndim)], self.shape))   # (B, M)
+        self._cg = cg
+        self._wave_ids = list(chunk_ids)
+        self._E = E
+        self._geoms = frame.geoms
+        self._ctx = None
+        self._pos = 0
+
+    def _wave_fill_halo(self, E, frame, origins, recon):
+        torch = self._torch
+        ndim = len(self.shape)
+        if frame.halo_rows.stop <= frame.halo_rows.start:
+            return
+        # band chunk-frame coords are shared across the wave (rep uses origins[0]);
+        # per chunk only the global positions / owning chunks shift.
+        rep_gc = np.stack(np.unravel_index(frame.h_gflat, self.shape), 1)
+        band = rep_gc - origins[0]                             # (H, ndim)
+        h_lv = torch.from_numpy(frame.h_lv.astype(np.int64)).to(self.device)
+        flat = recon.reshape(-1)                               # C == 1
+        vals_all, cvec_all = [], []
+        for o in origins:
+            gc = band + o
+            gflat = np.ravel_multi_index([gc[:, k] for k in range(ndim)],
+                                         self.shape)
+            ids = np.ravel_multi_index(
+                [gc[:, k] // self.edges[k] for k in range(ndim)], self.grid)
+            vals_all.append(self._norm(flat[gflat][None, :]))         # (1, H)
+            ids_t = torch.from_numpy(ids).to(self.device)
+            cvec_all.append(self.coarse[0, ids_t, h_lv])              # (H, K, d)
+        with torch.no_grad(), self._amp():
+            E[:, frame.halo_rows] = halo_embed(
+                self.model, torch.stack(cvec_all, 0), torch.cat(vals_all, 0))
+
+    def predict_wave_stage(self, s: int, recon: np.ndarray, eb: float):
+        """Batched `predict_stage`: returns (pred, scale) of shape (B, M) for the
+        wave's B chunks, ordered like ``np.nonzero`` of the local stage mask."""
+        torch = self._torch
+        cg = self._cg
+        j = self._pos + 1
+        if j >= len(cg.chain) or cg.chain[j] != s:
+            raise ValueError(f"stage {s} out of order for this wave")
+        prev = cg.chain[j - 1]
+        gp, gh = self._geoms[prev], self._geoms[s]
+        fvals = None if gp is None else \
+            self._norm(recon.reshape(-1)[self._wave_gidx[prev]])   # (B, M)
+        with torch.no_grad(), self._amp():
+            (values, log_b), self._E, self._ctx = stage_forward(
+                self.model, self._E, gp, gh, fvals, torch,
+                finalize_ctx=self._ctx, eb=float(eb) / self.span)
+        self._pos = j
+        pred = values.cpu().numpy() * self.span + self.vmin        # (B, M)
+        scale = np.exp2(log_b.cpu().numpy()) * self.span
+        return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
+                scale.astype(np.float32))
+
+    def finish_wave(self, recon: np.ndarray):
+        torch = self._torch
+        cg = self._cg
+        if self._pos != len(cg.chain) - 1:
+            raise ValueError("finish_wave before all non-empty stages predicted")
+        last = cg.chain[self._pos]
+        g = self._geoms[last]
+        E = self._E
+        with torch.no_grad(), self._amp():
+            if g is not None:
+                fvals = self._norm(recon.reshape(-1)[self._wave_gidx[last]])
+                ctx = self._ctx if self._ctx is not None else \
+                    self.model.embed(E, g)
+                fin = self.model.finalize(ctx, fvals).to(E.dtype)  # fp16->E dtype
+                E = E.index_copy(1, g.query_idx, fin)
+            cc = chunk_coarse(self.model, E, cg, torch)   # (B, levels+1, K, d)
+        ids = np.array(self._wave_ids)
+        self.coarse[0, ids] = cc
+        self.coded[ids] = True
+        self._E = self._ctx = self._cg = None
 
     def start_chunk(self, ci: int, recon: np.ndarray):
         torch = self._torch
@@ -927,28 +1239,24 @@ class ChunkedGNNPredictor:
         cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
                                self.anchor_block, torch, self.device)
 
-        # usability over the padded frame: interior always, halo per rule
-        usable_np, sel_flat, chunk_ids, lv, gflat = chunk_halo_info(
-            cg, origin, self.shape, self.edges, self.grid, self.coded)
-        usable = torch.from_numpy(usable_np).to(self.device)
-
-        # dense local field; fill usable halo cells from coarse + recon value
-        E = torch.zeros(self.C, cg.n_padded, cg.ndim, self.d,
+        # compact field: 1 dummy + interior + usable-referenced halo band only —
+        # the dead rest of the padded shell is never allocated.
+        frame = _CompactFrame(cg, origin, self.shape, self.edges, self.grid,
+                              self.coded, torch, self.device)
+        E = torch.zeros(self.C, frame.n_compact, cg.ndim, self.d,
                         device=self.device)
-        if len(sel_flat):
-            vals = self._norm(recon.reshape(self.C, -1)[:, gflat])
-            ids = torch.from_numpy(chunk_ids).to(self.device)
-            lvs = torch.from_numpy(lv.astype(np.int64)).to(self.device)
+        if len(frame.h_gflat):     # fill the halo rows from coarse + recon value
+            vals = self._norm(recon.reshape(self.C, -1)[:, frame.h_gflat])
+            ids = torch.from_numpy(frame.h_ids).to(self.device)
+            lvs = torch.from_numpy(frame.h_lv.astype(np.int64)).to(self.device)
             cvec = self.coarse[:, ids, lvs]                # (C, Hs, K, d)
             with torch.no_grad():
-                E[:, torch.from_numpy(sel_flat).to(self.device)] = \
-                    halo_embed(self.model, cvec, vals)
+                E[:, frame.halo_rows] = halo_embed(self.model, cvec, vals)
 
         self._cg = cg
         self._ci = ci
         self._E = E
-        self._geoms = [None if g is None else _OverlaidGeom(g, usable)
-                       for g in cg.geoms]
+        self._geoms = frame.geoms
         # global flat index per stage (finalize values are read from recon)
         self._gidx = [None if c is None else np.ravel_multi_index(
             [(c[:, k] + origin[k]) for k in range(len(self.shape))], self.shape)
@@ -969,7 +1277,7 @@ class ChunkedGNNPredictor:
         gp, gh = self._geoms[prev], self._geoms[s]
         fvals = None if gp is None else \
             self._norm(recon.reshape(self.C, -1)[:, self._gidx[prev]])
-        with torch.no_grad():
+        with torch.no_grad(), self._amp():
             (values, log_b), self._E, self._ctx = stage_forward(
                 self.model, self._E, gp, gh, fvals, torch,
                 finalize_ctx=self._ctx, eb=float(eb) / self.span)

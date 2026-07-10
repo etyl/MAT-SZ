@@ -19,15 +19,15 @@ python scripts/train_gnn.py \
     --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
     --out data/gnn_predictor.pt \
     --steps 50000 \
-    --batch 16 \
+    --batch 32 \
     --crop 128 \
-    --d 128 \
-    --lr 0.00005 \
+    --d 32 \
+    --lr 0.0005 \
     --noise-range 0.0001 0.05 \
     --eval-image /lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak/17.png \
     --eval-eb 0.01 \
     --eval-every 100 \
-    --img-every 500 \
+    --img-every 1000 \
     --device cuda \
     --wandb-mode offline \
     --run-name gnn-axis \

@@ -30,10 +30,10 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from deepsz.gnn_predictor import (CKPT_VERSION, _OverlaidGeom, anchor_finalize,
+from deepsz.gnn_predictor import (CKPT_VERSION, _CompactFrame, anchor_finalize,
                                   build_chunk_geoms, build_model,
                                   build_stage_geoms, chunk_coarse,
-                                  chunk_halo_info, stage_forward)
+                                  stage_forward)
 from deepsz.levels import stage_masks
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".ppm", ".pgm"}
@@ -284,11 +284,9 @@ def run_stages(model, x, geoms, d, device, eb, teacher_force=False,
     return nll_sum, npix, known_vals, pred_only, {"bins": bins, "abs_err": abs_err}
 
 
-def _run_chunk(model, cg, usable, E, known_vals, x, gidx, eb, device, reveal):
+def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
     """One chunk of the chunked-scene step: the codec's local stage chain with
     teacher forcing. Returns (nll bits, n holes, abs err, finalized E)."""
-    geoms = [None if g is None else _OverlaidGeom(g, usable)
-             for g in cg.geoms]
     nll = torch.zeros((), device=device)
     abs_err = torch.zeros((), device=device)
     npix = 0
@@ -355,23 +353,21 @@ def run_chunked_scene(model, x, hw, axis, order, levels, stride, d, device, eb):
     abs_err = torch.zeros((), device=device)
     npix = 0
     for ci in order:
-        usable_np, sel, ids, lv, gflat = chunk_halo_info(
-            cg, origins[ci], hw, edges, grid, coded)
-        usable = torch.from_numpy(usable_np).to(device)
-        E = torch.zeros(B, cg.n_padded, 2, d, device=device)
-        if len(sel):
-            ids_t = torch.from_numpy(ids).to(device)
-            lv_t = torch.from_numpy(lv.astype(np.int64)).to(device)
-            gflat_t = torch.from_numpy(gflat).to(device)
-            sel_t = torch.from_numpy(sel).to(device)
+        frame = _CompactFrame(cg, origins[ci], hw, edges, grid, coded,
+                              torch, device)
+        E = torch.zeros(B, frame.n_compact, 2, d, device=device)
+        if len(frame.h_gflat):                             # trailing halo block
+            ids_t = torch.from_numpy(frame.h_ids).to(device)
+            lv_t = torch.from_numpy(frame.h_lv.astype(np.int64)).to(device)
+            gflat_t = torch.from_numpy(frame.h_gflat).to(device)
             cvec = coarse[:, ids_t, lv_t]                  # (B, Hs, K, d)
-            E = E.index_copy(1, sel_t, model.finalize(
-                cvec, known_vals[:, gflat_t]))
+            halo = model.finalize(cvec, known_vals[:, gflat_t])
+            E = torch.cat([E[:, :frame.halo_rows.start], halo], dim=1)
         gidx = [None if c is None else torch.from_numpy(np.ravel_multi_index(
             [(c[:, k] + origins[ci][k]) for k in range(2)], hw)).to(device)
             for c in cg.coords]
-        n1, np1, a1, E = _run_chunk(model, cg, usable, E, known_vals, x, gidx,
-                                    eb, device, reveal)
+        n1, np1, a1, E = _run_chunk(model, cg, frame.geoms, E, known_vals, x,
+                                    gidx, eb, device, reveal)
         nll, npix, abs_err = nll + n1, npix + np1, abs_err + a1
         coarse[:, ci] = chunk_coarse(model, E, cg, torch)
         coded[ci] = True

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +14,7 @@ import numpy as np
 import zstandard
 
 from .codec import _compress_tile
+from . import gnn_predictor as _gp
 from .gnn_predictor import ChunkedGNNPredictor, GNNPredictor
 from .levels import stage_ebs, stage_masks
 from .quantizer import dequantize, quantize
@@ -28,6 +32,51 @@ _PREFIX_SIZE = struct.calcsize(_PREFIX)
 # memory is ~30*L*K*d bytes/point in transients — ~2^21 points is a few GB)
 _AUTO_CHUNK_THRESHOLD = 1 << 21
 _AUTO_CHUNK_POINTS = 1 << 18  # target points per chunk
+
+
+_PROG_LAST = [0.0]  # throttle for file output
+
+
+def _log(msg):
+    # ponytail: env-gated so tests/CLI stay quiet; set DEEPSZ_PROGRESS=1 to see it
+    if not os.environ.get("DEEPSZ_PROGRESS"):
+        return
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+
+def _cuda_peak(predictor):
+    """Peak GPU bytes since the last call (resets the counter), or None on CPU."""
+    torch = getattr(predictor, "_torch", None)
+    dev = getattr(predictor, "device", None)
+    if torch is None or dev is None or dev.type != "cuda":
+        return None
+    peak = torch.cuda.max_memory_allocated(dev)
+    torch.cuda.reset_peak_memory_stats(dev)
+    return peak
+
+
+def _progress(tag, i, n, t0, predictor=None):
+    if not os.environ.get("DEEPSZ_PROGRESS"):
+        return
+    now = time.time()
+    tty = sys.stderr.isatty()
+    # to a file (SLURM log) \r doesn't flush usefully -> newline, throttled to 5s
+    if not tty and i not in (0, n) and now - _PROG_LAST[0] < 5.0:
+        return
+    _PROG_LAST[0] = now
+    el = now - t0
+    eta = el / i * (n - i) if i else 0.0
+    peak = _cuda_peak(predictor) if predictor is not None else None
+    mem = f"  peak {peak / 1e9:5.2f}GB" if peak else ""
+    line = f"{tag} chunk {i}/{n}  {el:6.1f}s elapsed  ~{eta:6.1f}s left{mem}"
+    if tty:
+        sys.stderr.write("\r" + line + "   ")
+        if i == n:
+            sys.stderr.write("\n")
+    else:
+        sys.stderr.write(line + "\n")
+    sys.stderr.flush()
 
 
 def _as_numpy(x: Any) -> np.ndarray:
@@ -209,6 +258,30 @@ def _decode_anchor_stage(payload, off, recon, axes, eb0, radius):
     return off
 
 
+def _chunk_waves(grid: tuple[int, ...]) -> list[list[int]]:
+    """Group chunk ids into color waves. A wave = chunks with the same per-axis
+    parity ("color") and the same tensor-boundary signature. Same-color chunks
+    are >=2 apart on every axis they differ, so their halos (thickness one chunk)
+    never overlap -> they are mutually independent and, given the color ordering,
+    share one coded-neighbour pattern -> identical stage geometry, so they batch
+    in the model's B dim. Ordered by color so a wave's cross-color neighbours in
+    earlier colors are already coded. Correctness (the error bound) holds for any
+    order; only which context is available, hence the ratio, shifts."""
+    ndim = len(grid)
+    groups: dict = {}
+    for ci in range(int(np.prod(grid))):
+        cidx = np.unravel_index(ci, grid)
+        color = tuple(int(i) % 2 for i in cidx)
+        bsig = tuple((int(i) == 0, int(i) == g - 1) for i, g in zip(cidx, grid))
+        groups.setdefault((color, bsig), []).append(ci)
+
+    def rank(key):
+        color, bsig = key
+        return (sum(b << k for k, b in enumerate(color)), bsig)
+
+    return [groups[k] for k in sorted(groups, key=rank)]
+
+
 def _compress_chunked(
     values: np.ndarray,
     ebs: list[float],
@@ -216,45 +289,69 @@ def _compress_chunked(
     round_output: bool,
     predictor: ChunkedGNNPredictor,
     edges: tuple[int, ...],
+    batch_cap: int | None = None,
 ) -> bytes:
-    """Chunk-major encode: global anchor pass, then chunks in raster order,
-    each running its local stage schedule (stage 0 skipped — anchors are
-    already coded). Peak memory is O(chunk), plus the O(N) recon."""
+    """Wave-batched encode: global anchor pass, then chunks coded in color waves
+    (see `_chunk_waves`), each wave split into memory-bounded sub-batches run
+    together in the model's B dim. Stream order is wave -> sub-batch -> stage ->
+    chunk, mirrored bitwise by the decoder. Peak memory is O(batch * chunk)."""
     c = values.shape[0]
     shape = values.shape[1:]
     stride, block = predictor.anchor_stride, predictor.anchor_block
     recon = np.zeros_like(values)
     axes = _anchor_axes(shape, stride, block)
+    _log(f"encode: shape={shape} edges={edges} device={predictor.device} "
+         f"coding anchors...")
     parts = [_code_anchor_stage(values, recon, axes, ebs[0], radius,
                                 round_output)]
     predictor.begin(shape, edges, channels=c)
     predictor.anchor_coarse(recon)
-    for ci in range(predictor.n_chunks):
-        sls = predictor.chunk_slices(ci)
-        cshape = tuple(sl.stop - sl.start for sl in sls)
-        cmasks = stage_masks(cshape, predictor.levels, stride, block)
-        cvals = values[(slice(None), *sls)]
-        crecon = recon[(slice(None), *sls)]        # view: writes hit recon
-        predictor.start_chunk(ci, recon)
-        for s in range(1, len(cmasks)):
-            pos = cmasks[s]
-            n = int(pos.sum())
-            tables = build_laplace_tables(ebs[s], radius)
-            if n == 0:
-                parts.append(pack_stage(
-                    np.zeros(0, np.uint32), np.zeros(0, np.float32),
-                    rans_levels=np.zeros(0, np.uint8), rans_tables=tables))
-                continue
-            pred, scale = predictor.predict_stage(s, recon, ebs[s])
-            codes, outliers = quantize(cvals[:, pos], pred, ebs[s], radius,
-                                       round_output=round_output)
-            crecon[:, pos] = dequantize(pred, codes, outliers, ebs[s],
-                                        radius).reshape(c, n)
-            parts.append(pack_stage(
-                codes, outliers,
-                rans_levels=scale_to_level(scale, ebs[s]).reshape(-1),
-                rans_tables=tables))
-        predictor.finish_chunk(ci, recon)
+    B_cap = predictor.max_batch(tuple(min(e, n) for e, n in zip(edges, shape)))
+    if batch_cap is not None:                        # user cap (never above safe)
+        B_cap = max(1, min(B_cap, int(batch_cap)))
+    predictor.chunk_batch = B_cap                    # surfaced into stream meta
+    waves = _chunk_waves(predictor.grid)
+    n_sub = sum(-(-len(g) // B_cap) for g in waves)
+    _log(f"encode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
+         f"{n_sub} model-waves")
+    t0 = time.time()
+    done = 0
+    for group in waves:
+        for i in range(0, len(group), B_cap):
+            ids = group[i:i + B_cap]
+            _progress("encode", done, n_sub, t0, predictor)
+            done += 1
+            cshape = tuple(sl.stop - sl.start
+                           for sl in predictor.chunk_slices(ids[0]))
+            cmasks = stage_masks(cshape, predictor.levels, stride, block)
+            predictor.start_wave(ids, recon)
+            for s in range(1, len(cmasks)):
+                pos = cmasks[s]
+                n = int(pos.sum())
+                tables = build_laplace_tables(ebs[s], radius)
+                if n == 0:
+                    for _ in ids:
+                        parts.append(pack_stage(
+                            np.zeros(0, np.uint32), np.zeros(0, np.float32),
+                            rans_levels=np.zeros(0, np.uint8),
+                            rans_tables=tables))
+                    continue
+                pred, scale = predictor.predict_wave_stage(s, recon, ebs[s])
+                for bi, ci in enumerate(ids):
+                    sls = predictor.chunk_slices(ci)
+                    cvals = values[(slice(None), *sls)][:, pos]
+                    p = pred[bi][None, :]
+                    codes, outliers = quantize(cvals, p, ebs[s], radius,
+                                               round_output=round_output)
+                    recon[(slice(None), *sls)][:, pos] = dequantize(
+                        p, codes, outliers, ebs[s], radius).reshape(c, n)
+                    parts.append(pack_stage(
+                        codes, outliers,
+                        rans_levels=scale_to_level(
+                            scale[bi][None, :], ebs[s]).reshape(-1),
+                        rans_tables=tables))
+            predictor.finish_wave(recon)
+    _progress("encode", n_sub, n_sub, t0)
     return b"".join(parts)
 
 
@@ -265,37 +362,54 @@ def _decompress_chunked(
     radius: int,
     predictor: ChunkedGNNPredictor,
     edges: tuple[int, ...],
+    batch: int,
 ) -> np.ndarray:
     c = 1
     stride, block = predictor.anchor_stride, predictor.anchor_block
     recon = np.zeros((c, *shape), np.float32)
     axes = _anchor_axes(shape, stride, block)
+    _log(f"decode: shape={shape} edges={edges} decoding anchors...")
     off = _decode_anchor_stage(payload, 0, recon, axes, ebs[0], radius)
     predictor.begin(shape, edges, channels=c)
     predictor.anchor_coarse(recon)
-    for ci in range(predictor.n_chunks):
-        sls = predictor.chunk_slices(ci)
-        cshape = tuple(sl.stop - sl.start for sl in sls)
-        cmasks = stage_masks(cshape, predictor.levels, stride, block)
-        crecon = recon[(slice(None), *sls)]
-        predictor.start_chunk(ci, recon)
-        for s in range(1, len(cmasks)):
-            pos = cmasks[s]
-            n = int(pos.sum())
-            tables = build_laplace_tables(ebs[s], radius)
-            if n == 0:
-                _codes, _outliers, off = unpack_stage(
-                    payload, off, rans_levels=np.zeros(0, np.uint8),
-                    rans_tables=tables)
-                continue
-            pred, scale = predictor.predict_stage(s, recon, ebs[s])
-            levels64 = scale_to_level(scale, ebs[s]).reshape(-1)
-            codes, outliers, off = unpack_stage(payload, off,
-                                                rans_levels=levels64,
-                                                rans_tables=tables)
-            crecon[:, pos] = dequantize(pred, codes, outliers, ebs[s],
-                                        radius).reshape(c, n)
-        predictor.finish_chunk(ci, recon)
+    B_cap = max(1, int(batch))
+    waves = _chunk_waves(predictor.grid)
+    n_sub = sum(-(-len(g) // B_cap) for g in waves)
+    _log(f"decode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
+         f"{n_sub} model-waves")
+    t0 = time.time()
+    done = 0
+    for group in waves:
+        for i in range(0, len(group), B_cap):
+            ids = group[i:i + B_cap]
+            _progress("decode", done, n_sub, t0, predictor)
+            done += 1
+            cshape = tuple(sl.stop - sl.start
+                           for sl in predictor.chunk_slices(ids[0]))
+            cmasks = stage_masks(cshape, predictor.levels, stride, block)
+            predictor.start_wave(ids, recon)
+            for s in range(1, len(cmasks)):
+                pos = cmasks[s]
+                n = int(pos.sum())
+                tables = build_laplace_tables(ebs[s], radius)
+                if n == 0:
+                    for _ in ids:
+                        _c, _o, off = unpack_stage(
+                            payload, off, rans_levels=np.zeros(0, np.uint8),
+                            rans_tables=tables)
+                    continue
+                pred, scale = predictor.predict_wave_stage(s, recon, ebs[s])
+                for bi, ci in enumerate(ids):
+                    levels64 = scale_to_level(
+                        scale[bi][None, :], ebs[s]).reshape(-1)
+                    codes, outliers, off = unpack_stage(
+                        payload, off, rans_levels=levels64, rans_tables=tables)
+                    sls = predictor.chunk_slices(ci)
+                    recon[(slice(None), *sls)][:, pos] = dequantize(
+                        pred[bi][None, :], codes, outliers, ebs[s],
+                        radius).reshape(c, n)
+            predictor.finish_wave(recon)
+    _progress("decode", n_sub, n_sub, t0)
     if off != len(payload):
         raise ValueError("trailing bytes in DeepSZ GNN payload")
     return recon[0]
@@ -320,12 +434,15 @@ class GNNCompressorCodec:
         anchor_block: int = 1,
         radius: int = 1 << 15,
         max_radius: int = 64,
-        device: str = "cpu",
+        device: str | None = None,   # None -> cuda if available, else cpu
         zstd_level: int = 9,
         eb_ratio: float | None = 1.0,
         tune: str = "fast",
         strict_checkpoint: bool = True,
         chunk_size: int | tuple[int, ...] | None = None,
+        chunk_batch: int | None = None,
+        fp16: bool = False,
+        compile: bool = False,
     ):
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
@@ -341,6 +458,9 @@ class GNNCompressorCodec:
         self.anchor_block = int(anchor_block)
         self.radius = int(radius)
         self.max_radius = int(max_radius)
+        if device is None:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.zstd_level = int(zstd_level)
         self.eb_ratio = eb_ratio
@@ -351,6 +471,19 @@ class GNNCompressorCodec:
         # or per-axis tuple forces chunked with those edges (multiples of
         # anchor_stride).
         self.chunk_size = chunk_size
+        # chunk_batch: None = auto (as many same-geometry chunks as fit the encode
+        # GPU); an int caps it (capped again at the memory-safe auto value). The
+        # value used is frozen into the stream so decode replays it — set it to
+        # what the smallest decode device can hold.
+        self.chunk_batch = None if chunk_batch is None else max(1, int(chunk_batch))
+        # fp16: run the message-pass matmuls in fp16 autocast (cuda only; the
+        # readout stays fp32). ~2x on the GNN forward, may cost a little ratio at
+        # small eb -> opt-in. Stored in meta so decode uses the same float path.
+        self.fp16 = bool(fp16)
+        # compile: torch.compile the message-pass embed (fuses the elementwise
+        # ops that aren't in the GEMMs). Stored in meta so decode uses the same
+        # compiled float path. First encode pays a one-off compilation cost.
+        self.compile = bool(compile)
         self.checkpoint_hash = self._checkpoint_hash()
 
     def _chunk_edges(self, shape: tuple[int, ...]) -> tuple[int, ...] | None:
@@ -399,13 +532,13 @@ class GNNCompressorCodec:
         edges = self._chunk_edges(shape)
         candidates: list[tuple[int, bytes]] = []
         for ratio in ratio_candidates:
+            chunk_batch = None
             if edges is None:
                 payload = self._compress_payload(values, dtype, eb, vmin, vmax,
                                                  ratio)
             else:
-                payload = self._compress_chunked_payload(values, dtype, eb,
-                                                         vmin, vmax, ratio,
-                                                         edges)
+                payload, chunk_batch = self._compress_chunked_payload(
+                    values, dtype, eb, vmin, vmax, ratio, edges)
             meta = {
                 "codec": "deepsz.gnn",
                 "shape": list(original_shape),
@@ -425,6 +558,10 @@ class GNNCompressorCodec:
             }
             if edges is not None:
                 meta["chunks"] = list(edges)
+                meta["chunk_batch"] = int(chunk_batch)
+                meta["m_tile"] = int(_gp._M_TILE)   # replay the exact float path
+                meta["fp16"] = bool(self.fp16)
+                meta["compiled"] = bool(self.compile)
             stream = _write_stream(meta, payload, self.zstd_level,
                                    _VERSION if edges is None
                                    else _VERSION_CHUNKED)
@@ -458,8 +595,14 @@ class GNNCompressorCodec:
                                    int(meta["anchor_block"]),
                                    float(meta["error_bound"]),
                                    float(meta["eb_ratio"]))
-            values = _decompress_chunked(payload, shape, ebs,
-                                         int(meta["radius"]), predictor, edges)
+            saved_tile = _gp._M_TILE
+            _gp._M_TILE = int(meta.get("m_tile", saved_tile))  # match encode path
+            try:
+                values = _decompress_chunked(payload, shape, ebs,
+                                             int(meta["radius"]), predictor, edges,
+                                             int(meta.get("chunk_batch", 1)))
+            finally:
+                _gp._M_TILE = saved_tile
             out = _restore_dtype(values.reshape(original_shape), dtype)
             return torch.as_tensor(out)
 
@@ -509,8 +652,10 @@ class GNNCompressorCodec:
         predictor = self._chunked_predictor(vmin, vmax)
         ebs = _chunk_stage_ebs(values.shape, self.levels, self.anchor_stride,
                                self.anchor_block, eb, eb_ratio)
-        return _compress_chunked(values[None, ...], ebs, self.radius,
-                                 dtype.kind in "bi", predictor, edges)
+        payload = _compress_chunked(values[None, ...], ebs, self.radius,
+                                    dtype.kind in "bi", predictor, edges,
+                                    self.chunk_batch)
+        return payload, int(predictor.chunk_batch)
 
     def _chunked_predictor(
         self,
@@ -523,7 +668,7 @@ class GNNCompressorCodec:
                          else int(meta["anchor_stride"]))
         anchor_block = (self.anchor_block if meta is None
                         else int(meta["anchor_block"]))
-        return ChunkedGNNPredictor(
+        predictor = ChunkedGNNPredictor(
             self.checkpoint_path,
             vmin,
             vmax,
@@ -532,6 +677,12 @@ class GNNCompressorCodec:
             anchor_stride=anchor_stride,
             anchor_block=anchor_block,
         )
+        # encode: from the codec flag; decode: replay the stream's float path
+        predictor.fp16 = (self.fp16 if meta is None
+                          else bool(meta.get("fp16", False)))
+        predictor.compile = (self.compile if meta is None
+                             else bool(meta.get("compiled", False)))
+        return predictor
 
     def _predictor(
         self,

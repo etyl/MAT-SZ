@@ -14,7 +14,10 @@
 module purge
 module load pytorch-gpu
 
-CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/.worktrees/axis-embeddings/data/runs/20260709-173909-ffd4f2/gnn_predictor.pt}
+export PYTHONUNBUFFERED=1   # flush progress to the SLURM .out live
+export DEEPSZ_M_TILE=$((1 << 30))   # M-tiling off (chunk-batch 1 fits without it)
+
+CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
 EB=${EB:-0.01}
 TUNE=${TUNE:-fast}               # fast (1 encode) | size/rd (4 encodes)
 TUNE_SIZE_SLACK=${TUNE_SIZE_SLACK:-1.05}
@@ -23,9 +26,12 @@ python scripts/eval_tensor.py "/lustre/fswork/projects/rech/lzs/uhq13gg/benchmar
     --gnn-checkpoint "$CKPT" \
     --predictor gnn \
     --eb "$EB" \
-    --levels 6 \
-    --anchor-stride 64 \
+    --levels 4 \
+    --anchor-stride 16 \
     --anchor-block 1 \
+    --chunk-batch 1 \
     --tune "$TUNE" \
     --tune-size-slack "$TUNE_SIZE_SLACK" \
+    --fp16 \
+    --compile \
     "$@"

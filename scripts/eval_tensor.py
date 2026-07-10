@@ -11,6 +11,7 @@ instead of an image decoded by PIL.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -41,6 +42,24 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="tensor file (.npy or .pt/.pth)")
     add_common(ap)
+    ap.add_argument("--chunk-size", type=int, default=None,
+                    help="gnn only: force chunk edge (multiple of anchor-stride); "
+                         "0 = whole-tensor, omit = auto. Peak field/chunk is "
+                         "(edge+2*anchor_stride)^ndim, so keep edge small and "
+                         "anchor-stride << edge for large n-D tensors")
+    ap.add_argument("--chunk-batch", type=int, default=None,
+                    help="gnn only: cap how many chunks are coded together in the "
+                         "model batch dim (omit = auto from encode-GPU memory). "
+                         "The value is stored in the stream and replayed at decode, "
+                         "so set it to what the smallest decode device can hold")
+    ap.add_argument("--fp16", action="store_true",
+                    help="gnn only: fp16 autocast on the GNN message pass (cuda; "
+                         "~2x forward, readout stays fp32). May cost a little ratio "
+                         "at small eb -- compare bits/value with and without")
+    ap.add_argument("--compile", action="store_true",
+                    help="gnn only: torch.compile the message-pass embed (fuses "
+                         "the elementwise ~40%%; one-off compile cost on first "
+                         "chunk). Same float path replayed at decode")
     args = ap.parse_args(argv)
 
     arr = load_tensor(args.input)
@@ -52,13 +71,34 @@ def main(argv=None):
     if args.rel:
         eb = args.eb * max(float(arr.max()) - float(arr.min()), 1.0)
 
-    t0 = time.time()
-    stream, stats = run_compress(arr, args)
-    t_comp = time.time() - t0
+    if args.predictor == "gnn":
+        # GNNCompressorCodec auto-chunks large tensors; the codec.compress path
+        # allocates a dense embedding field over the whole tensor and OOMs.
+        os.environ.setdefault("DEEPSZ_PROGRESS", "1")  # per-chunk progress to stderr
+        from deepsz.gnn_codec import GNNCompressorCodec
+        codec = GNNCompressorCodec(
+            args.gnn_checkpoint, error_bound=eb, levels=args.levels,
+            anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
+            radius=args.radius, zstd_level=args.zstd_level,
+            eb_ratio=args.eb_ratio,
+            tune=args.tune if args.tune in ("fast", "size") else "fast",
+            chunk_size=args.chunk_size, chunk_batch=args.chunk_batch,
+            fp16=args.fp16, compile=args.compile)
+        t0 = time.time()
+        stream = codec.compress(arr)
+        t_comp = time.time() - t0
+        stats = {"outliers": 0}  # ponytail: codec doesn't surface outlier count
+        t0 = time.time()
+        rec = codec.uncompress(stream).numpy()
+        t_dec = time.time() - t0
+    else:
+        t0 = time.time()
+        stream, stats = run_compress(arr, args)
+        t_comp = time.time() - t0
 
-    t0 = time.time()
-    rec = decompress(stream, lambda hdr: build_predictor(args, hdr))
-    t_dec = time.time() - t0
+        t0 = time.time()
+        rec = decompress(stream, lambda hdr: build_predictor(args, hdr))
+        t_dec = time.time() - t0
 
     a = arr.astype(np.float64)
     r = rec.reshape(arr.shape).astype(np.float64)

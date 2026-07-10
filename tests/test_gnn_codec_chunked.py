@@ -15,8 +15,10 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("constriction")  # rANS backend; skip if unavailable
 
 from deepsz import GNNCompressorCodec
-from deepsz.gnn_predictor import (CKPT_VERSION, _OverlaidGeom, build_chunk_geoms,
-                                  build_model, chunk_halo_info)
+from deepsz.gnn_codec import _chunk_waves
+from deepsz.gnn_predictor import (CKPT_VERSION, ChunkedGNNPredictor,
+                                  _CompactFrame, build_chunk_geoms, build_model,
+                                  chunk_halo_info)
 
 STRIDE = 4
 LEVELS = 2
@@ -126,6 +128,71 @@ def test_auto_chunk_selection(v5_ckpt):
         bad.compress(np.zeros((8, 8), np.float32))
 
 
+# --- wave batching: same-color chunks are independent, so they batch ---------
+
+def test_chunk_waves_are_mutually_independent():
+    """Every wave's chunks are >=2 apart on each axis they differ, so their
+    one-chunk-thick halos never overlap -> batching them is order-independent."""
+    grid = (6, 4)
+    for wave in _chunk_waves(grid):
+        coords = [np.unravel_index(ci, grid) for ci in wave]
+        for i in range(len(coords)):
+            for j in range(i + 1, len(coords)):
+                diff = np.abs(np.array(coords[i]) - np.array(coords[j]))
+                assert diff.max() >= 2   # never adjacent (Chebyshev distance >= 2)
+
+
+def test_fp16_flag_roundtrips_and_persists(v5_ckpt):
+    """fp16=True round-trips within the bound and the flag rides in the stream so
+    decode replays the same float path. (autocast only bites on cuda; on cpu this
+    checks the plumbing + that enabling it doesn't break the closed loop.)"""
+    from deepsz.gnn_codec import _read_stream
+
+    rng = np.random.RandomState(9)
+    x = rng.rand(8, 8).astype(np.float32)
+    codec = GNNCompressorCodec(
+        v5_ckpt, error_bound=0.02, levels=LEVELS, anchor_stride=STRIDE,
+        anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=True)
+
+    stream = codec.compress(x)
+    meta, _ = _read_stream(bytes(stream))
+    assert meta.get("fp16") is True
+    assert _maxerr(codec.uncompress(stream), x) <= 0.02
+
+
+def test_compile_flag_roundtrips_and_persists(v5_ckpt):
+    """compile=True round-trips within the bound and the flag rides in the stream
+    so decode replays the same compiled float path."""
+    from deepsz.gnn_codec import _read_stream
+
+    rng = np.random.RandomState(11)
+    x = rng.rand(8, 8).astype(np.float32)
+    codec = GNNCompressorCodec(
+        v5_ckpt, error_bound=0.02, levels=LEVELS, anchor_stride=STRIDE,
+        anchor_block=1, max_radius=4, chunk_size=STRIDE, compile=True)
+
+    stream = codec.compress(x)
+    meta, _ = _read_stream(bytes(stream))
+    assert meta.get("compiled") is True
+    assert _maxerr(codec.uncompress(stream), x) <= 0.02
+
+
+def test_batch_size_invariant_within_bound(v5_ckpt):
+    """A wave split into different sub-batch sizes still round-trips within the
+    bound (the closed loop stays consistent because enc/dec share the batch)."""
+    rng = np.random.RandomState(5)
+    x = rng.rand(24, 16).astype(np.float32)   # grid 6x4 -> waves of size 2
+    for batch in (1, 2, 64):
+        orig = ChunkedGNNPredictor.max_batch
+        ChunkedGNNPredictor.max_batch = lambda self, cs, _b=batch: _b
+        try:
+            codec = _codec(v5_ckpt, eb=0.02, chunk_size=STRIDE)
+            y = codec.uncompress(codec.compress(x))
+        finally:
+            ChunkedGNNPredictor.max_batch = orig
+        assert _maxerr(y, x) <= 0.02
+
+
 # --- halo geometry: out-of-chunk neighbours go live only once coded ---------
 
 def test_halo_links_activate_when_neighbour_coded():
@@ -140,32 +207,33 @@ def test_halo_links_activate_when_neighbour_coded():
     grid = (2, 1)
     cg = build_chunk_geoms(edges, levels, stride, 1, torch, None)
     origin = (16, 0)                      # chunk 1 (bottom)
-    halo_set = set(cg.halo_flat.tolist())
 
-    def halo_valid_links(usable_np):
-        ut = torch.from_numpy(usable_np)
+    def halo_valid_links(coded):
+        # compact halo rows are the trailing block (row index > n_interior); a
+        # valid line into one is a live cross-border neighbour.
+        frame = _CompactFrame(cg, origin, shape, edges, grid, coded, torch, None)
         total = 0
         for s in cg.chain[1:]:            # refinement stages only
-            g = cg.geoms[s]
-            ov = _OverlaidGeom(g, ut)
-            for ip, v in ((g.ip, ov.vp), (g.in_, ov.vn)):
-                in_halo = np.isin(ip.numpy(), cg.halo_flat)
-                total += int((v.numpy() & in_halo).sum())
+            g = frame.geoms[s]
+            for ip, v in ((g.ip, g.vp), (g.in_, g.vn)):
+                in_halo = ip > frame.n_interior
+                total += int((v & in_halo).sum())
         return total
 
-    usable_uncoded, *_ = chunk_halo_info(
-        cg, origin, shape, edges, grid, np.array([False, False]))
-    usable_coded, *_ = chunk_halo_info(
-        cg, origin, shape, edges, grid, np.array([True, False]))
+    present_uncoded = chunk_halo_info(
+        cg, origin, shape, edges, grid, np.array([False, False]))[0]
+    present_coded = chunk_halo_info(
+        cg, origin, shape, edges, grid, np.array([True, False]))[0]
 
     # more halo cells usable once the neighbour is coded
-    assert usable_coded.sum() > usable_uncoded.sum()
+    assert len(present_coded) > len(present_uncoded)
     # Coding the neighbour is what creates live cross-border links: the periodic
     # nearest step upward from interior points otherwise lands on in-chunk
     # lattice cells, so an uncoded top halo contributes none (the (2,1) negative-
     # side asymmetry). This guards the halo wiring being live, not dead.
-    assert halo_valid_links(usable_coded) > halo_valid_links(usable_uncoded)
-    assert halo_valid_links(usable_coded) > 0
+    assert halo_valid_links(np.array([True, False])) > \
+        halo_valid_links(np.array([False, False]))
+    assert halo_valid_links(np.array([True, False])) > 0
 
 
 def test_out_of_tensor_halo_never_usable():
@@ -177,9 +245,9 @@ def test_out_of_tensor_halo_never_usable():
     grid = (2, 1)
     cg = build_chunk_geoms(edges, levels, stride, 1, torch, None)
     # chunk 0 (top): its top halo has global row < 0 -> out of tensor
-    usable, *_ = chunk_halo_info(
+    present, *_ = chunk_halo_info(
         cg, (0, 0), shape, edges, grid, np.array([True, True]))
-    gc = cg.halo_coords + np.array([0, 0])
+    gc = cg.ref_halo_coords + np.array([0, 0])
     out = np.any((gc < 0) | (gc >= np.array(shape)), axis=1)
-    out_flat = cg.halo_flat[out]
-    assert not usable[out_flat].any()
+    out_flat = cg.ref_halo_flat[out]
+    assert not np.isin(out_flat, present).any()

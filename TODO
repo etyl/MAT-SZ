@@ -1,1 +1,8 @@
-entropy regularisation
+better metrics in training (peak ram, marg bpp?)
+eval on small 4d tensor during training
+train on 4d data
+clean code
+    * remove MAT mentions
+    * simplify / clean code
+chose number of neighbors for agregation
+use tqdm for tensor eval

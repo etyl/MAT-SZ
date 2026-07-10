@@ -47,11 +47,13 @@ def make_predictor(method: str, img: np.ndarray, args):
     """Encoder-side predictor for a DeepSZ closed-loop method."""
     if method in ("gnn", "gnn-rans"):
         from deepsz.gnn_predictor import GNNPredictor
-        return GNNPredictor(args.gnn_checkpoint, float(img.min()), float(img.max()),
-                            tile_size=args.gnn_tile, max_radius=args.max_radius,
-                            device=args.device, levels=args.levels,
-                            anchor_stride=args.anchor_stride,
-                            anchor_block=args.anchor_block)
+        p = GNNPredictor(args.gnn_checkpoint, float(img.min()), float(img.max()),
+                         tile_size=args.gnn_tile, max_radius=args.max_radius,
+                         device=args.device, levels=args.levels,
+                         anchor_stride=args.anchor_stride,
+                         anchor_block=args.anchor_block)
+        p.fp16 = args.fp16
+        return p
     order = "linear" if method == "interp-linear" else "cubic"
     return InterpPredictor(args.interp_tile, order, args.levels,
                            args.anchor_stride, args.anchor_block)
@@ -61,11 +63,13 @@ def build_predictor_for_decompress(method: str, hdr: Header, args):
     """Decoder-side predictor; params come from the stream header."""
     if hdr.flags & FLAG_GNN:
         from deepsz.gnn_predictor import GNNPredictor
-        return GNNPredictor(args.gnn_checkpoint, hdr.vmin, hdr.vmax,
-                            tile_size=hdr.tile_size, max_radius=args.max_radius,
-                            device=args.device, levels=hdr.levels,
-                            anchor_stride=hdr.anchor_stride,
-                            anchor_block=hdr.anchor_block)
+        p = GNNPredictor(args.gnn_checkpoint, hdr.vmin, hdr.vmax,
+                         tile_size=hdr.tile_size, max_radius=args.max_radius,
+                         device=args.device, levels=hdr.levels,
+                         anchor_stride=hdr.anchor_stride,
+                         anchor_block=hdr.anchor_block)
+        p.fp16 = args.fp16   # eval runs enc+dec in-process, so both match
+        return p
     if hdr.flags & FLAG_MOCK:
         return MockPredictor(hdr.tile_size)
     return InterpPredictor(hdr.tile_size, "cubic" if hdr.flags & FLAG_CUBIC else "linear",
@@ -275,6 +279,9 @@ def main():
     ap.add_argument("--max-radius", type=int, default=64,
                     help="GNN neighbour search radius")
     ap.add_argument("--device", default="cpu", help="torch device for the GNN")
+    ap.add_argument("--fp16", action="store_true",
+                    help="fp16 autocast on the GNN message pass (cuda; readout "
+                         "stays fp32). Measures the ratio cost vs fp32 across eb")
     ap.add_argument("--images", nargs="*", default=None,
                     help="specific image filenames (default: all in --data)")
     ap.add_argument("--csv", default="eval.csv",
@@ -314,7 +321,11 @@ def main():
           f"anchor_stride={args.anchor_stride} anchor_block={args.anchor_block}")
     if uses_gnn:
         print(f"GNN checkpoint: {args.gnn_checkpoint}  (tile={args.gnn_tile}, "
-              f"device={args.device})\n")
+              f"device={args.device}, fp16={'ON' if args.fp16 else 'off'})")
+        if args.fp16 and not str(args.device).startswith("cuda"):
+            print("  NOTE: fp16 autocast only engages on cuda; device is "
+                  f"{args.device!r} -> running fp32")
+        print()
 
     rows: list[dict] = []
     total = len(images) * len(args.eb) * len(args.methods)
