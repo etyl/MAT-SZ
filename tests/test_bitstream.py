@@ -25,8 +25,17 @@ def test_stream_roundtrip():
     payloads = [bytes([i]) * (i * 100 + 1) for i in range(6)]
     stream = write_stream(h, payloads)
     h2, p2 = read_stream(stream)
+    h.spatial = (h.orig_h, h.orig_w)  # write_stream records the spatial shape
     assert h2 == h
     assert p2 == payloads
+
+
+def test_stream_roundtrip_nd():
+    h = make_header(spatial=(12, 20, 24, 28), n_tiles_y=1, n_tiles_x=1)
+    stream = write_stream(h, [b"x" * 33])
+    h2, p2 = read_stream(stream)
+    assert h2.spatial == (12, 20, 24, 28)
+    assert p2 == [b"x" * 33]
 
 
 def test_bad_magic():

@@ -19,7 +19,7 @@ import numpy as np
 import zstandard
 
 MAGIC = b"MATSZ01\0"
-VERSION = 4
+VERSION = 5
 
 FLAG_MOCK = 1 << 0
 FLAG_GRAY = 1 << 1
@@ -58,6 +58,10 @@ class Header:
     interp_center: int = 0  # interp multi-axis mode: 0=avg both, 1=axis0, 2=axis1
     eb_ratio: float = 1.0   # per-level error-bound decay (coarse tighter); 1=flat
     version: int = VERSION
+    # Original (unpadded) spatial shape, any rank. Written as a variable-length
+    # block by write_stream (the fixed struct only has room for 2 axes). Empty
+    # falls back to (orig_h, orig_w) for legacy 2-D callers.
+    spatial: tuple[int, ...] = ()
 
     def pack(self) -> bytes:
         return struct.pack(
@@ -89,19 +93,28 @@ class Header:
                    eb_ratio=eb_ratio, version=version)
 
 
+def _pack_spatial(header: Header) -> bytes:
+    spatial = header.spatial or (header.orig_h, header.orig_w)
+    return struct.pack(f"<B{len(spatial)}I", len(spatial), *spatial)
+
+
 def write_stream(header: Header, tile_payloads: list[bytes], zstd_level: int = 9) -> bytes:
     n = header.n_tiles_y * header.n_tiles_x
     if len(tile_payloads) != n:
         raise ValueError(f"expected {n} tile payloads, got {len(tile_payloads)}")
     sizes = struct.pack(f"<{n}Q", *(len(p) for p in tile_payloads))
     body = zstandard.ZstdCompressor(level=zstd_level).compress(b"".join(tile_payloads))
-    return header.pack() + sizes + body
+    return header.pack() + _pack_spatial(header) + sizes + body
 
 
 def read_stream(data: bytes) -> tuple[Header, list[bytes]]:
     header = Header.unpack(data)
-    n = header.n_tiles_y * header.n_tiles_x
     off = _HEADER_SIZE
+    (nd,) = struct.unpack_from("<B", data, off)
+    off += 1
+    header.spatial = struct.unpack_from(f"<{nd}I", data, off)
+    off += 4 * nd
+    n = header.n_tiles_y * header.n_tiles_x
     sizes = struct.unpack_from(f"<{n}Q", data, off)
     off += 8 * n
     body = zstandard.ZstdDecompressor().decompress(data[off:])

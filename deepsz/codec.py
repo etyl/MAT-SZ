@@ -36,7 +36,12 @@ def compress(
     tune_size_slack: float = 1.05,
     verbose: bool = False,
 ) -> tuple[bytes, dict]:
-    """Compress an (H, W) or (H, W, C) array. Returns (stream bytes, stats).
+    """Compress an image or an arbitrary-rank scalar field. Returns (stream, stats).
+
+    An (H, W) or (H, W, C∈{1,3}) array is treated as an image (channel axis last,
+    classic SZ semantics). Any other shape is a single-channel field of arbitrary
+    rank (scientific data) — compressed whole, no tiling, via a tile_free
+    predictor (interp/gnn); tiling predictors (MAT) only accept 2-D images.
 
     ``eb_ratio`` scales the per-level error bound (coarse levels tighter, see
     ``levels.stage_ebs``): pass a value in (0, 1] to fix it. With ``eb_ratio``
@@ -44,14 +49,24 @@ def compress(
     sweeps candidates and keeps the smallest stream, and ``rd`` keeps the
     lowest reconstruction SSE within ``tune_size_slack`` of the smallest stream.
     1.0 reproduces flat-eb classic SZ."""
-    if img.ndim == 2:
-        img = img[..., None]
-    h, w, c = img.shape
-    if c not in (1, 3):
-        raise ValueError(f"expected 1 or 3 channels, got {c}")
+    # Two input shapes. An "image" carries a trailing channel axis (2-D, or 3-D
+    # with 1 or 3 channels) and keeps SZ's classic (H, W, C) semantics. Anything
+    # else is a single-channel scalar field of arbitrary rank (scientific data):
+    # spatial = the whole shape, C = 1. Everything downstream (levels, interp/GNN
+    # predictors, quantizer) is already rank-generic; only tiling stays 2-D.
+    is_image = img.ndim <= 2 or (img.ndim == 3 and img.shape[-1] in (1, 3))
+    if is_image:
+        if img.ndim == 2:
+            img = img[..., None]
+        spatial = img.shape[:-1]
+        c = img.shape[-1]
+        fimg = img.astype(np.float32)
+    else:
+        spatial = img.shape
+        c = 1
+        fimg = img.astype(np.float32)[..., None]  # append a size-1 channel axis
     src_dtype = DTYPE_IDS[np.dtype(img.dtype)]
 
-    fimg = img.astype(np.float32)
     vmin = float(fimg.min())
     vmax = float(fimg.max())
     if vmax <= vmin:
@@ -65,42 +80,54 @@ def compress(
         if got != val:
             raise ValueError(f"predictor {name}={got} != compress {name}={val}")
 
-    # Tile-free predictors (interp) compress the whole image as one region: no
-    # padding, no seam. Others tile into square tile_size blocks (MAT needs 512).
+    # channel axis to front: (C, *spatial). moveaxis generalizes transpose(2,0,1).
+    field = np.moveaxis(fimg, -1, 0)
+    # Tile-free predictors (interp/GNN) compress the whole field as one region,
+    # any rank: no padding, no seam. Tiling predictors (MAT) need fixed square
+    # blocks and only handle 2-D images.
     notile = getattr(predictor, "tile_free", False)
     if notile:
         th = tw = 0
         ty = tx = 1
-        canvas = fimg.transpose(2, 0, 1)  # (C, H, W), no padding
+        canvas = field  # (C, *spatial), no padding
     else:
+        if len(spatial) != 2:
+            raise ValueError("tiling predictors support only 2-D images; use a "
+                             "tile_free predictor (interp/gnn) for n-D fields")
+        h, w = spatial
         th = tw = predictor.tile_size
         ty, tx = -(-h // th), -(-w // tw)
-        canvas = np.pad(fimg, ((0, ty * th - h), (0, tx * tw - w), (0, 0)), mode="edge")
-        canvas = canvas.transpose(2, 0, 1)
+        canvas = np.pad(field, ((0, 0), (0, ty * th - h), (0, tx * tw - w)), mode="edge")
 
-    _, ch, cw = canvas.shape
-    mh, mw = (ch, cw) if notile else (th, tw)
+    region_shape = canvas.shape[1:] if notile else (th, tw)
     # interp supplies its own sub-pass split; others use the plain dyadic schedule
     make_masks = getattr(predictor, "stage_masks", stage_masks)
-    masks = make_masks((mh, mw), levels, anchor_stride, anchor_block)
+    masks = make_masks(region_shape, levels, anchor_stride, anchor_block)
     flags = getattr(predictor, "stream_flag", 0) | (FLAG_GRAY if c == 1 else 0)
     flags |= FLAG_NOTILE if notile else 0
     use_rans = getattr(predictor, "provides_scale", False)
     flags |= FLAG_RANS if use_rans else 0
     round_output = np.issubdtype(np.dtype(img.dtype), np.integer)
-    step_h, step_w = ch // ty, cw // tx
+    step_h, step_w = (canvas.shape[1] // ty, canvas.shape[2] // tx) if not notile else (0, 0)
+
+    def new_stats():
+        return {"predict_s": 0.0, "quantize_s": 0.0, "entropy_s": 0.0,
+                "outliers": 0, "stage_codes": [0] * len(masks),
+                "stage_outliers": [0] * len(masks),
+                "stage_payload_bytes": [0] * len(masks),
+                "stage_model_bits": [0.0] * len(masks),
+                "stage_pred_sae": [0.0] * len(masks),
+                "stage_pred_sse": [0.0] * len(masks),
+                "stage_recon_sae": [0.0] * len(masks),
+                "stage_recon_sse": [0.0] * len(masks),
+                "stage_recon_max": [0.0] * len(masks)}
 
     def encode(ebs):
-        st = {"predict_s": 0.0, "quantize_s": 0.0, "entropy_s": 0.0,
-              "outliers": 0, "stage_codes": [0] * len(masks),
-              "stage_outliers": [0] * len(masks),
-              "stage_payload_bytes": [0] * len(masks),
-              "stage_model_bits": [0.0] * len(masks),
-              "stage_pred_sae": [0.0] * len(masks),
-              "stage_pred_sse": [0.0] * len(masks),
-              "stage_recon_sae": [0.0] * len(masks),
-              "stage_recon_sse": [0.0] * len(masks),
-              "stage_recon_max": [0.0] * len(masks)}
+        st = new_stats()
+        if notile:  # whole field, one region, any rank
+            payload, recon = _compress_tile(canvas, masks, ebs, predictor, radius,
+                                            round_output, st)
+            return [payload], recon, len(payload), st
         pays, rc = [], np.empty_like(canvas)
         for i in range(ty):
             for j in range(tx):
@@ -112,10 +139,11 @@ def compress(
         return pays, rc, sum(len(p) for p in pays), st
 
     def ebs_for(ratio):
-        return stage_ebs((mh, mw), levels, anchor_stride, anchor_block, eb, ratio)
+        return stage_ebs(region_shape, levels, anchor_stride, anchor_block, eb, ratio)
 
     def make_header(center, ratio):
-        return Header(orig_h=h, orig_w=w, channels=c, src_dtype=src_dtype,
+        return Header(orig_h=spatial[0], orig_w=spatial[1] if len(spatial) > 1 else 1,
+                      channels=c, src_dtype=src_dtype, spatial=tuple(spatial),
                       eb=float(eb), levels=levels, anchor_stride=anchor_stride,
                       anchor_block=anchor_block, tile_size=th, radius=radius,
                       seed=seed, vmin=vmin, vmax=vmax,
@@ -207,12 +235,19 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
     if hasattr(predictor, "center"):
         predictor.center = header.interp_center
 
-    ty, tx = header.n_tiles_y, header.n_tiles_x
-    if header.flags & FLAG_NOTILE:
-        step_h, step_w = header.orig_h, header.orig_w  # whole image, one region
-    else:
-        step_h = step_w = header.tile_size
     make_masks = getattr(predictor, "stage_masks", stage_masks)
+    spatial = tuple(header.spatial) or (header.orig_h, header.orig_w)
+    if header.flags & FLAG_NOTILE:  # whole field, one region, any rank
+        region = spatial
+        masks = make_masks(region, header.levels, header.anchor_stride,
+                           header.anchor_block)
+        ebs = stage_ebs(region, header.levels, header.anchor_stride,
+                        header.anchor_block, header.eb, header.eb_ratio)
+        canvas = _decompress_tile(payloads[0], masks, ebs, header, predictor)
+        return _finalize(canvas, header)
+
+    ty, tx = header.n_tiles_y, header.n_tiles_x
+    step_h = step_w = header.tile_size
     masks = make_masks((step_h, step_w), header.levels, header.anchor_stride,
                        header.anchor_block)
     ebs = stage_ebs((step_h, step_w), header.levels, header.anchor_stride,
@@ -292,9 +327,9 @@ def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats):
 
 def _decompress_tile(payload, masks, ebs, header, predictor):
     c = header.channels
-    th, tw = masks[0].shape  # region dims (tile or whole image)
-    recon = np.zeros((c, th, tw), np.float32)
-    known = np.zeros((th, tw), bool)
+    region = masks[0].shape  # region dims (tile, or whole field of any rank)
+    recon = np.zeros((c, *region), np.float32)
+    known = np.zeros(region, bool)
     off = 0
     use_rans = bool(header.flags & FLAG_RANS)
     for stage_idx, pos in enumerate(masks):
@@ -336,7 +371,9 @@ def _decompress_tile(payload, masks, ebs, header, predictor):
 
 
 def _finalize(canvas: np.ndarray, header: Header) -> np.ndarray:
-    out = canvas.transpose(1, 2, 0)[:header.orig_h, :header.orig_w]
+    spatial = tuple(header.spatial) or (header.orig_h, header.orig_w)
+    out = np.moveaxis(canvas, 0, -1)  # (C, *spatial) -> (*spatial, C)
+    out = out[tuple(slice(0, n) for n in spatial)]  # crop tiling padding
     dtype = DTYPE_CODES[header.src_dtype]
     if np.issubdtype(dtype, np.integer):
         info = np.iinfo(dtype)
