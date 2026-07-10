@@ -30,8 +30,10 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from deepsz.gnn_predictor import (CKPT_VERSION, build_model, build_stage_geoms,
-                                  stage_forward)
+from deepsz.gnn_predictor import (CKPT_VERSION, _OverlaidGeom, anchor_finalize,
+                                  build_chunk_geoms, build_model,
+                                  build_stage_geoms, chunk_coarse,
+                                  chunk_halo_info, stage_forward)
 from deepsz.levels import stage_masks
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".ppm", ".pgm"}
@@ -282,6 +284,100 @@ def run_stages(model, x, geoms, d, device, eb, teacher_force=False,
     return nll_sum, npix, known_vals, pred_only, {"bins": bins, "abs_err": abs_err}
 
 
+def _run_chunk(model, cg, usable, E, known_vals, x, gidx, eb, device, reveal):
+    """One chunk of the chunked-scene step: the codec's local stage chain with
+    teacher forcing. Returns (nll bits, n holes, abs err, finalized E)."""
+    geoms = [None if g is None else _OverlaidGeom(g, usable)
+             for g in cg.geoms]
+    nll = torch.zeros((), device=device)
+    abs_err = torch.zeros((), device=device)
+    npix = 0
+    ctx = None
+    for j in range(1, len(cg.chain)):
+        prev, s = cg.chain[j - 1], cg.chain[j]
+        gp, gh = geoms[prev], geoms[s]
+        fvals = None if gp is None else known_vals[:, gidx[prev]]
+        (pred, log_b), E, ctx = stage_forward(model, E, gp, gh, fvals, torch,
+                                              finalize_ctx=ctx, eb=eb)
+        tgt = x[:, gidx[s]]
+        nll = nll + discretized_laplace_nll(pred, log_b, tgt, eb).sum()
+        abs_err = abs_err + (pred.detach() - tgt).abs().sum()
+        npix += tgt.numel()
+        reveal(gidx[s])
+    last = cg.chain[-1]
+    g = geoms[last]
+    if g is not None:  # finalize the last stage so the coarse means see it
+        if ctx is None:
+            ctx = model.embed(E, g)
+        E = E.index_copy(1, g.query_idx,
+                         model.finalize(ctx, known_vals[:, gidx[last]]))
+    return nll, npix, abs_err, E
+
+
+def run_chunked_scene(model, x, hw, axis, order, levels, stride, d, device, eb):
+    """Teacher-forced two-chunk closed loop, mirroring the chunked codec: the
+    square scene is split in half along ``axis``; global anchors are revealed
+    and give every chunk its level-0 coarse embedding, then the chunks are
+    coded in ``order`` — the first sees only anchor context across the border,
+    the second sees the first's per-level coarse embeddings as coded halo.
+    Same geometry/halo/coarse code as ChunkedGNNPredictor, with gradients."""
+    B, N = x.shape
+    h, w = hw
+    eb = _batch_scalar(eb, B, device)
+    edges = (h, w // 2) if axis == 1 else (h // 2, w)
+    grid = (1, 2) if axis == 1 else (2, 1)
+    known_vals = torch.full_like(x, 0.5)
+
+    def reveal(idx):
+        if not torch.is_tensor(idx):
+            idx = torch.from_numpy(np.asarray(idx, np.int64)).to(device)
+        nz = (torch.rand(B, idx.numel(), device=device) * 2 - 1) * eb[:, None]
+        known_vals[:, idx] = (x[:, idx] + nz).clamp(0, 1)
+
+    # global anchor pass + per-chunk level-0 coarse
+    coarse = torch.zeros(B, 2, levels + 1, 2, d, device=device)
+    origins, aidx = [], []
+    for ci in range(2):
+        starts = tuple(g * e for g, e in zip(np.unravel_index(ci, grid), edges))
+        origins.append(starts)
+        axes = [o + np.arange(e)[(np.arange(e) + o) % stride == 0]
+                for o, e in zip(starts, edges)]
+        aidx.append((axes[0][:, None] * w + axes[1][None, :]).reshape(-1))
+    for ci in range(2):
+        reveal(aidx[ci])
+    for ci in range(2):
+        fin = anchor_finalize(model, known_vals[:, aidx[ci]], 2)
+        coarse[:, ci, 0] = model.coarse(fin.mean(1), math.log2(stride))
+
+    cg = build_chunk_geoms(edges, levels, stride, 1, torch, device)
+    coded = np.zeros(2, bool)
+    nll = torch.zeros((), device=device)
+    abs_err = torch.zeros((), device=device)
+    npix = 0
+    for ci in order:
+        usable_np, sel, ids, lv, gflat = chunk_halo_info(
+            cg, origins[ci], hw, edges, grid, coded)
+        usable = torch.from_numpy(usable_np).to(device)
+        E = torch.zeros(B, cg.n_padded, 2, d, device=device)
+        if len(sel):
+            ids_t = torch.from_numpy(ids).to(device)
+            lv_t = torch.from_numpy(lv.astype(np.int64)).to(device)
+            gflat_t = torch.from_numpy(gflat).to(device)
+            sel_t = torch.from_numpy(sel).to(device)
+            cvec = coarse[:, ids_t, lv_t]                  # (B, Hs, K, d)
+            E = E.index_copy(1, sel_t, model.finalize(
+                cvec, known_vals[:, gflat_t]))
+        gidx = [None if c is None else torch.from_numpy(np.ravel_multi_index(
+            [(c[:, k] + origins[ci][k]) for k in range(2)], hw)).to(device)
+            for c in cg.coords]
+        n1, np1, a1, E = _run_chunk(model, cg, usable, E, known_vals, x, gidx,
+                                    eb, device, reveal)
+        nll, npix, abs_err = nll + n1, npix + np1, abs_err + a1
+        coarse[:, ci] = chunk_coarse(model, E, cg, torch)
+        coded[ci] = True
+    return nll, npix, {"abs_err": abs_err}
+
+
 def load_eval_plane(path, device):
     """Whole-image luma plane from the eval image as ((1, N), (h, w))."""
     from PIL import Image
@@ -310,6 +406,10 @@ def main():
                     help="sample each training example's +/- noise log-uniformly "
                          "from [MIN, MAX], overriding --noise")
     ap.add_argument("--max-radius", type=int, default=64)
+    ap.add_argument("--chunk-frac", type=float, default=0.5,
+                    help="fraction of steps trained on the two-chunk scene "
+                         "(chunked-codec halo regime); the rest train the "
+                         "whole-crop schedule")
     ap.add_argument("--baseline", choices=("cubic", "linear"), default="cubic",
                     help="SZ-style interpolation used for the reference line")
     ap.add_argument("--eval-image", default=str(Path(__file__).resolve().parent
@@ -426,14 +526,22 @@ def main():
         # on broken schedules (see levels.stage_plan's guard).
         stride = args.stride or random.choice((8, 16, 32))
         levels = args.levels or stride.bit_length() - 1
-        geoms, _ = build_stage_geoms((args.crop, args.crop), levels, stride, 1,
-                                     args.max_radius, torch, device)
 
         # Pixel-weighted discretized-Laplacian NLL: the sampled eb both
         # conditions the head and sets the teacher-forcing noise amplitude.
         eb = sample_noise(x.shape[0], args, device)
-        nll, npix, _, _, aux = run_stages(model, x, geoms, args.d, device,
-                                          eb=eb, teacher_force=True)
+        if random.random() < args.chunk_frac:
+            # chunked-codec regime: two half-crop chunks with halo context
+            axis = random.randint(0, 1)
+            order = random.choice(([0, 1], [1, 0]))
+            nll, npix, aux = run_chunked_scene(
+                model, x, (args.crop, args.crop), axis, order, levels, stride,
+                args.d, device, eb)
+        else:
+            geoms, _ = build_stage_geoms((args.crop, args.crop), levels, stride,
+                                         1, args.max_radius, torch, device)
+            nll, npix, _, _, aux = run_stages(model, x, geoms, args.d, device,
+                                              eb=eb, teacher_force=True)
         loss = nll / max(npix, 1)
         train_mae = aux["abs_err"].detach() / max(npix, 1)
         opt.zero_grad()

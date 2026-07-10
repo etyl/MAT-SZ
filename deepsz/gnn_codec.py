@@ -11,17 +11,23 @@ import numpy as np
 import zstandard
 
 from .codec import _compress_tile
-from .gnn_predictor import GNNPredictor
+from .gnn_predictor import ChunkedGNNPredictor, GNNPredictor
 from .levels import stage_ebs, stage_masks
-from .quantizer import dequantize
-from .bitstream import unpack_stage
+from .quantizer import dequantize, quantize
+from .bitstream import pack_stage, unpack_stage
 from .rans import build_laplace_tables, scale_to_level
 
 
 _MAGIC = b"MATSZGNN"
-_VERSION = 2
+_VERSION = 2          # whole-tensor streams
+_VERSION_CHUNKED = 3  # chunk-major streams (global anchors + per-chunk stages)
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
+
+# auto mode: whole-tensor below this many points, chunked above (whole-tensor
+# memory is ~30*L*K*d bytes/point in transients — ~2^21 points is a few GB)
+_AUTO_CHUNK_THRESHOLD = 1 << 21
+_AUTO_CHUNK_POINTS = 1 << 18  # target points per chunk
 
 
 def _as_numpy(x: Any) -> np.ndarray:
@@ -56,10 +62,11 @@ def _restore_dtype(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
     return values.astype(dtype, copy=False)
 
 
-def _write_stream(meta: dict[str, Any], payload: bytes, zstd_level: int) -> bytes:
+def _write_stream(meta: dict[str, Any], payload: bytes, zstd_level: int,
+                  version: int = _VERSION) -> bytes:
     header = json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8")
     body = zstandard.ZstdCompressor(level=zstd_level).compress(payload)
-    return struct.pack(_PREFIX, _MAGIC, _VERSION, len(header)) + header + body
+    return struct.pack(_PREFIX, _MAGIC, version, len(header)) + header + body
 
 
 def _read_stream(stream: bytes) -> tuple[dict[str, Any], bytes]:
@@ -68,7 +75,7 @@ def _read_stream(stream: bytes) -> tuple[dict[str, Any], bytes]:
     magic, version, header_len = struct.unpack_from(_PREFIX, stream, 0)
     if magic != _MAGIC:
         raise ValueError(f"not a DeepSZ GNN stream (bad magic {magic!r})")
-    if version != _VERSION:
+    if version not in (_VERSION, _VERSION_CHUNKED):
         raise ValueError(f"unsupported DeepSZ GNN stream version {version}")
     off = _PREFIX_SIZE
     meta = json.loads(stream[off:off + header_len].decode("utf-8"))
@@ -143,6 +150,157 @@ def _decompress_region(
     return recon[0]
 
 
+def _chunk_stage_ebs(shape, levels, stride, block, eb, eb_ratio) -> list[float]:
+    """Per-stage error bounds for the chunked path. The stage strides depend
+    only on (rank, levels, stride), so evaluate ``stage_ebs`` on a tiny
+    same-rank shape — never on the full tensor (that would materialise
+    full-shape stage masks, the memory bug this path removes)."""
+    return stage_ebs((2 * stride,) * len(shape), levels, stride, block, eb,
+                     eb_ratio)
+
+
+def _anchor_axes(shape: tuple[int, ...], stride: int, block: int) -> list[np.ndarray]:
+    """Per-axis anchor coordinates. The anchor set is separable (every
+    coordinate has residue < block mod stride), so the global anchor pass can
+    index it with np.ix_ and never materialise a full-shape mask."""
+    axes = []
+    for n in shape:
+        c = np.arange(n)
+        axes.append(c[(c % stride) < block])
+    return axes
+
+
+def _auto_chunk_edges(shape: tuple[int, ...], stride: int) -> tuple[int, ...]:
+    """Uniform chunk edge targeting ~_AUTO_CHUNK_POINTS points per chunk,
+    rounded down to a multiple of the anchor stride (>= one stride)."""
+    target = _AUTO_CHUNK_POINTS ** (1.0 / len(shape))
+    edge = max(stride, int(target) // stride * stride)
+    return (edge,) * len(shape)
+
+
+def _code_anchor_stage(values, recon, axes, eb0, radius, round_output):
+    """Encoder side of the global anchor pass: quantize anchors against pred 0,
+    write their recon, return the packed stage."""
+    c = values.shape[0]
+    sub = (slice(None), *np.ix_(*axes))
+    avals = values[sub].reshape(c, -1)
+    n = avals.shape[1]
+    pred = np.zeros((c, n), np.float32)
+    codes, outliers = quantize(avals, pred, eb0, radius,
+                               round_output=round_output)
+    recon[sub] = dequantize(pred, codes, outliers, eb0, radius).reshape(
+        recon[sub].shape)
+    tables = build_laplace_tables(eb0, radius)
+    levels64 = scale_to_level(np.full((c, n), eb0, np.float32), eb0).reshape(-1)
+    return pack_stage(codes, outliers, rans_levels=levels64, rans_tables=tables)
+
+
+def _decode_anchor_stage(payload, off, recon, axes, eb0, radius):
+    c = recon.shape[0]
+    sub = (slice(None), *np.ix_(*axes))
+    n = int(np.prod([len(a) for a in axes]))
+    tables = build_laplace_tables(eb0, radius)
+    levels64 = scale_to_level(np.full((c, n), eb0, np.float32), eb0).reshape(-1)
+    codes, outliers, off = unpack_stage(payload, off, rans_levels=levels64,
+                                        rans_tables=tables)
+    pred = np.zeros((c, n), np.float32)
+    recon[sub] = dequantize(pred, codes, outliers, eb0, radius).reshape(
+        recon[sub].shape)
+    return off
+
+
+def _compress_chunked(
+    values: np.ndarray,
+    ebs: list[float],
+    radius: int,
+    round_output: bool,
+    predictor: ChunkedGNNPredictor,
+    edges: tuple[int, ...],
+) -> bytes:
+    """Chunk-major encode: global anchor pass, then chunks in raster order,
+    each running its local stage schedule (stage 0 skipped — anchors are
+    already coded). Peak memory is O(chunk), plus the O(N) recon."""
+    c = values.shape[0]
+    shape = values.shape[1:]
+    stride, block = predictor.anchor_stride, predictor.anchor_block
+    recon = np.zeros_like(values)
+    axes = _anchor_axes(shape, stride, block)
+    parts = [_code_anchor_stage(values, recon, axes, ebs[0], radius,
+                                round_output)]
+    predictor.begin(shape, edges, channels=c)
+    predictor.anchor_coarse(recon)
+    for ci in range(predictor.n_chunks):
+        sls = predictor.chunk_slices(ci)
+        cshape = tuple(sl.stop - sl.start for sl in sls)
+        cmasks = stage_masks(cshape, predictor.levels, stride, block)
+        cvals = values[(slice(None), *sls)]
+        crecon = recon[(slice(None), *sls)]        # view: writes hit recon
+        predictor.start_chunk(ci, recon)
+        for s in range(1, len(cmasks)):
+            pos = cmasks[s]
+            n = int(pos.sum())
+            tables = build_laplace_tables(ebs[s], radius)
+            if n == 0:
+                parts.append(pack_stage(
+                    np.zeros(0, np.uint32), np.zeros(0, np.float32),
+                    rans_levels=np.zeros(0, np.uint8), rans_tables=tables))
+                continue
+            pred, scale = predictor.predict_stage(s, recon, ebs[s])
+            codes, outliers = quantize(cvals[:, pos], pred, ebs[s], radius,
+                                       round_output=round_output)
+            crecon[:, pos] = dequantize(pred, codes, outliers, ebs[s],
+                                        radius).reshape(c, n)
+            parts.append(pack_stage(
+                codes, outliers,
+                rans_levels=scale_to_level(scale, ebs[s]).reshape(-1),
+                rans_tables=tables))
+        predictor.finish_chunk(ci, recon)
+    return b"".join(parts)
+
+
+def _decompress_chunked(
+    payload: bytes,
+    shape: tuple[int, ...],
+    ebs: list[float],
+    radius: int,
+    predictor: ChunkedGNNPredictor,
+    edges: tuple[int, ...],
+) -> np.ndarray:
+    c = 1
+    stride, block = predictor.anchor_stride, predictor.anchor_block
+    recon = np.zeros((c, *shape), np.float32)
+    axes = _anchor_axes(shape, stride, block)
+    off = _decode_anchor_stage(payload, 0, recon, axes, ebs[0], radius)
+    predictor.begin(shape, edges, channels=c)
+    predictor.anchor_coarse(recon)
+    for ci in range(predictor.n_chunks):
+        sls = predictor.chunk_slices(ci)
+        cshape = tuple(sl.stop - sl.start for sl in sls)
+        cmasks = stage_masks(cshape, predictor.levels, stride, block)
+        crecon = recon[(slice(None), *sls)]
+        predictor.start_chunk(ci, recon)
+        for s in range(1, len(cmasks)):
+            pos = cmasks[s]
+            n = int(pos.sum())
+            tables = build_laplace_tables(ebs[s], radius)
+            if n == 0:
+                _codes, _outliers, off = unpack_stage(
+                    payload, off, rans_levels=np.zeros(0, np.uint8),
+                    rans_tables=tables)
+                continue
+            pred, scale = predictor.predict_stage(s, recon, ebs[s])
+            levels64 = scale_to_level(scale, ebs[s]).reshape(-1)
+            codes, outliers, off = unpack_stage(payload, off,
+                                                rans_levels=levels64,
+                                                rans_tables=tables)
+            crecon[:, pos] = dequantize(pred, codes, outliers, ebs[s],
+                                        radius).reshape(c, n)
+        predictor.finish_chunk(ci, recon)
+    if off != len(payload):
+        raise ValueError("trailing bytes in DeepSZ GNN payload")
+    return recon[0]
+
+
 class GNNCompressorCodec:
     """Usable Python codec for GNN-backed DeepSZ tensor compression.
 
@@ -167,6 +325,7 @@ class GNNCompressorCodec:
         eb_ratio: float | None = 1.0,
         tune: str = "fast",
         strict_checkpoint: bool = True,
+        chunk_size: int | tuple[int, ...] | None = None,
     ):
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
@@ -187,7 +346,31 @@ class GNNCompressorCodec:
         self.eb_ratio = eb_ratio
         self.tune = tune
         self.strict_checkpoint = bool(strict_checkpoint)
+        # chunk_size: None = auto (whole-tensor for small inputs, chunked
+        # above _AUTO_CHUNK_THRESHOLD points); 0 = force whole-tensor; an int
+        # or per-axis tuple forces chunked with those edges (multiples of
+        # anchor_stride).
+        self.chunk_size = chunk_size
         self.checkpoint_hash = self._checkpoint_hash()
+
+    def _chunk_edges(self, shape: tuple[int, ...]) -> tuple[int, ...] | None:
+        """Chunk edges for this shape, or None for the whole-tensor path."""
+        cs = self.chunk_size
+        if cs == 0:
+            return None
+        if cs is None:
+            if int(np.prod(shape)) <= _AUTO_CHUNK_THRESHOLD:
+                return None
+            return _auto_chunk_edges(shape, self.anchor_stride)
+        edges = ((int(cs),) * len(shape) if np.isscalar(cs)
+                 else tuple(int(e) for e in cs))
+        if len(edges) != len(shape):
+            raise ValueError("chunk_size must be scalar or one entry per axis")
+        for e in edges:
+            if e < self.anchor_stride or e % self.anchor_stride:
+                raise ValueError("chunk_size must be a positive multiple of "
+                                 "anchor_stride")
+        return edges
 
     def compress(self, x: Any, error_bound: float | None = None) -> bytes:
         """Compress a numpy array or torch tensor of any rank into bytes."""
@@ -213,9 +396,16 @@ class GNNCompressorCodec:
             [float(self.eb_ratio)] if self.eb_ratio is not None
             else ([1.0, 0.9, 0.8, 0.7] if self.tune == "size" else [1.0])
         )
+        edges = self._chunk_edges(shape)
         candidates: list[tuple[int, bytes]] = []
         for ratio in ratio_candidates:
-            payload = self._compress_payload(values, dtype, eb, vmin, vmax, ratio)
+            if edges is None:
+                payload = self._compress_payload(values, dtype, eb, vmin, vmax,
+                                                 ratio)
+            else:
+                payload = self._compress_chunked_payload(values, dtype, eb,
+                                                         vmin, vmax, ratio,
+                                                         edges)
             meta = {
                 "codec": "deepsz.gnn",
                 "shape": list(original_shape),
@@ -233,7 +423,11 @@ class GNNCompressorCodec:
                 "entropy_coder": "rans",
                 "checkpoint_hash": self.checkpoint_hash.hex(),
             }
-            stream = _write_stream(meta, payload, self.zstd_level)
+            if edges is not None:
+                meta["chunks"] = list(edges)
+            stream = _write_stream(meta, payload, self.zstd_level,
+                                   _VERSION if edges is None
+                                   else _VERSION_CHUNKED)
             candidates.append((len(stream), stream))
         return min(candidates, key=lambda item: item[0])[1]
 
@@ -255,6 +449,19 @@ class GNNCompressorCodec:
         vmax = float(meta["vmax"])
         if vmax <= vmin:
             vmax = vmin + 1.0
+
+        if "chunks" in meta:
+            edges = tuple(int(e) for e in meta["chunks"])
+            predictor = self._chunked_predictor(vmin, vmax, meta)
+            ebs = _chunk_stage_ebs(shape, int(meta["levels"]),
+                                   int(meta["anchor_stride"]),
+                                   int(meta["anchor_block"]),
+                                   float(meta["error_bound"]),
+                                   float(meta["eb_ratio"]))
+            values = _decompress_chunked(payload, shape, ebs,
+                                         int(meta["radius"]), predictor, edges)
+            out = _restore_dtype(values.reshape(original_shape), dtype)
+            return torch.as_tensor(out)
 
         predictor = self._predictor(vmin, vmax, meta)
         masks = stage_masks(shape, int(meta["levels"]), int(meta["anchor_stride"]),
@@ -288,6 +495,43 @@ class GNNCompressorCodec:
         payload, _ = _compress_tile(values[None, ...], masks, ebs, predictor,
                                     self.radius, dtype.kind in "bi", stats)
         return payload
+
+    def _compress_chunked_payload(
+        self,
+        values: np.ndarray,
+        dtype: np.dtype,
+        eb: float,
+        vmin: float,
+        vmax: float,
+        eb_ratio: float,
+        edges: tuple[int, ...],
+    ) -> bytes:
+        predictor = self._chunked_predictor(vmin, vmax)
+        ebs = _chunk_stage_ebs(values.shape, self.levels, self.anchor_stride,
+                               self.anchor_block, eb, eb_ratio)
+        return _compress_chunked(values[None, ...], ebs, self.radius,
+                                 dtype.kind in "bi", predictor, edges)
+
+    def _chunked_predictor(
+        self,
+        vmin: float,
+        vmax: float,
+        meta: dict[str, Any] | None = None,
+    ) -> ChunkedGNNPredictor:
+        levels = self.levels if meta is None else int(meta["levels"])
+        anchor_stride = (self.anchor_stride if meta is None
+                         else int(meta["anchor_stride"]))
+        anchor_block = (self.anchor_block if meta is None
+                        else int(meta["anchor_block"]))
+        return ChunkedGNNPredictor(
+            self.checkpoint_path,
+            vmin,
+            vmax,
+            device=self.device,
+            levels=levels,
+            anchor_stride=anchor_stride,
+            anchor_block=anchor_block,
+        )
 
     def _predictor(
         self,

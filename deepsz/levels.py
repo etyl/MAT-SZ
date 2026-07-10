@@ -122,6 +122,37 @@ def known_counts(
     return counts
 
 
+def point_levels(
+    coords: "list[np.ndarray] | tuple[np.ndarray, ...]",
+    levels: int,
+    anchor_stride: int,
+    anchor_block: int = 1,
+) -> np.ndarray:
+    """Dyadic level at which each point is revealed, from coordinate residues.
+
+    ``coords`` is one integer array per axis (equal shapes, broadcast not
+    required). Level 0 = anchor pattern (every coordinate ``% anchor_stride <
+    anchor_block``); otherwise the smallest ``k >= 1`` whose lattice
+    ``stride >> k`` contains the point on every axis. Points off every dyadic
+    lattice (the schedule's remainder clause) land on the finest level. This is
+    exactly the level of the ``stage_plan`` stage that reveals the point, and
+    the chunked codec uses it to pick a halo point's per-level coarse
+    embedding without materialising any full-shape stage mask."""
+    coords = [np.asarray(c, np.int64) for c in coords]
+    out = np.full(coords[0].shape, levels, np.int8)
+    anchor = np.ones(coords[0].shape, bool)
+    for c in coords:
+        anchor &= (c % anchor_stride) < anchor_block
+    for k in range(levels - 1, 0, -1):  # coarse levels overwrite finer ones
+        s = max(anchor_stride >> k, 1)
+        on = np.ones(coords[0].shape, bool)
+        for c in coords:
+            on &= (c % s) == 0
+        out[on] = k
+    out[anchor] = 0
+    return out
+
+
 def stage_ebs(
     shape: tuple[int, ...],
     levels: int,

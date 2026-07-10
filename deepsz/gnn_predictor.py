@@ -44,12 +44,12 @@ from pathlib import Path
 
 import numpy as np
 
-from .levels import stage_masks
+from .levels import point_levels, stage_masks
 
 # torch is imported lazily inside the class / model so that importing this
 # module (e.g. for FLAG constants) stays cheap.
 
-CKPT_VERSION = 4
+CKPT_VERSION = 5
 
 
 def half_directions(ndim: int) -> list[tuple[int, ...]]:
@@ -400,6 +400,22 @@ def build_model(d: int = 32):
         def forward(self, ctx, value_emb):  # (B, N, d), (B, N, d) -> (B, N, d)
             return self.net(torch.cat([ctx, value_emb], dim=-1))
 
+    class CoarseProj(nn.Module):
+        """Project a chunk's per-level mean finalized embedding into the
+        context space MixEmbed expects for halo neighbours, conditioned on the
+        level's stride so one MLP serves every level. Used only by the chunked
+        codec path: out-of-chunk neighbours are represented as
+        ``mix(coarse[chunk, level], InitEmbed(value))`` instead of their dense
+        finalized embedding (which is never stored)."""
+
+        def __init__(self):
+            super().__init__()
+            self.net = _mlp(torch, [d + 1, h, d])
+
+        def forward(self, mean_emb, log_s):  # (..., K, d), scalar
+            cond = mean_emb.new_full((*mean_emb.shape[:-1], 1), float(log_s))
+            return self.net(torch.cat([mean_emb, cond], dim=-1))
+
     class GNN(nn.Module):
         def __init__(self):
             super().__init__()
@@ -412,6 +428,7 @@ def build_model(d: int = 32):
             self.axis_pool = AttnPool()
             self.head = PredHead()
             self.mix = MixEmbed()
+            self.coarse = CoarseProj()
 
         def _line_messages(self, E, geom):
             """Per-line messages for this stage's M query points, built from
@@ -492,7 +509,7 @@ def _load_inference_model(checkpoint_path, torch, device):
     version = int(ckpt.get("version", 1))
     if version != CKPT_VERSION:
         raise ValueError(
-            "Rotary axial GNN checkpoint format v4 is required. Retrain with "
+            "Rotary axial GNN checkpoint format v5 is required. Retrain with "
             "scripts/train_gnn.py."
         )
     d = int(ckpt["d"])
@@ -657,3 +674,332 @@ class GNNPredictor:
         scale = np.exp2(log_b.cpu().numpy().reshape(c, -1)) * span
         return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
                 scale.astype(np.float32))
+
+
+# ---------------------------------------------------------------------------
+# Chunked inference: the tensor is coded chunk by chunk (global anchors first),
+# dense embeddings exist only for the current chunk + halo, and finished chunks
+# leave behind one CoarseProj'd mean embedding per level (see ChunkedGNNPredictor).
+# ---------------------------------------------------------------------------
+
+
+class _ChunkGeoms:
+    """Stage geometry and index metadata for one chunk shape, in the
+    halo-padded local frame (halo = ``anchor_stride`` on every side — every
+    valid periodic neighbour is within ``anchor_stride`` steps, see
+    `_nearest_steps`). Origin-independent: chunk origins are multiples of the
+    stride and the halo equals it, so local coordinates are congruent to global
+    ones mod the pattern period and every aligned chunk of the same shape
+    shares this object (cached in ``build_chunk_geoms``)."""
+
+    def __init__(self, chunk_shape, levels, stride, block, torch, device):
+        self.chunk_shape = tuple(int(n) for n in chunk_shape)
+        self.levels, self.stride, self.block = levels, stride, block
+        self.halo = stride
+        ndim = len(self.chunk_shape)
+        self.ndim = ndim
+        self.padded_shape = tuple(n + 2 * stride for n in self.chunk_shape)
+        self.n_padded = int(np.prod(self.padded_shape))
+
+        masks = stage_masks(self.chunk_shape, levels, stride, block)
+        pats = _period_prefixes(self.chunk_shape, levels, stride, block)
+        self.geoms, self.coords = [], []   # per stage; None for empty stages
+        for s, mask in enumerate(masks):
+            Q = np.stack(np.nonzero(mask), axis=1)   # chunk-frame coords
+            if not len(Q):
+                self.geoms.append(None)
+                self.coords.append(None)
+                continue
+            self.geoms.append(_StageGeom(pats[s], Q + stride, self.padded_shape,
+                                         stride, torch, device))
+            self.coords.append(Q)
+        # prediction chain: stage 0 is always the base (anchors, possibly empty
+        # in a ragged tail chunk -> None geom, nothing to finalize), followed by
+        # every non-empty refinement stage in order.
+        self.chain = [0] + [s for s in range(1, len(self.geoms))
+                            if self.geoms[s] is not None]
+
+        pad_flat = np.arange(self.n_padded, dtype=np.int64
+                             ).reshape(self.padded_shape)
+        inner = tuple(slice(stride, stride + n) for n in self.chunk_shape)
+        hmask = np.ones(self.padded_shape, bool)
+        hmask[inner] = False
+        self.halo_flat = pad_flat[hmask]                             # (H,)
+        # chunk-frame coords of halo cells (negative / >= chunk_shape allowed)
+        self.halo_coords = np.stack(np.nonzero(hmask), axis=1) - stride
+        self.interior_flat = pad_flat[inner].reshape(-1)
+        # per-level buckets of interior padded indices, for the coarse means
+        lv = point_levels(list(np.indices(self.chunk_shape).reshape(ndim, -1)),
+                          levels, stride, block)
+        self.level_flat = [self.interior_flat[lv == l]
+                           for l in range(levels + 1)]
+
+
+_CHUNK_GEOM_CACHE: dict = {}
+
+
+def build_chunk_geoms(chunk_shape, levels, stride, block, torch, device=None):
+    """Cached `_ChunkGeoms` per (chunk shape, schedule, device). Interior
+    chunks all share one entry; ragged edge chunks add at most a few shape
+    variants (ponytail: unbounded like _GEOM_CACHE, bounded in practice)."""
+    key = (tuple(int(n) for n in chunk_shape), levels, stride, block, str(device))
+    hit = _CHUNK_GEOM_CACHE.get(key)
+    if hit is None:
+        hit = _ChunkGeoms(chunk_shape, levels, stride, block, torch, device)
+        _CHUNK_GEOM_CACHE[key] = hit
+    return hit
+
+
+class _OverlaidGeom:
+    """A cached padded-frame `_StageGeom` with its periodic validity ANDed with
+    one chunk's runtime usability mask: in-chunk neighbours are always usable
+    (the local schedule reveals them in pattern order), halo neighbours only if
+    their point is actually decoded (already-coded chunk, or a global anchor)
+    and inside the tensor. Shares every other tensor with the base geometry."""
+
+    __slots__ = _StageGeom.__slots__
+
+    def __init__(self, base, usable):
+        for name in ("ip", "in_", "dp", "dn", "cos", "lognnz",
+                     "query_idx", "idx_np", "M", "ndim"):
+            setattr(self, name, getattr(base, name))
+        self.vp = base.vp & usable[base.ip]
+        self.vn = base.vn & usable[base.in_]
+
+
+def chunk_halo_info(cg, origin, shape, edges, grid, coded):
+    """Usability mask and halo-fill indices for one chunk of a chunk grid.
+
+    Returns ``(usable, sel_flat, chunk_ids, lv, gflat)``: a bool mask over the
+    padded frame (interior always usable, halo cells only when decoded), and —
+    for the usable halo cells — their padded flat index, owning chunk id,
+    dyadic level and global flat index. Shared by the inference predictor and
+    the trainer so both sides build halo context identically."""
+    ndim = len(shape)
+    usable = np.zeros(cg.n_padded, bool)
+    usable[cg.interior_flat] = True
+    gc = cg.halo_coords + np.asarray(origin, np.int64)
+    shp = np.asarray(shape)
+    inb = np.all((gc >= 0) & (gc < shp), axis=1)
+    gci = gc[inb]
+    chunk_ids = np.ravel_multi_index(
+        [gci[:, k] // edges[k] for k in range(ndim)], grid)
+    lv = point_levels([gci[:, k] for k in range(ndim)],
+                      cg.levels, cg.stride, cg.block)
+    ok = np.asarray(coded)[chunk_ids] | (lv == 0)
+    sel_flat = cg.halo_flat[inb][ok]
+    usable[sel_flat] = True
+    gflat = np.ravel_multi_index(
+        [gci[ok][:, k] for k in range(ndim)], shape)
+    return usable, sel_flat, chunk_ids[ok], lv[ok], gflat
+
+
+def anchor_finalize(model, vals, ndim):
+    """Finalized embedding of anchor points as the codec computes it: anchors
+    have nothing known before them, so their pooled context is the line pool's
+    null token and the finalized embedding is a pure function of the value.
+    ``vals``: (B, M) normalized values -> (B, M, ndim, d)."""
+    B, M = vals.shape
+    null = model.line_pool.null_v.view(1, 1, 1, -1).expand(B, M, ndim, -1)
+    return model.finalize(null, vals)
+
+
+def halo_embed(model, coarse_vecs, vals):
+    """Representation of an out-of-chunk known neighbour: fuse its chunk's
+    per-level coarse embedding with the embedding of its reconstructed value.
+    ``coarse_vecs``: (B, H, K, d); ``vals``: (B, H) normalized."""
+    return model.finalize(coarse_vecs, vals)
+
+
+def chunk_coarse(model, E_pad, cg, torch):
+    """Per-level coarse embeddings of a finished chunk: mean of the finalized
+    interior embeddings per level -> CoarseProj (conditioned on the level
+    stride). Levels with no points in this (ragged) chunk stay zero — they are
+    never read, since a halo point of that level would itself be such an
+    interior point. Returns (B, levels + 1, ndim, d)."""
+    B = E_pad.shape[0]
+    out = E_pad.new_zeros(B, cg.levels + 1, cg.ndim, model.d)
+    for l, flat in enumerate(cg.level_flat):
+        if not len(flat):
+            continue
+        idx = torch.from_numpy(flat).to(E_pad.device)
+        mean = E_pad.index_select(1, idx).mean(dim=1)        # (B, K, d)
+        s = cg.stride if l == 0 else max(cg.stride >> l, 1)
+        out[:, l] = model.coarse(mean, math.log2(s))
+    return out
+
+
+class ChunkedGNNPredictor:
+    """Chunk-by-chunk GNN predictor with bounded memory.
+
+    Coding order (mirrored bitwise by the decoder): a global anchor pass, then
+    chunks in raster order, each running its local stage schedule with a dense
+    embedding field over chunk + ``anchor_stride`` halo only. What survives a
+    chunk is its per-level coarse embedding table entry (CoarseProj of the mean
+    finalized embedding), used to represent its points when they appear in a
+    later chunk's halo. Everything model-sized is O(chunk); the only O(N)
+    state is the caller's recon array.
+
+    Per-tensor protocol driven by the codec (encode and decode identically):
+        begin(shape, chunk_edges, channels)
+        anchor_coarse(recon)                     # after the anchor pass
+        for ci in range(n_chunks):               # raster order
+            start_chunk(ci, recon)
+            for each non-empty local stage s >= 1, in order:
+                pred, scale = predict_stage(s, recon, eb)
+                ... caller quantizes and writes recon ...
+            finish_chunk(ci, recon)
+    """
+
+    provides_scale = True
+
+    def __init__(self, checkpoint_path, vmin: float, vmax: float,
+                 device: str = "cpu", levels: int = 4, anchor_stride: int = 16,
+                 anchor_block: int = 1):
+        import torch
+
+        self._torch = torch
+        self.device = torch.device(device)
+        self.vmin = float(vmin)
+        self.vmax = float(vmax)
+        span = self.vmax - self.vmin
+        self.span = span if span > 0 else 1.0
+        self.levels = int(levels)
+        self.anchor_stride = int(anchor_stride)
+        self.anchor_block = int(anchor_block)
+        self.d, self.model, self.checkpoint_hash = _load_inference_model(
+            checkpoint_path, torch, self.device)
+
+    # -- per-tensor lifecycle -------------------------------------------------
+    def begin(self, shape, chunk_edges, channels: int = 1):
+        torch = self._torch
+        self.shape = tuple(int(n) for n in shape)
+        self.edges = tuple(int(e) for e in chunk_edges)
+        if len(self.edges) != len(self.shape):
+            raise ValueError("chunk_edges must have one entry per axis")
+        for e in self.edges:
+            if e < self.anchor_stride or e % self.anchor_stride:
+                raise ValueError("chunk edges must be positive multiples of "
+                                 "anchor_stride")
+        self.grid = tuple(-(-n // e) for n, e in zip(self.shape, self.edges))
+        self.n_chunks = int(np.prod(self.grid))
+        self.C = int(channels)
+        ndim = len(self.shape)
+        self.coarse = torch.zeros(self.C, self.n_chunks, self.levels + 1,
+                                  ndim, self.d, device=self.device)
+        self.coded = np.zeros(self.n_chunks, bool)
+        self._cg = None
+
+    def chunk_slices(self, ci: int):
+        cidx = np.unravel_index(ci, self.grid)
+        return tuple(slice(i * e, min((i + 1) * e, n))
+                     for i, e, n in zip(cidx, self.edges, self.shape))
+
+    def _norm(self, vals: np.ndarray):
+        v = (np.clip(vals, self.vmin, self.vmax) - self.vmin) / self.span
+        return self._torch.from_numpy(v.astype(np.float32)).to(self.device)
+
+    def anchor_coarse(self, recon: np.ndarray):
+        """Level-0 coarse embeddings for every chunk, right after the global
+        anchor pass — so every chunk has anchor context on all sides before any
+        chunk is coded. Anchors finalize from the null context, so this is a
+        pure function of their reconstructed values."""
+        torch = self._torch
+        ndim = len(self.shape)
+        log_s = math.log2(self.anchor_stride)
+        with torch.no_grad():
+            for ci in range(self.n_chunks):
+                axes = []
+                for sl in self.chunk_slices(ci):
+                    c = np.arange(sl.start, sl.stop)
+                    axes.append(c[(c % self.anchor_stride) < self.anchor_block])
+                if any(len(a) == 0 for a in axes):
+                    continue                     # ragged chunk with no anchors
+                vals = recon[(slice(None), *np.ix_(*axes))].reshape(self.C, -1)
+                fin = anchor_finalize(self.model, self._norm(vals), ndim)
+                self.coarse[:, ci, 0] = self.model.coarse(fin.mean(1), log_s)
+
+    def start_chunk(self, ci: int, recon: np.ndarray):
+        torch = self._torch
+        sls = self.chunk_slices(ci)
+        origin = np.array([sl.start for sl in sls], np.int64)
+        cshape = tuple(sl.stop - sl.start for sl in sls)
+        cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
+                               self.anchor_block, torch, self.device)
+
+        # usability over the padded frame: interior always, halo per rule
+        usable_np, sel_flat, chunk_ids, lv, gflat = chunk_halo_info(
+            cg, origin, self.shape, self.edges, self.grid, self.coded)
+        usable = torch.from_numpy(usable_np).to(self.device)
+
+        # dense local field; fill usable halo cells from coarse + recon value
+        E = torch.zeros(self.C, cg.n_padded, cg.ndim, self.d,
+                        device=self.device)
+        if len(sel_flat):
+            vals = self._norm(recon.reshape(self.C, -1)[:, gflat])
+            ids = torch.from_numpy(chunk_ids).to(self.device)
+            lvs = torch.from_numpy(lv.astype(np.int64)).to(self.device)
+            cvec = self.coarse[:, ids, lvs]                # (C, Hs, K, d)
+            with torch.no_grad():
+                E[:, torch.from_numpy(sel_flat).to(self.device)] = \
+                    halo_embed(self.model, cvec, vals)
+
+        self._cg = cg
+        self._ci = ci
+        self._E = E
+        self._geoms = [None if g is None else _OverlaidGeom(g, usable)
+                       for g in cg.geoms]
+        # global flat index per stage (finalize values are read from recon)
+        self._gidx = [None if c is None else np.ravel_multi_index(
+            [(c[:, k] + origin[k]) for k in range(len(self.shape))], self.shape)
+            for c in cg.coords]
+        self._ctx = None
+        self._pos = 0                                      # index into cg.chain
+
+    def predict_stage(self, s: int, recon: np.ndarray, eb: float):
+        """Predict local stage ``s`` (must be the next non-empty stage in the
+        chunk's schedule). Returns (pred, scale) in original units, ordered
+        like ``np.nonzero`` of the local stage mask."""
+        torch = self._torch
+        cg = self._cg
+        j = self._pos + 1
+        if j >= len(cg.chain) or cg.chain[j] != s:
+            raise ValueError(f"stage {s} out of order for this chunk")
+        prev = cg.chain[j - 1]
+        gp, gh = self._geoms[prev], self._geoms[s]
+        fvals = None if gp is None else \
+            self._norm(recon.reshape(self.C, -1)[:, self._gidx[prev]])
+        with torch.no_grad():
+            (values, log_b), self._E, self._ctx = stage_forward(
+                self.model, self._E, gp, gh, fvals, torch,
+                finalize_ctx=self._ctx, eb=float(eb) / self.span)
+        self._pos = j
+        pred = values.cpu().numpy().reshape(self.C, -1) * self.span + self.vmin
+        scale = np.exp2(log_b.cpu().numpy().reshape(self.C, -1)) * self.span
+        return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
+                scale.astype(np.float32))
+
+    def finish_chunk(self, ci: int, recon: np.ndarray):
+        """Finalize the last stage's points into the field, store the chunk's
+        per-level coarse embeddings, and drop the dense field."""
+        torch = self._torch
+        cg = self._cg
+        if ci != self._ci:
+            raise ValueError("finish_chunk out of order")
+        if self._pos != len(cg.chain) - 1:
+            raise ValueError("finish_chunk before all non-empty stages were "
+                             "predicted")
+        last = cg.chain[self._pos]
+        g = self._geoms[last]
+        E = self._E
+        with torch.no_grad():
+            if g is not None:
+                fvals = self._norm(recon.reshape(self.C, -1)[:,
+                                                             self._gidx[last]])
+                ctx = self._ctx if self._ctx is not None else \
+                    self.model.embed(E, g)
+                E = E.index_copy(1, g.query_idx,
+                                 self.model.finalize(ctx, fvals))
+            self.coarse[:, ci] = chunk_coarse(self.model, E, cg, torch)
+        self.coded[ci] = True
+        self._E = self._ctx = self._cg = None
