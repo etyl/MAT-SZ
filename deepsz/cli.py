@@ -71,6 +71,13 @@ def add_common(ap):
     ap.add_argument("--levels", type=int, default=4)
     ap.add_argument("--anchor-stride", type=int, default=16)
     ap.add_argument("--anchor-block", type=int, default=1)
+    ap.add_argument("--agg-level", type=int, default=None,
+                    help="gnn only: neighbourhood aggregation level -- cap on the "
+                         "L1 length of neighbour lines. 1 = axis-aligned direct "
+                         "neighbours only; 2 = +2-axis diagonals; omit = full "
+                         "neighbourhood. Lower is faster in high dimensions (the "
+                         "line count is (3^ndim-1)/2 at full). Frozen into the "
+                         "stream so decode matches")
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--zstd-level", type=int, default=9)

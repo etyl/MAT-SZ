@@ -93,6 +93,13 @@ def _as_numpy(x: Any) -> np.ndarray:
     return np.asarray(x)
 
 
+def _meta_agg_level(meta: dict[str, Any]) -> int | None:
+    """Neighbourhood aggregation level recorded in a stream, or None (full) for
+    streams written before the option existed."""
+    v = meta.get("agg_level")
+    return None if v is None else int(v)
+
+
 def _dtype_meta(dtype: np.dtype) -> dict[str, Any]:
     dtype = np.dtype(dtype)
     return {
@@ -434,6 +441,7 @@ class GNNCompressorCodec:
         anchor_block: int = 1,
         radius: int = 1 << 15,
         max_radius: int = 64,
+        agg_level: int | None = None,
         device: str | None = None,   # None -> cuda if available, else cpu
         zstd_level: int = 9,
         eb_ratio: float | None = 1.0,
@@ -458,6 +466,11 @@ class GNNCompressorCodec:
         self.anchor_block = int(anchor_block)
         self.radius = int(radius)
         self.max_radius = int(max_radius)
+        # Neighbourhood aggregation level: cap on the L1 length of the GNN's
+        # neighbour lines (None = full neighbourhood). Smaller = fewer directions
+        # per point = faster inference, most impactful in high dimensions. Frozen
+        # into the stream so decode reproduces the encoder's prediction bitwise.
+        self.agg_level = None if agg_level is None else int(agg_level)
         if device is None:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -550,6 +563,7 @@ class GNNCompressorCodec:
                 "anchor_block": self.anchor_block,
                 "radius": self.radius,
                 "max_radius": self.max_radius,
+                "agg_level": self.agg_level,
                 "vmin": vmin,
                 "vmax": vmax,
                 "eb_ratio": ratio,
@@ -668,6 +682,7 @@ class GNNCompressorCodec:
                          else int(meta["anchor_stride"]))
         anchor_block = (self.anchor_block if meta is None
                         else int(meta["anchor_block"]))
+        agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
         predictor = ChunkedGNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -676,6 +691,7 @@ class GNNCompressorCodec:
             levels=levels,
             anchor_stride=anchor_stride,
             anchor_block=anchor_block,
+            agg_level=agg_level,
         )
         # encode: from the codec flag; decode: replay the stream's float path
         predictor.fp16 = (self.fp16 if meta is None
@@ -694,6 +710,7 @@ class GNNCompressorCodec:
         anchor_stride = self.anchor_stride if meta is None else int(meta["anchor_stride"])
         anchor_block = self.anchor_block if meta is None else int(meta["anchor_block"])
         max_radius = self.max_radius if meta is None else int(meta["max_radius"])
+        agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
         return GNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -704,6 +721,7 @@ class GNNCompressorCodec:
             levels=levels,
             anchor_stride=anchor_stride,
             anchor_block=anchor_block,
+            agg_level=agg_level,
         )
 
     def _checkpoint_hash(self) -> bytes:

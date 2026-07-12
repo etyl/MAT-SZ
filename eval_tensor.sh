@@ -29,6 +29,7 @@ python scripts/eval_tensor.py "/lustre/fswork/projects/rech/lzs/uhq13gg/benchmar
     --levels 4 \
     --anchor-stride 16 \
     --anchor-block 1 \
+    --agg-level 2 \
     --chunk-batch 1 \
     --tune "$TUNE" \
     --tune-size-slack "$TUNE_SIZE_SLACK" \
