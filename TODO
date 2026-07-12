@@ -1,5 +1,6 @@
 better metrics in training (peak ram, marg bpp?)
-eval on small 4d tensor during training
+[done] eval on small 4d tensor during training (--eval-tensor: full-codec
+       roundtrip -> distortion / rate / peak-RAM / enc+dec time to wandb)
 train on 4d data
 clean code
     * remove MAT mentions
