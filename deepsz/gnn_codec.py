@@ -6,7 +6,6 @@ import json
 import os
 import struct
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -34,9 +33,6 @@ _AUTO_CHUNK_THRESHOLD = 1 << 21
 _AUTO_CHUNK_POINTS = 1 << 18  # target points per chunk
 
 
-_PROG_LAST = [0.0]  # throttle for file output
-
-
 def _log(msg):
     # ponytail: env-gated so tests/CLI stay quiet; set DEEPSZ_PROGRESS=1 to see it
     if not os.environ.get("DEEPSZ_PROGRESS"):
@@ -56,27 +52,11 @@ def _cuda_peak(predictor):
     return peak
 
 
-def _progress(tag, i, n, t0, predictor=None):
-    if not os.environ.get("DEEPSZ_PROGRESS"):
-        return
-    now = time.time()
-    tty = sys.stderr.isatty()
-    # to a file (SLURM log) \r doesn't flush usefully -> newline, throttled to 5s
-    if not tty and i not in (0, n) and now - _PROG_LAST[0] < 5.0:
-        return
-    _PROG_LAST[0] = now
-    el = now - t0
-    eta = el / i * (n - i) if i else 0.0
-    peak = _cuda_peak(predictor) if predictor is not None else None
-    mem = f"  peak {peak / 1e9:5.2f}GB" if peak else ""
-    line = f"{tag} chunk {i}/{n}  {el:6.1f}s elapsed  ~{eta:6.1f}s left{mem}"
-    if tty:
-        sys.stderr.write("\r" + line + "   ")
-        if i == n:
-            sys.stderr.write("\n")
-    else:
-        sys.stderr.write(line + "\n")
-    sys.stderr.flush()
+def _progress_bar(tag, n):
+    # env-gated (DEEPSZ_PROGRESS) so tests/CLI stay quiet; disabled bar is a no-op.
+    from tqdm import tqdm
+    return tqdm(total=n, desc=tag, unit="wave", file=sys.stderr,
+                disable=not os.environ.get("DEEPSZ_PROGRESS"))
 
 
 def _as_numpy(x: Any) -> np.ndarray:
@@ -321,13 +301,10 @@ def _compress_chunked(
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
     _log(f"encode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
          f"{n_sub} model-waves")
-    t0 = time.time()
-    done = 0
+    bar = _progress_bar("encode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
-            _progress("encode", done, n_sub, t0, predictor)
-            done += 1
             cshape = tuple(sl.stop - sl.start
                            for sl in predictor.chunk_slices(ids[0]))
             cmasks = stage_masks(cshape, predictor.levels, stride, block)
@@ -358,7 +335,11 @@ def _compress_chunked(
                             scale[bi][None, :], ebs[s]).reshape(-1),
                         rans_tables=tables))
             predictor.finish_wave(recon)
-    _progress("encode", n_sub, n_sub, t0)
+            peak = _cuda_peak(predictor)
+            if peak:
+                bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
+            bar.update(1)
+    bar.close()
     return b"".join(parts)
 
 
@@ -384,13 +365,10 @@ def _decompress_chunked(
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
     _log(f"decode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
          f"{n_sub} model-waves")
-    t0 = time.time()
-    done = 0
+    bar = _progress_bar("decode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
-            _progress("decode", done, n_sub, t0, predictor)
-            done += 1
             cshape = tuple(sl.stop - sl.start
                            for sl in predictor.chunk_slices(ids[0]))
             cmasks = stage_masks(cshape, predictor.levels, stride, block)
@@ -416,7 +394,11 @@ def _decompress_chunked(
                         pred[bi][None, :], codes, outliers, ebs[s],
                         radius).reshape(c, n)
             predictor.finish_wave(recon)
-    _progress("decode", n_sub, n_sub, t0)
+            peak = _cuda_peak(predictor)
+            if peak:
+                bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
+            bar.update(1)
+    bar.close()
     if off != len(payload):
         raise ValueError("trailing bytes in DeepSZ GNN payload")
     return recon[0]
