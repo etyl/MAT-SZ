@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import struct
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -277,11 +279,24 @@ def _compress_chunked(
     predictor: ChunkedGNNPredictor,
     edges: tuple[int, ...],
     batch_cap: int | None = None,
+    overlap: bool = False,
 ) -> bytes:
     """Wave-batched encode: global anchor pass, then chunks coded in color waves
     (see `_chunk_waves`), each wave split into memory-bounded sub-batches run
     together in the model's B dim. Stream order is wave -> sub-batch -> stage ->
-    chunk, mirrored bitwise by the decoder. Peak memory is O(batch * chunk)."""
+    chunk, mirrored bitwise by the decoder. Peak memory is O(batch * chunk).
+
+    ``overlap``: run the per-stage rANS packing on a background thread. Only the
+    quantize+dequantize (which writes recon that the next forward reads) stays on
+    the critical path; pack_stage does not feed back, so it can in principle hide
+    behind the next stage's GPU forward. Output bytes are identical -- each pack
+    writes into its reserved slot, flattened in order at the end.
+
+    Caveat (measured): constriction's rANS holds the GIL, so it does not actually
+    overlap the main thread's Python-driven launch loop on an eager/latency-bound
+    GPU -- it comes out ~neutral here. It is likeliest to pay off where the GPU
+    forward is fused/long (``--compile`` on Volta+) so the main thread sits in
+    GIL-releasing CUDA syncs the worker can drain into. Opt-in for that reason."""
     c = values.shape[0]
     shape = values.shape[1:]
     stride, block = predictor.anchor_stride, predictor.anchor_block
@@ -301,6 +316,48 @@ def _compress_chunked(
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
     _log(f"encode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
          f"{n_sub} model-waves")
+    # Optional background rANS: pack_stage runs on a worker while the main thread
+    # drives the next GPU forward. Each emit reserves an ordered slot the worker
+    # fills, so the joined byte stream is identical to the synchronous path.
+    task_q: queue.Queue | None = None
+    worker: threading.Thread | None = None
+    worker_err: list[BaseException] = []
+    if overlap:
+        # Unbounded on purpose: a bounded queue back-pressures the main thread on
+        # put() whenever the worker can't drain, and constriction's rANS holds
+        # the GIL, so the worker *is* starved during the main thread's launch
+        # loop -- a small cap turns neutral into a large regression (measured
+        # -24% at cap 64). Trades RAM (buffered stage codes) for that safety.
+        task_q = queue.Queue()
+
+        def _rans_worker():
+            while True:
+                item = task_q.get()
+                try:
+                    if item is None:
+                        return
+                    slot, cd, ol, lv, tb = item
+                    slot[0] = pack_stage(cd, ol, rans_levels=lv, rans_tables=tb)
+                except BaseException as exc:                    # surface to main
+                    worker_err.append(exc)
+                    return
+                finally:
+                    task_q.task_done()
+
+        worker = threading.Thread(target=_rans_worker, daemon=True)
+        worker.start()
+
+    def emit(codes, outliers, levels, tables):
+        if overlap:
+            if worker_err:
+                raise worker_err[0]
+            slot: list = [None]
+            parts.append(slot)
+            task_q.put((slot, codes, outliers, levels, tables))
+        else:
+            parts.append(pack_stage(codes, outliers, rans_levels=levels,
+                                    rans_tables=tables))
+
     bar = _progress_bar("encode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
@@ -315,10 +372,8 @@ def _compress_chunked(
                 tables = build_laplace_tables(ebs[s], radius)
                 if n == 0:
                     for _ in ids:
-                        parts.append(pack_stage(
-                            np.zeros(0, np.uint32), np.zeros(0, np.float32),
-                            rans_levels=np.zeros(0, np.uint8),
-                            rans_tables=tables))
+                        emit(np.zeros(0, np.uint32), np.zeros(0, np.float32),
+                             np.zeros(0, np.uint8), tables)
                     continue
                 pred, scale = predictor.predict_wave_stage(s, recon, ebs[s])
                 for bi, ci in enumerate(ids):
@@ -329,17 +384,21 @@ def _compress_chunked(
                                                round_output=round_output)
                     recon[(slice(None), *sls)][:, pos] = dequantize(
                         p, codes, outliers, ebs[s], radius).reshape(c, n)
-                    parts.append(pack_stage(
-                        codes, outliers,
-                        rans_levels=scale_to_level(
-                            scale[bi][None, :], ebs[s]).reshape(-1),
-                        rans_tables=tables))
+                    emit(codes, outliers,
+                         scale_to_level(scale[bi][None, :], ebs[s]).reshape(-1),
+                         tables)
             predictor.finish_wave(recon)
             peak = _cuda_peak(predictor)
             if peak:
                 bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
             bar.update(1)
     bar.close()
+    if overlap:
+        task_q.put(None)
+        worker.join()
+        if worker_err:
+            raise worker_err[0]
+        parts = [p[0] if isinstance(p, list) else p for p in parts]
     return b"".join(parts)
 
 
@@ -433,6 +492,7 @@ class GNNCompressorCodec:
         chunk_batch: int | None = None,
         fp16: bool = False,
         compile: bool = False,
+        overlap: bool = False,
     ):
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
@@ -479,6 +539,10 @@ class GNNCompressorCodec:
         # ops that aren't in the GEMMs). Stored in meta so decode uses the same
         # compiled float path. First encode pays a one-off compilation cost.
         self.compile = bool(compile)
+        # overlap: run per-stage rANS packing on a background thread so it hides
+        # behind the next stage's GPU forward. Encode-only; the output bytes are
+        # identical, so nothing about the stream or decode changes.
+        self.overlap = bool(overlap)
         self.checkpoint_hash = self._checkpoint_hash()
 
     def _chunk_edges(self, shape: tuple[int, ...]) -> tuple[int, ...] | None:
@@ -650,7 +714,7 @@ class GNNCompressorCodec:
                                self.anchor_block, eb, eb_ratio)
         payload = _compress_chunked(values[None, ...], ebs, self.radius,
                                     dtype.kind in "bi", predictor, edges,
-                                    self.chunk_batch)
+                                    self.chunk_batch, overlap=self.overlap)
         return payload, int(predictor.chunk_batch)
 
     def _chunked_predictor(
