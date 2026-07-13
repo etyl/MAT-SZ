@@ -19,7 +19,6 @@ DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak}
 CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
 TUNE=${TUNE:-rd}               # fast (1 encode) | size/rd (4 encodes)
 TUNE_SIZE_SLACK=${TUNE_SIZE_SLACK:-1.05}
-FP16=${FP16:-}                 # set FP16=1 to run the GNN in fp16 (ratio A/B)
 
 python scripts/eval_predictors.py \
     --data "$DATA" \
@@ -34,7 +33,7 @@ python scripts/eval_predictors.py \
     --device cuda \
     --csv eval.csv \
     --plot eval_rd.png \
-    ${FP16:+--fp16} \
+    --fp16 \
     "$@"
 
 # per-image + per-method table -> job log
