@@ -17,7 +17,9 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +43,18 @@ IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".ppm", ".pgm"}
 
 def list_images(root):
     return [p for p in Path(root).rglob("*") if p.suffix.lower() in IMG_EXT]
+
+
+def load_tensor(path: str) -> np.ndarray:
+    """Load a raw n-D tensor from .npy or a torch .pt/.pth for the codec eval."""
+    if path.endswith(".npy"):
+        return np.load(path)
+    if path.endswith((".pt", ".pth")):
+        obj = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(obj, torch.Tensor):
+            raise ValueError(f"{path} holds {type(obj).__name__}, expected a tensor")
+        return obj.detach().cpu().numpy()
+    raise ValueError(f"unsupported extension: {path} (use .npy/.pt/.pth)")
 
 
 @lru_cache(maxsize=1024)
@@ -216,6 +230,102 @@ def entropy_bits_from_codes(codes):
     _, counts = torch.unique(flat, return_counts=True)
     p = counts.to(torch.float64) / flat.numel()
     return float(-(p * torch.log2(p)).sum())
+
+
+class _PeakRSS:
+    """Sample process resident-set size in a background thread and hold the peak
+    (in MB) reached over the ``with`` body. Linux-only (/proc/self/statm); the
+    training host is Linux. Captures allocator peaks the torch CUDA counters
+    miss (host-side numpy/zstd/rANS buffers)."""
+
+    _PAGE = os.sysconf("SC_PAGE_SIZE")
+
+    def __init__(self, interval: float = 0.02):
+        self.interval = interval
+        self.peak = 0.0
+        self._stop = threading.Event()
+        self._t: threading.Thread | None = None
+
+    def _rss_mb(self) -> float:
+        with open("/proc/self/statm") as f:
+            resident_pages = int(f.read().split()[1])
+        return resident_pages * self._PAGE / 1e6
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self.peak = max(self.peak, self._rss_mb())
+
+    def __enter__(self):
+        self.peak = self._rss_mb()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._t.join()
+        self.peak = max(self.peak, self._rss_mb())
+
+
+def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
+    """Roundtrip `tensor` (a small n-D array, e.g. 4-D) through the *real* codec
+    at the current weights and return distortion / rate / peak-RAM / time metrics
+    for wandb. Unlike the closed-loop image eval, this exercises the full
+    compress+decompress byte path (rANS, zstd, chunking), so the rate is the
+    actual stream size and the RAM/time are what the deployed codec pays.
+
+    The codec loads weights from disk, so the live model is frozen to `ckpt_path`
+    first (overwritten each call; the model cache keys on mtime so this reloads).
+    """
+    from deepsz.gnn_codec import GNNCompressorCodec
+
+    torch.save({"state_dict": model.state_dict(), "d": d,
+                "version": CKPT_VERSION}, ckpt_path)
+    codec = GNNCompressorCodec(
+        ckpt_path, error_bound=eb, levels=(args.levels or 4),
+        anchor_stride=(args.stride or 16), max_radius=args.max_radius,
+        device=str(device))
+
+    base_gpu = 0
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base_gpu = torch.cuda.memory_allocated()
+
+    with _PeakRSS() as rss:
+        t0 = time.time()
+        stream = codec.compress(tensor)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_comp = time.time() - t0
+        t0 = time.time()
+        rec = codec.uncompress(stream).numpy().reshape(tensor.shape)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_dec = time.time() - t0
+
+    a = tensor.astype(np.float64)
+    r = rec.astype(np.float64)
+    max_err = float(np.abs(a - r).max())
+    mse = float(np.mean((a - r) ** 2))
+    vrange = max(float(a.max()) - float(a.min()), 1e-12)
+    psnr = 10 * np.log10(vrange ** 2 / mse) if mse > 0 else float("inf")
+    bpv = 8 * len(stream) / tensor.size  # tensor is float32 -> 32 bpv raw
+
+    metrics = {
+        "eval_tensor/psnr_db": psnr,          # distortion
+        "eval_tensor/max_abs_err": max_err,   # distortion (bound check: <= eb)
+        "eval_tensor/bits_per_value": bpv,    # rate
+        "eval_tensor/ratio": 4 * tensor.size / len(stream),  # rate (vs f32)
+        "eval_tensor/compress_s": t_comp,     # inference time (encode)
+        "eval_tensor/decompress_s": t_dec,    # inference time (decode)
+        "eval_tensor/peak_host_mb": rss.peak,  # max ram (host RSS peak)
+    }
+    if device.type == "cuda":
+        metrics["eval_tensor/peak_gpu_mb"] = (
+            torch.cuda.max_memory_allocated() - base_gpu) / 1e6  # max ram (gpu)
+        torch.cuda.empty_cache()
+    return metrics
 
 
 def run_stages(model, x, geoms, d, device, eb, teacher_force=False,
@@ -417,6 +527,15 @@ def main():
                     help="log eval reconstruction images every N steps")
     ap.add_argument("--eval-eb", type=float, default=0.01,
                     help="error bound (in [0,1]) for the real-inference eval loop")
+    ap.add_argument("--eval-tensor", default=None,
+                    help="small n-D tensor (.npy/.pt, e.g. a 4-D field) roundtripped "
+                         "through the full codec each --eval-tensor-every steps; logs "
+                         "distortion / rate / peak-RAM / inference-time to wandb")
+    ap.add_argument("--eval-tensor-eb", type=float, default=None,
+                    help="absolute error bound for --eval-tensor (default: --eval-eb)")
+    ap.add_argument("--eval-tensor-every", type=int, default=500,
+                    help="run the --eval-tensor codec roundtrip every N steps "
+                         "(full compress+decompress; keep it a multiple of eval-every)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--levels", type=int, default=None,
                     help="fix the stage levels (default: random 3/4/5 per step; "
@@ -495,6 +614,18 @@ def main():
     wandb.summary["baseline_mae"] = baseline_mae
     truth_img = eval_x.detach().cpu().numpy().reshape(eh, ew)
     wandb.log({"eval/truth": wandb.Image(truth_img, caption=eval_name)}, step=0)
+
+    # Optional full-codec roundtrip eval on a small n-D tensor (e.g. 4-D). Loaded
+    # once as float32; weights are frozen to this temp checkpoint each eval so the
+    # codec (which reads weights from disk) sees the current model.
+    eval_tensor = None
+    eval_tensor_ckpt = run_dir / "eval_tensor.pt"
+    eval_tensor_eb = (args.eval_eb if args.eval_tensor_eb is None
+                      else args.eval_tensor_eb)
+    if args.eval_tensor:
+        eval_tensor = load_tensor(args.eval_tensor).astype(np.float32)
+        print(f"eval-tensor: {args.eval_tensor} {eval_tensor.shape} "
+              f"eb={eval_tensor_eb}")
 
     run_loss = 0.0
     last_eval = float("nan")
@@ -578,6 +709,22 @@ def main():
                 log["eval/recon_pred"] = wandb.Image(pred_only.clip(0, 1))
                 log["eval/residual"] = wandb.Image(residual_rgb(recon - pred_only))
             wandb.log(log, step=step)
+
+        if eval_tensor is not None and step % args.eval_tensor_every == 0:
+            model.eval()
+            with torch.no_grad():
+                tmetrics = eval_tensor_codec(model, args.d, args, eval_tensor,
+                                             eval_tensor_eb, device,
+                                             eval_tensor_ckpt)
+            model.train()
+            wandb.log(tmetrics, step=step)
+            print(f"[{step}] eval-tensor: "
+                  f"PSNR={tmetrics['eval_tensor/psnr_db']:.2f}dB "
+                  f"bpv={tmetrics['eval_tensor/bits_per_value']:.3f} "
+                  f"maxerr={tmetrics['eval_tensor/max_abs_err']:.3g} "
+                  f"host={tmetrics['eval_tensor/peak_host_mb']:.0f}MB "
+                  f"enc={tmetrics['eval_tensor/compress_s']:.2f}s "
+                  f"dec={tmetrics['eval_tensor/decompress_s']:.2f}s")
 
         if step % 100 == 0:
             bar.set_postfix(bpp=f"{run_loss / 100:.5f}",

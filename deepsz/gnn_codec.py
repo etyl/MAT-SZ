@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import struct
 import sys
-import time
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -34,9 +35,6 @@ _AUTO_CHUNK_THRESHOLD = 1 << 21
 _AUTO_CHUNK_POINTS = 1 << 18  # target points per chunk
 
 
-_PROG_LAST = [0.0]  # throttle for file output
-
-
 def _log(msg):
     # ponytail: env-gated so tests/CLI stay quiet; set DEEPSZ_PROGRESS=1 to see it
     if not os.environ.get("DEEPSZ_PROGRESS"):
@@ -56,27 +54,11 @@ def _cuda_peak(predictor):
     return peak
 
 
-def _progress(tag, i, n, t0, predictor=None):
-    if not os.environ.get("DEEPSZ_PROGRESS"):
-        return
-    now = time.time()
-    tty = sys.stderr.isatty()
-    # to a file (SLURM log) \r doesn't flush usefully -> newline, throttled to 5s
-    if not tty and i not in (0, n) and now - _PROG_LAST[0] < 5.0:
-        return
-    _PROG_LAST[0] = now
-    el = now - t0
-    eta = el / i * (n - i) if i else 0.0
-    peak = _cuda_peak(predictor) if predictor is not None else None
-    mem = f"  peak {peak / 1e9:5.2f}GB" if peak else ""
-    line = f"{tag} chunk {i}/{n}  {el:6.1f}s elapsed  ~{eta:6.1f}s left{mem}"
-    if tty:
-        sys.stderr.write("\r" + line + "   ")
-        if i == n:
-            sys.stderr.write("\n")
-    else:
-        sys.stderr.write(line + "\n")
-    sys.stderr.flush()
+def _progress_bar(tag, n):
+    # env-gated (DEEPSZ_PROGRESS) so tests/CLI stay quiet; disabled bar is a no-op.
+    from tqdm import tqdm
+    return tqdm(total=n, desc=tag, unit="wave", file=sys.stderr,
+                disable=not os.environ.get("DEEPSZ_PROGRESS"))
 
 
 def _as_numpy(x: Any) -> np.ndarray:
@@ -91,6 +73,13 @@ def _as_numpy(x: Any) -> np.ndarray:
     if numpy is not None:
         return x.numpy()
     return np.asarray(x)
+
+
+def _meta_agg_level(meta: dict[str, Any]) -> int | None:
+    """Neighbourhood aggregation level recorded in a stream, or None (full) for
+    streams written before the option existed."""
+    v = meta.get("agg_level")
+    return None if v is None else int(v)
 
 
 def _dtype_meta(dtype: np.dtype) -> dict[str, Any]:
@@ -290,11 +279,24 @@ def _compress_chunked(
     predictor: ChunkedGNNPredictor,
     edges: tuple[int, ...],
     batch_cap: int | None = None,
+    overlap: bool = False,
 ) -> bytes:
     """Wave-batched encode: global anchor pass, then chunks coded in color waves
     (see `_chunk_waves`), each wave split into memory-bounded sub-batches run
     together in the model's B dim. Stream order is wave -> sub-batch -> stage ->
-    chunk, mirrored bitwise by the decoder. Peak memory is O(batch * chunk)."""
+    chunk, mirrored bitwise by the decoder. Peak memory is O(batch * chunk).
+
+    ``overlap``: run the per-stage rANS packing on a background thread. Only the
+    quantize+dequantize (which writes recon that the next forward reads) stays on
+    the critical path; pack_stage does not feed back, so it can in principle hide
+    behind the next stage's GPU forward. Output bytes are identical -- each pack
+    writes into its reserved slot, flattened in order at the end.
+
+    Caveat (measured): constriction's rANS holds the GIL, so it does not actually
+    overlap the main thread's Python-driven launch loop on an eager/latency-bound
+    GPU -- it comes out ~neutral here. It is likeliest to pay off where the GPU
+    forward is fused/long (``--compile`` on Volta+) so the main thread sits in
+    GIL-releasing CUDA syncs the worker can drain into. Opt-in for that reason."""
     c = values.shape[0]
     shape = values.shape[1:]
     stride, block = predictor.anchor_stride, predictor.anchor_block
@@ -314,13 +316,52 @@ def _compress_chunked(
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
     _log(f"encode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
          f"{n_sub} model-waves")
-    t0 = time.time()
-    done = 0
+    # Optional background rANS: pack_stage runs on a worker while the main thread
+    # drives the next GPU forward. Each emit reserves an ordered slot the worker
+    # fills, so the joined byte stream is identical to the synchronous path.
+    task_q: queue.Queue | None = None
+    worker: threading.Thread | None = None
+    worker_err: list[BaseException] = []
+    if overlap:
+        # Unbounded on purpose: a bounded queue back-pressures the main thread on
+        # put() whenever the worker can't drain, and constriction's rANS holds
+        # the GIL, so the worker *is* starved during the main thread's launch
+        # loop -- a small cap turns neutral into a large regression (measured
+        # -24% at cap 64). Trades RAM (buffered stage codes) for that safety.
+        task_q = queue.Queue()
+
+        def _rans_worker():
+            while True:
+                item = task_q.get()
+                try:
+                    if item is None:
+                        return
+                    slot, cd, ol, lv, tb = item
+                    slot[0] = pack_stage(cd, ol, rans_levels=lv, rans_tables=tb)
+                except BaseException as exc:                    # surface to main
+                    worker_err.append(exc)
+                    return
+                finally:
+                    task_q.task_done()
+
+        worker = threading.Thread(target=_rans_worker, daemon=True)
+        worker.start()
+
+    def emit(codes, outliers, levels, tables):
+        if overlap:
+            if worker_err:
+                raise worker_err[0]
+            slot: list = [None]
+            parts.append(slot)
+            task_q.put((slot, codes, outliers, levels, tables))
+        else:
+            parts.append(pack_stage(codes, outliers, rans_levels=levels,
+                                    rans_tables=tables))
+
+    bar = _progress_bar("encode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
-            _progress("encode", done, n_sub, t0, predictor)
-            done += 1
             cshape = tuple(sl.stop - sl.start
                            for sl in predictor.chunk_slices(ids[0]))
             cmasks = stage_masks(cshape, predictor.levels, stride, block)
@@ -331,10 +372,8 @@ def _compress_chunked(
                 tables = build_laplace_tables(ebs[s], radius)
                 if n == 0:
                     for _ in ids:
-                        parts.append(pack_stage(
-                            np.zeros(0, np.uint32), np.zeros(0, np.float32),
-                            rans_levels=np.zeros(0, np.uint8),
-                            rans_tables=tables))
+                        emit(np.zeros(0, np.uint32), np.zeros(0, np.float32),
+                             np.zeros(0, np.uint8), tables)
                     continue
                 pred, scale = predictor.predict_wave_stage(s, recon, ebs[s])
                 for bi, ci in enumerate(ids):
@@ -345,13 +384,21 @@ def _compress_chunked(
                                                round_output=round_output)
                     recon[(slice(None), *sls)][:, pos] = dequantize(
                         p, codes, outliers, ebs[s], radius).reshape(c, n)
-                    parts.append(pack_stage(
-                        codes, outliers,
-                        rans_levels=scale_to_level(
-                            scale[bi][None, :], ebs[s]).reshape(-1),
-                        rans_tables=tables))
+                    emit(codes, outliers,
+                         scale_to_level(scale[bi][None, :], ebs[s]).reshape(-1),
+                         tables)
             predictor.finish_wave(recon)
-    _progress("encode", n_sub, n_sub, t0)
+            peak = _cuda_peak(predictor)
+            if peak:
+                bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
+            bar.update(1)
+    bar.close()
+    if overlap:
+        task_q.put(None)
+        worker.join()
+        if worker_err:
+            raise worker_err[0]
+        parts = [p[0] if isinstance(p, list) else p for p in parts]
     return b"".join(parts)
 
 
@@ -377,13 +424,10 @@ def _decompress_chunked(
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
     _log(f"decode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
          f"{n_sub} model-waves")
-    t0 = time.time()
-    done = 0
+    bar = _progress_bar("decode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
-            _progress("decode", done, n_sub, t0, predictor)
-            done += 1
             cshape = tuple(sl.stop - sl.start
                            for sl in predictor.chunk_slices(ids[0]))
             cmasks = stage_masks(cshape, predictor.levels, stride, block)
@@ -409,7 +453,11 @@ def _decompress_chunked(
                         pred[bi][None, :], codes, outliers, ebs[s],
                         radius).reshape(c, n)
             predictor.finish_wave(recon)
-    _progress("decode", n_sub, n_sub, t0)
+            peak = _cuda_peak(predictor)
+            if peak:
+                bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
+            bar.update(1)
+    bar.close()
     if off != len(payload):
         raise ValueError("trailing bytes in DeepSZ GNN payload")
     return recon[0]
@@ -434,6 +482,7 @@ class GNNCompressorCodec:
         anchor_block: int = 1,
         radius: int = 1 << 15,
         max_radius: int = 64,
+        agg_level: int | None = None,
         device: str | None = None,   # None -> cuda if available, else cpu
         zstd_level: int = 9,
         eb_ratio: float | None = 1.0,
@@ -443,6 +492,7 @@ class GNNCompressorCodec:
         chunk_batch: int | None = None,
         fp16: bool = False,
         compile: bool = False,
+        overlap: bool = False,
     ):
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
@@ -458,6 +508,11 @@ class GNNCompressorCodec:
         self.anchor_block = int(anchor_block)
         self.radius = int(radius)
         self.max_radius = int(max_radius)
+        # Neighbourhood aggregation level: cap on the L1 length of the GNN's
+        # neighbour lines (None = full neighbourhood). Smaller = fewer directions
+        # per point = faster inference, most impactful in high dimensions. Frozen
+        # into the stream so decode reproduces the encoder's prediction bitwise.
+        self.agg_level = None if agg_level is None else int(agg_level)
         if device is None:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -484,6 +539,10 @@ class GNNCompressorCodec:
         # ops that aren't in the GEMMs). Stored in meta so decode uses the same
         # compiled float path. First encode pays a one-off compilation cost.
         self.compile = bool(compile)
+        # overlap: run per-stage rANS packing on a background thread so it hides
+        # behind the next stage's GPU forward. Encode-only; the output bytes are
+        # identical, so nothing about the stream or decode changes.
+        self.overlap = bool(overlap)
         self.checkpoint_hash = self._checkpoint_hash()
 
     def _chunk_edges(self, shape: tuple[int, ...]) -> tuple[int, ...] | None:
@@ -550,6 +609,7 @@ class GNNCompressorCodec:
                 "anchor_block": self.anchor_block,
                 "radius": self.radius,
                 "max_radius": self.max_radius,
+                "agg_level": self.agg_level,
                 "vmin": vmin,
                 "vmax": vmax,
                 "eb_ratio": ratio,
@@ -654,7 +714,7 @@ class GNNCompressorCodec:
                                self.anchor_block, eb, eb_ratio)
         payload = _compress_chunked(values[None, ...], ebs, self.radius,
                                     dtype.kind in "bi", predictor, edges,
-                                    self.chunk_batch)
+                                    self.chunk_batch, overlap=self.overlap)
         return payload, int(predictor.chunk_batch)
 
     def _chunked_predictor(
@@ -668,6 +728,7 @@ class GNNCompressorCodec:
                          else int(meta["anchor_stride"]))
         anchor_block = (self.anchor_block if meta is None
                         else int(meta["anchor_block"]))
+        agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
         predictor = ChunkedGNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -676,6 +737,7 @@ class GNNCompressorCodec:
             levels=levels,
             anchor_stride=anchor_stride,
             anchor_block=anchor_block,
+            agg_level=agg_level,
         )
         # encode: from the codec flag; decode: replay the stream's float path
         predictor.fp16 = (self.fp16 if meta is None
@@ -694,6 +756,7 @@ class GNNCompressorCodec:
         anchor_stride = self.anchor_stride if meta is None else int(meta["anchor_stride"])
         anchor_block = self.anchor_block if meta is None else int(meta["anchor_block"])
         max_radius = self.max_radius if meta is None else int(meta["max_radius"])
+        agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
         return GNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -704,6 +767,7 @@ class GNNCompressorCodec:
             levels=levels,
             anchor_stride=anchor_stride,
             anchor_block=anchor_block,
+            agg_level=agg_level,
         )
 
     def _checkpoint_hash(self) -> bytes:

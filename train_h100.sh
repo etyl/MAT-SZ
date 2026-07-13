@@ -15,22 +15,28 @@ module purge
 module load arch/h100
 module load pytorch-gpu
 
+
 python scripts/train_gnn.py \
     --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
     --out data/gnn_predictor.pt \
     --steps 50000 \
     --batch 32 \
     --crop 128 \
-    --d 32 \
+    --d 64 \
     --lr 0.0005 \
     --noise-range 0.0001 0.05 \
     --eval-image /lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak/17.png \
     --eval-eb 0.01 \
     --eval-every 100 \
     --img-every 1000 \
+    --eval-tensor ./data/rti_normal.npy \
+    --eval-tensor-eb 0.01 \
+    --eval-tensor-every 500 \
     --device cuda \
     --wandb-mode offline \
     --run-name gnn-axis \
+    --fp16 \
+    --compile \
     "$@"
 
 # per-run dir -> data/runs/<date>-<hash>/ (checkpoint + config.json)

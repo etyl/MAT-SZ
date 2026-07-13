@@ -56,6 +56,10 @@ def main(argv=None):
                     help="gnn only: fp16 autocast on the GNN message pass (cuda; "
                          "~2x forward, readout stays fp32). May cost a little ratio "
                          "at small eb -- compare bits/value with and without")
+    ap.add_argument("--overlap", action="store_true",
+                    help="gnn chunked only: pack the per-stage rANS on a "
+                         "background thread so it hides behind the next stage's "
+                         "GPU forward. Output bytes are identical; encode-only")
     ap.add_argument("--compile", action="store_true",
                     help="gnn only: torch.compile the message-pass embed (fuses "
                          "the elementwise ~40%%; one-off compile cost on first "
@@ -79,11 +83,12 @@ def main(argv=None):
         codec = GNNCompressorCodec(
             args.gnn_checkpoint, error_bound=eb, levels=args.levels,
             anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
+            agg_level=args.agg_level,
             radius=args.radius, zstd_level=args.zstd_level,
             eb_ratio=args.eb_ratio,
             tune=args.tune if args.tune in ("fast", "size") else "fast",
             chunk_size=args.chunk_size, chunk_batch=args.chunk_batch,
-            fp16=args.fp16, compile=args.compile)
+            fp16=args.fp16, compile=args.compile, overlap=args.overlap)
         t0 = time.time()
         stream = codec.compress(arr)
         t_comp = time.time() - t0

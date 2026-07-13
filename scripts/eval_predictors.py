@@ -53,6 +53,7 @@ def make_predictor(method: str, img: np.ndarray, args):
                          anchor_stride=args.anchor_stride,
                          anchor_block=args.anchor_block)
         p.fp16 = args.fp16
+        p.compile = args.compile
         return p
     order = "linear" if method == "interp-linear" else "cubic"
     return InterpPredictor(args.interp_tile, order, args.levels,
@@ -69,6 +70,7 @@ def build_predictor_for_decompress(method: str, hdr: Header, args):
                          anchor_stride=hdr.anchor_stride,
                          anchor_block=hdr.anchor_block)
         p.fp16 = args.fp16   # eval runs enc+dec in-process, so both match
+        p.compile = args.compile
         return p
     if hdr.flags & FLAG_MOCK:
         return MockPredictor(hdr.tile_size)
@@ -282,6 +284,9 @@ def main():
     ap.add_argument("--fp16", action="store_true",
                     help="fp16 autocast on the GNN message pass (cuda; readout "
                          "stays fp32). Measures the ratio cost vs fp32 across eb")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the GNN message-pass embed (same float "
+                         "path replayed at decode; eval runs enc+dec in-process)")
     ap.add_argument("--images", nargs="*", default=None,
                     help="specific image filenames (default: all in --data)")
     ap.add_argument("--csv", default="eval.csv",
@@ -327,38 +332,40 @@ def main():
                   f"{args.device!r} -> running fp32")
         print()
 
+    from tqdm import tqdm
     rows: list[dict] = []
     total = len(images) * len(args.eb) * len(args.methods)
-    done = 0
+    pbar = tqdm(total=total, unit="job")
     for img_path in images:
         img = load_image(img_path)
         for eb in sorted(args.eb):
             for method in args.methods:
-                done += 1
-                print(f"[{done:3d}/{total}] {img_path.name} eb={eb:g} {method} ...",
-                      end=" ", flush=True)
+                pbar.set_description(f"{img_path.name} eb={eb:g} {method}")
                 try:
                     r = eval_sz3(img, eb) if method == "sz3" else \
                         eval_deepsz(img, eb, method, args)
                 except Exception as exc:
-                    print(f"ERROR: {exc}")
+                    tqdm.write(f"{img_path.name} eb={eb:g} {method}: ERROR: {exc}")
+                    pbar.update(1)
                     continue
                 if r is None:
-                    print("skipped (SZ3 unavailable)")
+                    tqdm.write(f"{img_path.name} eb={eb:g} {method}: skipped (SZ3 unavailable)")
+                    pbar.update(1)
                     continue
                 r.update(image=img_path.name, method=method, eb=eb)
                 rows.append(r)
                 ok = "PASS" if r["bound_ok"] else "FAIL"
-                print(f"bpp={r['bpp']:.3f} PSNR={r['psnr']:.2f}dB "
-                      f"maxErr={r['max_err']:.1f} [{ok}] {r['t_comp']:.2f}s")
+                tqdm.write(f"{img_path.name} eb={eb:g} {method}: "
+                           f"bpp={r['bpp']:.3f} PSNR={r['psnr']:.2f}dB "
+                           f"maxErr={r['max_err']:.1f} [{ok}] {r['t_comp']:.2f}s")
                 if method in ("gnn", "gnn-rans"):
-                    print(f"    GNN search: {r['tune_candidates']} candidate(s), "
-                          f"setup={r['t_encode_setup']:.2f}s, "
-                          f"predict={r['t_predict']:.2f}s "
-                          f"quantize={r['t_quantize']:.2f}s "
-                          f"entropy={r['t_entropy']:.2f}s; "
-                          f"decode={r['t_dec']:.2f}s "
-                          f"(setup={r['t_decode_setup']:.2f}s)")
+                    tqdm.write(f"    GNN search: {r['tune_candidates']} candidate(s), "
+                               f"setup={r['t_encode_setup']:.2f}s, "
+                               f"predict={r['t_predict']:.2f}s "
+                               f"quantize={r['t_quantize']:.2f}s "
+                               f"entropy={r['t_entropy']:.2f}s; "
+                               f"decode={r['t_dec']:.2f}s "
+                               f"(setup={r['t_decode_setup']:.2f}s)")
                 # GNN runs untiled (whole image = one region), so its embedding
                 # field is O(image size) instead of O(tile size); release it
                 # and any cached CUDA blocks before the next image/eb.
@@ -367,6 +374,8 @@ def main():
                     import torch
                     gc.collect()
                     torch.cuda.empty_cache()
+                pbar.update(1)
+    pbar.close()
 
     if not rows:
         sys.exit("No results — check errors above.")
