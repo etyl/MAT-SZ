@@ -1,5 +1,6 @@
 """Train the lightweight GNN predictor (deepsz/gnn_predictor.py) on natural
-images. CPU-friendly: the model is ~20k params, a few thousand steps suffice.
+images mixed with anisotropic synthetic 4-D fields. CPU-friendly: the model is
+~20k params, a few thousand steps suffice.
 
     conda run -n nf python scripts/train_gnn.py --data /path/to/images
 
@@ -14,6 +15,7 @@ stage. Checkpoint -> data/gnn_predictor.pt.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -90,6 +92,71 @@ def load_plane(path, crop):
 def sample_batch(paths, batch, crop):
     planes = [load_plane(random.choice(paths), crop) for _ in range(batch)]
     return torch.from_numpy(np.stack(planes)).reshape(batch, -1)  # (B, N)
+
+
+def sample_synthetic_batch(batch, shape, correlation, rng=None,
+                           permute_axes=True):
+    """Return smooth anisotropic Gaussian random fields in ``[0, 1]``.
+
+    The entries of ``correlation`` are Gaussian smoothing sigmas in grid cells;
+    a larger value makes adjacent values more correlated. By default their axis
+    assignment is independently shuffled for each field, preventing the model
+    from memorizing that one fixed axis is always the most useful. Two filtered
+    scales keep samples richer than a single blurred-noise realization.
+    Reflecting boundaries avoid teaching the model an artificial periodic seam.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    shape = tuple(int(n) for n in shape)
+    correlation = tuple(float(s) for s in correlation)
+    rng = np.random.default_rng() if rng is None else rng
+    fields = []
+    for _ in range(batch):
+        sigma = correlation
+        if permute_axes:
+            sigma = tuple(np.asarray(correlation)[rng.permutation(len(shape))])
+        fine = gaussian_filter(rng.standard_normal(shape), sigma=sigma,
+                               mode="reflect")
+        coarse = gaussian_filter(rng.standard_normal(shape),
+                                 sigma=tuple(2.0 * s for s in sigma),
+                                 mode="reflect")
+        field = fine + 0.5 * coarse
+        # Robust scaling retains local variation when one realization contains
+        # a rare extreme. Values match the normalized image training range.
+        lo, hi = np.percentile(field, (1.0, 99.0))
+        if hi <= lo:  # only realistically reachable for degenerate tiny shapes
+            field = np.full(shape, 0.5, np.float32)
+        else:
+            field = np.clip((field - lo) / (hi - lo), 0.0, 1.0)
+        fields.append(field.astype(np.float32, copy=False))
+    return torch.from_numpy(np.stack(fields)).reshape(batch, -1)
+
+
+def mixed_batch_sizes(crop, synthetic_shape, synthetic_fraction,
+                      image_batch, synthetic_batch):
+    """Choose source batch sizes and return their actual point fraction.
+
+    A 2-D crop and a 4-D field are indivisible training examples, so arbitrary
+    fractions can only be approximated at that granularity. ``synthetic_batch``
+    fixes the number of fields; the image batch is derived to make the fraction
+    of scalar points as close as possible to ``synthetic_fraction``. At the two
+    endpoints the explicitly configured batch size for the active source is
+    retained.
+    """
+    fraction = float(synthetic_fraction)
+    if fraction == 0.0:
+        return int(image_batch), 0, 0.0
+    if fraction == 1.0:
+        return 0, int(synthetic_batch), 1.0
+    image_points = int(crop) ** 2
+    field_points = math.prod(int(n) for n in synthetic_shape)
+    synthetic_batch = int(synthetic_batch)
+    target_image_points = (synthetic_batch * field_points
+                           * (1.0 - fraction) / fraction)
+    image_batch = max(1, round(target_image_points / image_points))
+    ns = synthetic_batch * field_points
+    ni = image_batch * image_points
+    return image_batch, synthetic_batch, ns / (ni + ns)
 
 
 def prefetch_batches(paths, batch, crop, steps, workers):
@@ -192,6 +259,13 @@ def sample_noise(batch, args, device):
     return torch.empty(batch, device=device).uniform_(log_lo, log_hi).exp()
 
 
+def training_autocast(fp16, device):
+    """CUDA FP16 autocast matching the codec's message-pass execution mode."""
+    if fp16 and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return contextlib.nullcontext()
+
+
 def discretized_laplace_nll(mu, log_b, target, eb):
     """Mean code length in bits for target under a discretized Laplace cell."""
     eb = torch.as_tensor(eb, device=target.device, dtype=target.dtype).reshape(-1, 1)
@@ -284,7 +358,8 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
     codec = GNNCompressorCodec(
         ckpt_path, error_bound=eb, levels=(args.levels or 4),
         anchor_stride=(args.stride or 16), max_radius=args.max_radius,
-        device=str(device))
+        device=str(device), agg_level=args.agg_level,
+        fp16=args.fp16, compile=args.compile)
 
     base_gpu = 0
     if device.type == "cuda":
@@ -417,12 +492,14 @@ def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
     if g is not None:  # finalize the last stage so the coarse means see it
         if ctx is None:
             ctx = model.embed(E, g)
+        finalized = model.finalize(ctx, known_vals[:, gidx[last]]).to(E.dtype)
         E = E.index_copy(1, g.query_idx,
-                         model.finalize(ctx, known_vals[:, gidx[last]]))
+                         finalized)
     return nll, npix, abs_err, E
 
 
-def run_chunked_scene(model, x, hw, axis, order, levels, stride, d, device, eb):
+def run_chunked_scene(model, x, hw, axis, order, levels, stride, d, device, eb,
+                      agg_level=None):
     """Teacher-forced two-chunk closed loop, mirroring the chunked codec: the
     square scene is split in half along ``axis``; global anchors are revealed
     and give every chunk its level-0 coarse embedding, then the chunks are
@@ -457,7 +534,7 @@ def run_chunked_scene(model, x, hw, axis, order, levels, stride, d, device, eb):
         fin = anchor_finalize(model, known_vals[:, aidx[ci]], 2)
         coarse[:, ci, 0] = model.coarse(fin.mean(1), math.log2(stride))
 
-    cg = build_chunk_geoms(edges, levels, stride, 1, torch, device)
+    cg = build_chunk_geoms(edges, levels, stride, 1, torch, device, agg_level)
     coded = np.zeros(2, bool)
     nll = torch.zeros((), device=device)
     abs_err = torch.zeros((), device=device)
@@ -502,6 +579,23 @@ def main():
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--crop", type=int, default=128)
+    ap.add_argument("--synthetic-frac", type=float, default=0.5,
+                    help="target fraction of scalar training points from 4-D "
+                         "fields in every optimizer step; the image batch size "
+                         "is derived to approach this fraction")
+    ap.add_argument("--synthetic-shape", type=int, nargs=4,
+                    default=(16, 16, 16, 16), metavar=("N0", "N1", "N2", "N3"),
+                    help="shape of each generated 4-D training field")
+    ap.add_argument("--synthetic-correlation", type=float, nargs=4,
+                    default=(6.0, 3.0, 1.5, 0.75),
+                    metavar=("S0", "S1", "S2", "S3"),
+                    help="Gaussian correlation length (grid cells) per axis; "
+                         "larger means smoother/more correlated")
+    ap.add_argument("--synthetic-batch", type=int, default=1,
+                    help="number of 4-D fields per optimizer step; with a mixed "
+                         "step, --batch is derived from the target point fraction")
+    ap.add_argument("--synthetic-stride", type=int, default=8,
+                    help="anchor stride for synthetic fields (power of two)")
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--d", type=int, default=32)
     ap.add_argument("--noise", type=float, default=0.01,
@@ -512,6 +606,10 @@ def main():
                     help="sample each training example's +/- noise log-uniformly "
                          "from [MIN, MAX], overriding --noise")
     ap.add_argument("--max-radius", type=int, default=64)
+    ap.add_argument("--agg-level", type=int, default=2,
+                    help="maximum L1 neighbourhood aggregation level: 1 uses "
+                         "axis-aligned directions only; 2 also uses two-axis "
+                         "diagonals (default: 2)")
     ap.add_argument("--chunk-frac", type=float, default=0.5,
                     help="fraction of steps trained on the two-chunk scene "
                          "(chunked-codec halo regime); the rest train the "
@@ -547,6 +645,12 @@ def main():
                          "bit-reproducible; >0 overlaps I/O with the GPU step)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available()
                     else "cpu", help="cpu | cuda | cuda:N")
+    ap.add_argument("--fp16", action="store_true",
+                    help="train the GNN message pass with CUDA FP16 autocast "
+                         "and gradient scaling; readout/loss remain FP32")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the message-pass embed with dynamic "
+                         "shapes (one-off compilation cost on first steps)")
     ap.add_argument("--wandb-mode", choices=("online", "offline", "disabled"),
                     default="online", help="wandb logging mode")
     ap.add_argument("--wandb-project", default="gnn-sz")
@@ -559,10 +663,24 @@ def main():
         lo, hi = args.noise_range
         if lo <= 0 or hi < lo:
             raise SystemExit("--noise-range must satisfy 0 < MIN <= MAX")
+    if not 0.0 <= args.synthetic_frac <= 1.0:
+        raise SystemExit("--synthetic-frac must be in [0, 1]")
+    if any(n < 2 for n in args.synthetic_shape):
+        raise SystemExit("--synthetic-shape entries must all be >= 2")
+    if any(s <= 0 for s in args.synthetic_correlation):
+        raise SystemExit("--synthetic-correlation entries must all be > 0")
+    if args.synthetic_batch < 1:
+        raise SystemExit("--synthetic-batch must be >= 1")
+    if (args.synthetic_stride < 2 or
+            args.synthetic_stride & (args.synthetic_stride - 1)):
+        raise SystemExit("--synthetic-stride must be a power of two >= 2")
+    if args.agg_level < 1:
+        raise SystemExit("--agg-level must be >= 1")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
+    synthetic_rng = np.random.default_rng(args.seed + 1)
 
     # per-run dir: <out-parent>/runs/<date>-<config-hash>/ holds the checkpoint
     # and a config.json snapshot, so concurrent/repeated runs never clobber.
@@ -582,13 +700,36 @@ def main():
                mode=args.wandb_mode, config=wandb_config, dir=str(run_dir))
 
     device = torch.device(args.device)
+    amp_enabled = args.fp16 and device.type == "cuda"
+    if args.fp16 and not amp_enabled:
+        print("NOTE: --fp16 only engages on CUDA; using FP32 on "
+              f"device={device}")
     paths = list_images(args.data)
     if not paths:
         raise SystemExit(f"no images found under {args.data}")
     print(f"{len(paths)} images, device={device}")
+    image_batch, synthetic_batch, synthetic_point_fraction = mixed_batch_sizes(
+        args.crop, args.synthetic_shape, args.synthetic_frac,
+        args.batch, args.synthetic_batch)
+    if args.synthetic_frac:
+        image_points = image_batch * args.crop ** 2
+        synthetic_points = synthetic_batch * math.prod(args.synthetic_shape)
+        print("synthetic mix: "
+              f"target={args.synthetic_frac:g}, "
+              f"actual point fraction={synthetic_point_fraction:.6g}, "
+              f"image={image_batch}x{args.crop}^2={image_points} points, "
+              f"synthetic={synthetic_batch}x{tuple(args.synthetic_shape)}="
+              f"{synthetic_points} points, "
+              f"correlation={tuple(args.synthetic_correlation)}, "
+              f"stride={args.synthetic_stride}")
 
     model = build_model(args.d).to(device)
+    if args.compile:
+        mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
+        model.embed = torch.compile(model.embed, dynamic=True, mode=mode)
+        print(f"torch.compile enabled for model.embed (mode={mode or 'default'})")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     decay_start = int(args.steps * 0.7)  # linear lr decay over the last 30% steps
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(
         1.0, (args.steps - s) / max(args.steps - decay_start, 1)))
@@ -604,7 +745,7 @@ def main():
     eval_x, (eh, ew) = load_eval_plane(args.eval_image, device)
     eval_masks = stage_masks((eh, ew), 4, 16, anchor_block=1)  # interp baseline
     eval_geoms, _ = build_stage_geoms((eh, ew), 4, 16, 1, args.max_radius,
-                                      torch, device)
+                                      torch, device, args.agg_level)
 
     be, bn = interp_eval(eval_x, eval_masks, args.eval_eb, args.baseline)
     baseline_mae = be / max(bn, 1)
@@ -643,48 +784,87 @@ def main():
         prof.start()
         args.steps = args.profile + 2  # wait + warmup + active
 
-    batches = prefetch_batches(paths, args.batch, args.crop, args.steps,
+    batches = prefetch_batches(paths, image_batch, args.crop, args.steps,
                                args.workers)
     bar = tqdm(range(1, args.steps + 1), desc="train")
     for step in bar:
-        x = next(batches).to(device)  # (B, N) truth, decoded on a worker thread
-        # stride and levels must be paired so the schedule densifies to stride 1
-        # (levels == log2(stride)); independent draws mismatch and train the net
-        # on broken schedules (see levels.stage_plan's guard).
-        stride = args.stride or random.choice((8, 16, 32))
-        levels = args.levels or stride.bit_length() - 1
-
-        # Pixel-weighted discretized-Laplacian NLL: the sampled eb both
-        # conditions the head and sets the teacher-forcing noise amplitude.
-        eb = sample_noise(x.shape[0], args, device)
-        if random.random() < args.chunk_frac:
-            # chunked-codec regime: two half-crop chunks with halo context
-            axis = random.randint(0, 1)
-            order = random.choice(([0, 1], [1, 0]))
-            nll, npix, aux = run_chunked_scene(
-                model, x, (args.crop, args.crop), axis, order, levels, stride,
-                args.d, device, eb)
-        else:
-            geoms, _ = build_stage_geoms((args.crop, args.crop), levels, stride,
-                                         1, args.max_radius, torch, device)
-            nll, npix, _, _, aux = run_stages(model, x, geoms, args.d, device,
-                                              eb=eb, teacher_force=True)
-        loss = nll / max(npix, 1)
-        train_mae = aux["abs_err"].detach() / max(npix, 1)
         opt.zero_grad()
-        loss.backward()
-        opt.step()
+        # Weight each source mean by its *actual number of scalar points* in
+        # this mixed batch. Thus the objective is the mean over all points used
+        # by the step, including rounding needed for indivisible examples.
+        image_weight = 1.0 - synthetic_point_fraction
+        synthetic_weight = synthetic_point_fraction
+        combined_loss = 0.0
+        combined_mae = 0.0
+        train_log = {}
+
+        # The 2-D and 4-D examples cannot share a rectangular tensor batch.
+        # Run them sequentially and backward immediately so their gradients
+        # accumulate without retaining both computation graphs in GPU memory.
+        if image_weight:
+            x = next(batches).to(device)  # decoded on a worker thread
+            stride = args.stride or random.choice((8, 16, 32))
+            levels = args.levels or stride.bit_length() - 1
+            eb = sample_noise(x.shape[0], args, device)
+            with training_autocast(args.fp16, device):
+                if random.random() < args.chunk_frac:
+                    axis = random.randint(0, 1)
+                    order = random.choice(([0, 1], [1, 0]))
+                    nll, npix, aux = run_chunked_scene(
+                        model, x, (args.crop, args.crop), axis, order, levels,
+                        stride, args.d, device, eb, args.agg_level)
+                else:
+                    geoms, _ = build_stage_geoms(
+                        (args.crop, args.crop), levels, stride, 1,
+                        args.max_radius, torch, device, args.agg_level)
+                    nll, npix, _, _, aux = run_stages(
+                        model, x, geoms, args.d, device, eb=eb,
+                        teacher_force=True)
+            image_loss = nll / max(npix, 1)
+            image_mae = aux["abs_err"].detach() / max(npix, 1)
+            scaler.scale(image_weight * image_loss).backward()
+            combined_loss += image_weight * image_loss.item()
+            combined_mae += image_weight * image_mae.item()
+            train_log.update({"train/image_bpp": image_loss.item(),
+                              "train/image_mae": image_mae.item()})
+
+        if synthetic_weight:
+            field_shape = tuple(args.synthetic_shape)
+            x = sample_synthetic_batch(
+                synthetic_batch, field_shape,
+                args.synthetic_correlation, synthetic_rng).to(device)
+            stride = args.synthetic_stride
+            levels = args.levels or stride.bit_length() - 1
+            eb = sample_noise(x.shape[0], args, device)
+            geoms, _ = build_stage_geoms(
+                field_shape, levels, stride, 1, args.max_radius, torch, device,
+                args.agg_level)
+            with training_autocast(args.fp16, device):
+                nll, npix, _, _, aux = run_stages(
+                    model, x, geoms, args.d, device, eb=eb,
+                    teacher_force=True)
+            synthetic_loss = nll / max(npix, 1)
+            synthetic_mae = aux["abs_err"].detach() / max(npix, 1)
+            scaler.scale(synthetic_weight * synthetic_loss).backward()
+            combined_loss += synthetic_weight * synthetic_loss.item()
+            combined_mae += synthetic_weight * synthetic_mae.item()
+            train_log.update({"train/synthetic_bpp": synthetic_loss.item(),
+                              "train/synthetic_mae": synthetic_mae.item()})
+
+        scaler.step(opt)
+        scaler.update()
         sched.step()
-        run_loss += loss.item()
-        wandb.log({
-            "train/bpp": loss.item(),
-            "train/mae": train_mae.item(),
-            "lr": sched.get_last_lr()[0],
-        }, step=step)
+        run_loss += combined_loss
+        train_log.update({"train/bpp": combined_loss,
+                          "train/mae": combined_mae,
+                          "train/synthetic_point_fraction":
+                              synthetic_point_fraction,
+                          "lr": sched.get_last_lr()[0]})
+        wandb.log(train_log, step=step)
 
         if step % args.eval_every == 0:
             model.eval()
-            with torch.no_grad():
+            with torch.no_grad(), training_autocast(args.fp16, device):
                 bits, en, recon, pred_only, aux = run_stages(
                     model, eval_x, eval_geoms, args.d, device,
                     eb=args.eval_eb, collect=True, collect_bins=True)

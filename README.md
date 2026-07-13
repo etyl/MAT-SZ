@@ -57,6 +57,50 @@ reconstructed = codec.uncompress(compressed)  # torch.Tensor
 checkpoint hash in the binary stream. Decoding verifies the checkpoint hash by
 default.
 
+## GNN training with synthetic 4-D fields
+
+The GNN trainer mixes natural-image crops with generated smooth 4-D fields by
+default. The four correlation values are Gaussian smoothing lengths in grid
+cells: larger values make an axis smoother and more predictable. Their axis
+assignment is randomly permuted for every generated field, so the model must
+infer which axes are most useful instead of relying on a fixed axis ordering.
+
+```bash
+python scripts/train_gnn.py \
+    --data /path/to/images \
+    --synthetic-frac 0.5 \
+    --synthetic-shape 16 16 16 16 \
+    --synthetic-correlation 6 3 1.5 0.75 \
+    --synthetic-batch 1 \
+    --synthetic-stride 8 \
+    --agg-level 2
+```
+
+Every optimizer step processes both sources sequentially: an image batch using
+the existing mixture of whole-image and 2-D chunked training, followed by a 4-D
+batch using the rank-generic whole-field schedule. `--synthetic-frac` is the
+target fraction of scalar points from the synthetic batch. For example, the
+default combines one `16^4` field (65,536 points) with four `128^2` crops
+(65,536 points), making exactly 50% of the 131,072 values synthetic. The image
+batch size is derived from this target and `--synthetic-batch`; fractions that
+cannot be represented by whole examples are rounded to the nearest achievable
+ratio and the actual ratio is printed. Source losses are weighted by those
+actual point counts before one optimizer update. Sequential backward passes
+avoid holding both computation graphs in memory. Set `--synthetic-frac 0` for
+image-only training or `1` for synthetic-only training.
+
+`--synthetic-stride 8` controls the synthetic field's prediction schedule, not
+its correlation length. Directly coded anchors are spaced every eight cells on
+each axis; three dyadic refinement levels then reduce that spacing through
+`8 -> 4 -> 2 -> 1`. `--agg-level 2` limits GNN neighbourhood lines to
+axis-aligned directions and two-axis diagonals, excluding directions that vary
+along three or four axes at once.
+
+On CUDA, add `--fp16` to autocast the GNN message pass with gradient scaling,
+and `--compile` to compile the dynamic-shape embedding pass. The prediction
+readout and loss remain FP32. These settings are also used by periodic
+`--eval-tensor` codec evaluations.
+
 ## Legacy Setup Notes
 
 ```bash
