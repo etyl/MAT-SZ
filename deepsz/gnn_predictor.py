@@ -351,6 +351,7 @@ def build_model(d: int = 32):
         def forward(self, e, cos, sign):
             # e: (B, L, M, K, d); cos: (L, K)
             # theta broadcasts over B (dim 0) and M (dim 2).
+            cos = cos.to(e.dtype)        # geom is fp32; match model dtype (fused)
             theta = (sign * cos)[:, None, :, None] * self.freq  # (L, 1, K, d/2)
             cs, sn = torch.cos(theta), torch.sin(theta)
             B, L, M, K, _ = e.shape
@@ -411,7 +412,10 @@ def build_model(d: int = 32):
             sn = (self.null_k * self.q).sum() * scale
             scores = torch.cat([scores, sn.expand(1, B, N)], dim=0)
             v = torch.cat([v, self.null_v.expand(1, B, N, dd)], dim=0)
-            w = torch.softmax(scores, dim=0)  # (L+1, B, N)
+            # Softmax in fp32 even when the model is fp16: -inf-masked scores
+            # overflow/NaN in half. Cast the weights back to v's dtype so the
+            # weighted sum stays in the model dtype (was autocast's fp32 rule).
+            w = torch.softmax(scores.float(), dim=0).to(v.dtype)  # (L+1, B, N)
             return (w.unsqueeze(-1) * v).sum(0)  # (B, N, d)
 
     class PredHead(nn.Module):
@@ -497,20 +501,27 @@ def build_model(d: int = 32):
             ep = self.rope(ep, geom.cos, 1.0)       # (B, L, m, K, d)
             en = self.rope(en, geom.cos, -1.0)
             _, L, M, K, _ = ep.shape
-            lp = (torch.log2(dp) + geom.lognnz
+            # .to(ep.dtype): geom distances are fp32; match model dtype so the
+            # dir/bidir MLPs get fp16 inputs under true-half (cast fuses in embed).
+            lp = (torch.log2(dp) + geom.lognnz).to(ep.dtype
                   ).view(1, L, M, 1, 1).expand(B, L, M, K, 1)
-            lnn = (torch.log2(dn) + geom.lognnz
+            lnn = (torch.log2(dn) + geom.lognnz).to(ep.dtype
                    ).view(1, L, M, 1, 1).expand(B, L, M, K, 1)
             sign = ep.new_ones(B, L, M, K, 1)
             both = (vp & vn).view(1, L, M, 1, 1)
             vp_only = (vp & ~vn).view(1, L, M, 1, 1)
-            # Build the message in place, one direction MLP at a time, so we never
-            # hold bidir/dpos/dneg (each (B,L,m,K,d)) simultaneously — peak drops by
-            # two such buffers, which dominate GPU memory at the finest stages.
-            msg = self.dir(en, -sign, lnn)                       # vn-only baseline
-            msg = torch.where(vp_only, self.dir(ep, sign, lp), msg)
+            # Every single-neighbour point uses the *same* dir weights, differing
+            # only in which neighbour/sign/dist it feeds. Select that input before
+            # the MLP (ep if only +, else en) so dir runs once, not twice — the
+            # second pass was always discarded by the where. Both-neighbour points
+            # get overwritten by bidir. Still one big buffer at a time, so the
+            # finest-stage memory peak is unchanged.
+            e_sel = torch.where(vp_only, ep, en)
+            msg = self.dir(e_sel,
+                           torch.where(vp_only, sign, -sign),
+                           torch.where(vp_only, lp, lnn))
             msg = torch.where(both, self.bidir(en, ep, lnn, lp), msg)
-            del ep, en
+            del ep, en, e_sel
             return (msg.permute(1, 0, 2, 3, 4).contiguous(), (vp | vn))
 
         def _embed_block(self, E, geom, msl):
@@ -600,7 +611,11 @@ def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
     if geom_prev is not None and geom_prev.M:
         ctx = finalize_ctx if finalize_ctx is not None else model.embed(E, geom_prev)
         finalized = model.finalize(ctx, finalize_vals).to(E.dtype)  # fp16 -> E dtype
-        E = E.index_copy(1, geom_prev.query_idx, finalized)     # write newly-known
+        # ponytail: in-place. no grad here, and each model.embed re-stages E, so
+        # mutating it between calls is safe; out-of-place clones E every stage
+        # (~200ms of DtoD at chunk 32). Only unsafe if E were a CUDA-graph static
+        # buffer, but reduce-overhead re-copies inputs, so eager E stays mutable.
+        E.index_copy_(1, geom_prev.query_idx, finalized)        # write newly-known
     head_ctx = model.embed(E, geom_head)
     return model.head_of(head_ctx, eb), E, head_ctx
 
@@ -651,6 +666,19 @@ def stage_forward(model, E, *args, **kwargs):
     return values, E
 
 
+def _apply_half(model):
+    """True-fp16 inference: cast the whole model to fp16 so there are *no* per-op
+    autocast input casts (the ~880 aten::to that dominated CPU on the idle-GPU
+    workload). Keep the prediction readout — axis_pool + head — in fp32 for
+    quantization precision (head_of upcasts its context to match), and AttnPool
+    upcasts its own softmax, together replacing what autocast pinned to fp32.
+    ponytail: mutates the (shared, cached) model in place; fine because a process
+    runs one dtype. Idempotent, so enc+dec calling it on the same model is safe."""
+    model.half()
+    model.axis_pool.float()
+    model.head.float()
+
+
 class GNNPredictor:
     """GNN predictor loaded from a trained checkpoint. The stage schedule
     (`levels`, `anchor_stride`, `anchor_block`) must match the codec's, so the
@@ -671,14 +699,29 @@ class GNNPredictor:
         # dynamic=True: one graph for every stage/chunk M, no recompile storm.
         # enc and dec both compile (flag replayed) so their float paths match.
         if self.compile and not getattr(self, "_compiled", False):
-            self.model.embed = self._torch.compile(self.model.embed, dynamic=True)
+            # DEEPSZ_COMPILE_MODE=reduce-overhead -> CUDA graphs, kills per-kernel
+            # launch latency on the ~30 tiny message-pass kernels (launch-bound).
+            # ponytail: CUDA graphs want static shapes; with varying stage M they
+            # recapture per new shape, so it only wins once shapes settle/repeat.
+            mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
+            self.model.embed = self._torch.compile(
+                self.model.embed, dynamic=True, mode=mode)
             self._compiled = True
 
+    def _mdtype(self):
+        # Model/activation dtype: true fp16 only on cuda (CPU has no fp16 kernels
+        # for these ops, so it stays fp32 and the fp16 flag is a no-op there).
+        return self._torch.float16 if (self.fp16 and self.device.type == "cuda") \
+            else self._torch.float32
+
     def _amp(self):
+        # True-half instead of autocast: cast the model once (before compile, so
+        # the graph is fp16), then run with no autocast -> no per-op input casts.
+        if self.fp16 and self.device.type == "cuda" \
+                and not getattr(self, "_halved", False):
+            _apply_half(self.model)
+            self._halved = True
         self._maybe_compile()
-        if self.fp16 and self.device.type == "cuda":
-            return self._torch.autocast(device_type="cuda",
-                                        dtype=self._torch.float16)
         return contextlib.nullcontext()
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
@@ -749,7 +792,8 @@ class GNNPredictor:
         if not cont:
             ndim = recon.ndim - 1
             self._E = torch.zeros(
-                c, known.size, ndim, self.d, device=self.device)
+                c, known.size, ndim, self.d, device=self.device,
+                dtype=self._mdtype())
             self._ctx = None
         geom_prev, geom_head = geoms[i - 1], geoms[i]
 
@@ -758,15 +802,16 @@ class GNNPredictor:
         vals = recon.reshape(c, -1)[:, geom_prev.idx_np]
         fvals = torch.from_numpy(
             ((np.clip(vals, self.vmin, self.vmax) - self.vmin) / span
-             ).astype(np.float32)).to(self.device)
+             ).astype(np.float32)).to(self.device, self._mdtype())
         finalize_ctx = self._ctx if cont else None
         with torch.no_grad(), self._amp():
             (values, log_b), self._E, self._ctx = stage_forward(
                 self.model, self._E, geom_prev, geom_head, fvals, torch,
                 finalize_ctx=finalize_ctx, eb=norm_eb)
         self._stage = i
-        pred = values.cpu().numpy().reshape(c, -1) * span + self.vmin
-        scale = np.exp2(log_b.cpu().numpy().reshape(c, -1)) * span
+        vals_np, logb_np = torch.stack((values, log_b)).cpu().numpy()  # one D2H
+        pred = vals_np.reshape(c, -1) * span + self.vmin
+        scale = np.exp2(logb_np.reshape(c, -1)) * span
         return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
                 scale.astype(np.float32))
 
@@ -1018,7 +1063,13 @@ class ChunkedGNNPredictor:
         # aren't in the GEMMs). dynamic=True keeps one graph across all M sizes;
         # enc and dec both compile (flag replayed) so their float paths match.
         if self.compile and not getattr(self, "_compiled", False):
-            self.model.embed = self._torch.compile(self.model.embed, dynamic=True)
+            # DEEPSZ_COMPILE_MODE=reduce-overhead -> CUDA graphs, kills per-kernel
+            # launch latency on the ~30 tiny message-pass kernels (launch-bound).
+            # ponytail: CUDA graphs want static shapes; with varying stage M they
+            # recapture per new shape, so it only wins once shapes settle/repeat.
+            mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
+            self.model.embed = self._torch.compile(
+                self.model.embed, dynamic=True, mode=mode)
             self._compiled = True
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
@@ -1057,7 +1108,8 @@ class ChunkedGNNPredictor:
         ndim = len(self.shape)
         self._check_field_budget(ndim, channels)
         self.coarse = torch.zeros(self.C, self.n_chunks, self.levels + 1,
-                                  ndim, self.d, device=self.device)
+                                  ndim, self.d, device=self.device,
+                                  dtype=self._mdtype())  # fed back into the fp16 pass
         self.coded = np.zeros(self.n_chunks, bool)
         self._cg = None
 
@@ -1100,7 +1152,8 @@ class ChunkedGNNPredictor:
 
     def _norm(self, vals: np.ndarray):
         v = (np.clip(vals, self.vmin, self.vmax) - self.vmin) / self.span
-        return self._torch.from_numpy(v.astype(np.float32)).to(self.device)
+        return self._torch.from_numpy(v.astype(np.float32)).to(
+            self.device, self._mdtype())
 
     def anchor_coarse(self, recon: np.ndarray):
         """Level-0 coarse embeddings for every chunk, right after the global
@@ -1123,7 +1176,7 @@ class ChunkedGNNPredictor:
             groups.setdefault(len(vals), ([], []))
             groups[len(vals)][0].append(ci)
             groups[len(vals)][1].append(vals)
-        with torch.no_grad():
+        with torch.no_grad(), self._amp():   # _amp halves the model on first use
             for ids, vlist in groups.values():
                 v = np.stack(vlist)                             # (G, M_a)
                 fin = anchor_finalize(self.model, self._norm(v), ndim)
@@ -1131,13 +1184,18 @@ class ChunkedGNNPredictor:
 
     # ---- batched wave path (codec): many same-geometry chunks in the B dim ----
 
+    def _mdtype(self):
+        return self._torch.float16 if (self.fp16 and self.device.type == "cuda") \
+            else self._torch.float32
+
     def _amp(self):
-        """fp16 autocast over the message pass when enabled on cuda; the readout
-        (head_of) forces itself back to fp32 so predictions stay precise."""
+        """True-fp16 model on cuda (no autocast -> no per-op input casts); the
+        readout (axis_pool/head) stays fp32 so predictions stay precise."""
+        if self.fp16 and self.device.type == "cuda" \
+                and not getattr(self, "_halved", False):
+            _apply_half(self.model)
+            self._halved = True
         self._maybe_compile()
-        if self.fp16 and self.device.type == "cuda":
-            return self._torch.autocast(device_type="cuda",
-                                        dtype=self._torch.float16)
         return contextlib.nullcontext()
 
     def max_batch(self, cshape):
@@ -1182,7 +1240,8 @@ class ChunkedGNNPredictor:
                                self.agg_level)
         frame = _CompactFrame(cg, origins[0], self.shape, self.edges, self.grid,
                               self.coded, torch, self.device)
-        E = torch.zeros(B, frame.n_compact, ndim, self.d, device=self.device)
+        E = torch.zeros(B, frame.n_compact, ndim, self.d, device=self.device,
+                        dtype=self._mdtype())
         self._wave_fill_halo(E, frame, origins, recon)
         # per-chunk global flat indices per stage, for finalize reads from recon
         self._wave_gidx = []
@@ -1242,8 +1301,11 @@ class ChunkedGNNPredictor:
                 self.model, self._E, gp, gh, fvals, torch,
                 finalize_ctx=self._ctx, eb=float(eb) / self.span)
         self._pos = j
-        pred = values.cpu().numpy() * self.span + self.vmin        # (B, M)
-        scale = np.exp2(log_b.cpu().numpy()) * self.span
+        # One D2H for both heads: two separate .cpu() are two blocking syncs per
+        # stage, and this stage-loop is the wall bottleneck (GPU ~30% utilized).
+        vals_np, logb_np = torch.stack((values, log_b)).cpu().numpy()
+        pred = vals_np * self.span + self.vmin                     # (B, M)
+        scale = np.exp2(logb_np) * self.span
         return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
                 scale.astype(np.float32))
 
@@ -1261,7 +1323,7 @@ class ChunkedGNNPredictor:
                 ctx = self._ctx if self._ctx is not None else \
                     self.model.embed(E, g)
                 fin = self.model.finalize(ctx, fvals).to(E.dtype)  # fp16->E dtype
-                E = E.index_copy(1, g.query_idx, fin)
+                E.index_copy_(1, g.query_idx, fin)              # ponytail: in-place, see _stage_forward_geoms
             cc = chunk_coarse(self.model, E, cg, torch)   # (B, levels+1, K, d)
         ids = np.array(self._wave_ids)
         self.coarse[0, ids] = cc
@@ -1282,7 +1344,7 @@ class ChunkedGNNPredictor:
         frame = _CompactFrame(cg, origin, self.shape, self.edges, self.grid,
                               self.coded, torch, self.device)
         E = torch.zeros(self.C, frame.n_compact, cg.ndim, self.d,
-                        device=self.device)
+                        device=self.device, dtype=self._mdtype())
         if len(frame.h_gflat):     # fill the halo rows from coarse + recon value
             vals = self._norm(recon.reshape(self.C, -1)[:, frame.h_gflat])
             ids = torch.from_numpy(frame.h_ids).to(self.device)
@@ -1320,8 +1382,9 @@ class ChunkedGNNPredictor:
                 self.model, self._E, gp, gh, fvals, torch,
                 finalize_ctx=self._ctx, eb=float(eb) / self.span)
         self._pos = j
-        pred = values.cpu().numpy().reshape(self.C, -1) * self.span + self.vmin
-        scale = np.exp2(log_b.cpu().numpy().reshape(self.C, -1)) * self.span
+        vals_np, logb_np = torch.stack((values, log_b)).cpu().numpy()  # one D2H
+        pred = vals_np.reshape(self.C, -1) * self.span + self.vmin
+        scale = np.exp2(logb_np.reshape(self.C, -1)) * self.span
         return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
                 scale.astype(np.float32))
 
@@ -1344,8 +1407,8 @@ class ChunkedGNNPredictor:
                                                              self._gidx[last]])
                 ctx = self._ctx if self._ctx is not None else \
                     self.model.embed(E, g)
-                E = E.index_copy(1, g.query_idx,
-                                 self.model.finalize(ctx, fvals))
+                E.index_copy_(1, g.query_idx,                   # ponytail: in-place, see _stage_forward_geoms
+                              self.model.finalize(ctx, fvals))
             self.coarse[:, ci] = chunk_coarse(self.model, E, cg, torch)
         self.coded[ci] = True
         self._E = self._ctx = self._cg = None

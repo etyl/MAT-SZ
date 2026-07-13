@@ -20,7 +20,7 @@ export DEEPSZ_M_TILE=$((1 << 30))   # M-tiling off (chunk-batch 1 fits without i
 # D128 checkpoint
 # CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
 # D32 checkpoint
-CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
+CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-232158-afc995/gnn_predictor.pt}
 
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
 # DATA=${DATA:-./data/rti_normal.npy}
