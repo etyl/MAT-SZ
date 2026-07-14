@@ -485,7 +485,7 @@ class GNNCompressorCodec:
         agg_level: int | None = None,
         device: str | None = None,   # None -> cuda if available, else cpu
         zstd_level: int = 9,
-        eb_ratio: float | None = 1.0,
+        eb_ratio: float | None = None,  # None = auto: fast -> 0.8, size -> sweep
         tune: str = "fast",
         strict_checkpoint: bool = True,
         chunk_size: int | tuple[int, ...] | None = None,
@@ -586,7 +586,7 @@ class GNNCompressorCodec:
 
         ratio_candidates = (
             [float(self.eb_ratio)] if self.eb_ratio is not None
-            else ([1.0, 0.9, 0.8, 0.7] if self.tune == "size" else [1.0])
+            else ([1.0, 0.9, 0.8, 0.7] if self.tune == "size" else [0.8])
         )
         edges = self._chunk_edges(shape)
         candidates: list[tuple[int, bytes]] = []

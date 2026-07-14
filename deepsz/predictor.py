@@ -43,6 +43,15 @@ class MockPredictor:
         return out if pos is None else out[:, pos]
 
 
+def default_interp_center(ndim: int) -> int:
+    """Best fast-mode ``center`` for a spatial rank. Averaging the per-axis
+    interpolation (``center=0``) helps in 2-D/3-D but degrades as rank grows —
+    a 4-D cell-centre blends 4 already-quantized axis-estimates and loses to
+    SZ3's single-direction scheme. Empirically ``center=1`` (interpolate along
+    one axis, like SZ3) wins from 4-D up; ``center=0`` wins at/below 3-D."""
+    return 1 if ndim >= 4 else 0
+
+
 def _interp_axis_at(W, coords, axis, s, order, shape):
     """SZ3's 1D interpolation of the query points ``coords`` (a tuple of per-axis
     index arrays into the spatial grid) along ``axis``: cubic weights
@@ -95,19 +104,23 @@ class InterpPredictor:
 
     tile_free = True  # codec compresses the whole image as one region
     tunable = True    # encoder sweeps (eb_ratio, center) and keeps the smallest
+    fast_eb_ratio = 0.9  # single-encode (tune=fast) default; see codec.encode
 
     def __init__(self, tile_size: int = 512, order: str = "cubic",
                  levels: int = 4, anchor_stride: int = 16, anchor_block: int = 4,
-                 center: int = 0):
+                 center: int | None = None):
         if order not in ("linear", "cubic"):
             raise ValueError("order must be 'linear' or 'cubic'")
         self.order = order
         self.levels = levels
         self.anchor_stride = anchor_stride
         self.anchor_block = anchor_block
-        # multi-odd-axis ("centre") prediction: 0 avg both axes (best on most
-        # data), 1/2 interpolate along the first/last odd axis only (SZ3's
-        # single-direction centre — wins on strongly anisotropic content).
+        # multi-odd-axis ("centre") prediction: 0 avg all odd axes, 1/2
+        # interpolate along the first/last odd axis only (SZ3's single-direction
+        # centre). None = pick by spatial rank (``default_interp_center``): 0 for
+        # <=3-D, 1 from 4-D up, where averaging over many axes starts to lose.
+        # The codec resolves None to a concrete value once the region rank is
+        # known; decode always overrides from the header.
         self.center = center
         self.stream_flag = FLAG_INTERP | (FLAG_CUBIC if order == "cubic" else 0)
         self.checkpoint_hash = b"\0" * 16
@@ -155,11 +168,13 @@ class InterpPredictor:
         # an edge-midpoint (one odd axis) reads 2 priors, a 2-D centre (two odd
         # axes) reads 4. ``center`` picks how a multi-odd-axis point combines
         # them: averaged (0) or single-direction (1/2).
-        if self.center == 0 or len(axes) == 1:
+        center = (self.center if self.center is not None
+                  else default_interp_center(len(shape)))
+        if center == 0 or len(axes) == 1:
             out = sum(_interp_axis_at(W, coords, a, s, self.order, shape)
                       for a in axes) / len(axes)
         else:
-            a = axes[0] if self.center == 1 else axes[-1]
+            a = axes[0] if center == 1 else axes[-1]
             out = _interp_axis_at(W, coords, a, s, self.order, shape)
         out = out.astype(np.float32)                              # (C, M)
         return out if pos is not None else out.reshape(recon.shape)

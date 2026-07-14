@@ -103,10 +103,13 @@ def test_autotune_improves_distortion_with_bounded_size_slack():
     assert tuned_stats["recon_sse"] <= flat_stats["recon_sse"]
 
 
-def test_fast_tune_is_single_flat_candidate():
+def test_fast_tune_is_single_candidate():
+    """Fast mode does a single encode at the predictor's fixed defaults: no
+    eb_ratio/center sweep. The 2-D interp default is center=0, eb_ratio=0.9."""
     img = smooth_image(96, 96, 1)[..., 0]
     kw = dict(levels=4, anchor_stride=8, anchor_block=4)
     _, stats = compress(img, 3.0, InterpPredictor(64, "cubic", **kw),
                         tune="fast", **kw)
-    assert stats["eb_ratio"] == 1.0
-    assert stats["interp_center"] == 0
+    assert stats["tune_candidates"] == 1
+    assert stats["eb_ratio"] == InterpPredictor.fast_eb_ratio  # 0.9
+    assert stats["interp_center"] == 0  # 2-D -> averaging centre

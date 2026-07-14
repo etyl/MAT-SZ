@@ -676,6 +676,8 @@ class GNNPredictor:
     stream_flag = _FLAG
     tile_free = True  # runs on the whole tensor as one region, no tiling
     tunable = True    # encoder sweeps eb_ratio (no centre mode; see codec.encode)
+    fast_eb_ratio = 0.8  # single-encode (tune=fast) default; tighter coarse
+                         # levels help the learned fine-level prediction
     provides_scale = True
     fp16 = False      # fp16 autocast on the message pass (encode/decode must match)
     compile = False   # torch.compile the embed pass (encode/decode must match)

@@ -16,7 +16,7 @@ from .bitstream import (DTYPE_CODES, DTYPE_IDS, FLAG_CUBIC, FLAG_GRAY,
                         FLAG_INTERP, FLAG_MOCK, FLAG_NOTILE, FLAG_RANS, Header,
                         pack_stage, read_stream, unpack_stage, write_stream)
 from .levels import stage_ebs, stage_masks
-from .predictor import InterpPredictor, MockPredictor
+from .predictor import InterpPredictor, MockPredictor, default_interp_center
 from .quantizer import dequantize, quantize
 from .rans import build_laplace_tables, model_bits, scale_to_level
 
@@ -159,12 +159,16 @@ def compress(
     # carries the full eb, so every candidate satisfies the bound.
     tunable = getattr(predictor, "tunable", False)
     has_center = hasattr(predictor, "center")
+    # Resolve a rank-aware ``center`` (None = auto) now that the region rank is
+    # known, so fast mode and the tune sweep both start from the right base.
+    if has_center and getattr(predictor, "center") is None:
+        predictor.center = default_interp_center(len(region_shape))
     if eb_ratio is not None:
         ratio_cands = [eb_ratio]
     elif tunable and tune != "fast":
         ratio_cands = [1.0, 0.9, 0.8, 0.7]
-    else:
-        ratio_cands = [1.0]
+    else:  # single encode: predictor's best fixed default (see fast_eb_ratio)
+        ratio_cands = [getattr(predictor, "fast_eb_ratio", 1.0)]
     base_center = getattr(predictor, "center", 0)
     center_cands = [base_center]
     if tunable and has_center and tune != "fast" and eb_ratio is None:
