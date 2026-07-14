@@ -7,7 +7,9 @@ torch = pytest.importorskip("torch")
 
 from scripts.train_gnn import (discretized_laplace_nll, sample_noise,
                                sample_synthetic_batch, mixed_batch_sizes,
-                               training_autocast, run_chunked_scene)
+                               normalize_tensor,
+                               prefetch_synthetic_batches, training_autocast,
+                               run_chunked_scene)
 from deepsz.gnn_predictor import build_model
 
 
@@ -64,6 +66,23 @@ def test_synthetic_batch_is_4d_normalized_and_reproducible():
     assert torch.equal(a, b)
 
 
+def test_eval_tensor_normalization_maps_extrema_to_unit_interval():
+    tensor = np.array([[-4.0, 1.0], [6.0, -1.5]], dtype=np.float64)
+
+    normalized = normalize_tensor(tensor)
+
+    assert normalized.dtype == np.float32
+    assert float(normalized.min()) == 0.0
+    assert float(normalized.max()) == 1.0
+    np.testing.assert_allclose(normalized, (tensor + 4.0) / 10.0)
+
+
+def test_eval_tensor_normalization_handles_constant_tensor():
+    normalized = normalize_tensor(np.full((2, 3), 7.0, dtype=np.float32))
+
+    np.testing.assert_array_equal(normalized, np.zeros((2, 3), np.float32))
+
+
 def test_synthetic_axis_smoothness_follows_correlation_lengths():
     shape = (24, 20, 16, 12)
     correlation = (5.0, 3.0, 1.5, 0.6)
@@ -92,6 +111,19 @@ def test_synthetic_fields_randomly_permute_correlation_axes():
                      for axis in range(4)]
         smoothest_axes.append(int(np.argmin(variation)))
     assert len(set(smoothest_axes)) > 1
+
+
+def test_synthetic_prefetch_preserves_seeded_sequence():
+    shape = (8, 6, 4, 4)
+    correlation = (3.0, 2.0, 1.0, 0.5)
+    expected_rng = np.random.default_rng(31)
+    expected = [sample_synthetic_batch(2, shape, correlation, expected_rng)
+                for _ in range(3)]
+
+    actual = list(prefetch_synthetic_batches(
+        2, shape, correlation, np.random.default_rng(31), 3))
+
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
 
 
 def test_mixed_batch_fraction_counts_scalar_points():

@@ -11,6 +11,7 @@ instead of an image decoded by PIL.
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import sys
 import time
@@ -23,6 +24,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deepsz.cli import add_common, build_predictor, run_compress
 from deepsz.codec import decompress
+
+
+def _cap_crop(arr: np.ndarray, stride: int, cap: int) -> np.ndarray:
+    """Centered crop with <= ``cap`` voxels, each edge a multiple of ``stride``
+    so the interp level schedule stays valid. Returns arr unchanged if it fits."""
+    if arr.size <= cap:
+        return arr
+    edge = max(int(cap ** (1.0 / arr.ndim)), stride)
+    edge -= edge % stride or 0
+    edge = max(edge, stride)
+    sl = tuple(slice((d - min(d, edge)) // 2, (d - min(d, edge)) // 2 + min(d, edge))
+               for d in arr.shape)
+    return np.ascontiguousarray(arr[sl])
+
+
+def report(label, arr, rec, nbytes, eb, t_comp=None, t_dec=None):
+    """One comparable line per codec: same PSNR (value-range peak) and bits/value."""
+    a = arr.astype(np.float64)
+    r = rec.reshape(arr.shape).astype(np.float64)
+    max_err = float(np.abs(a - r).max())
+    mse = float(np.mean((a - r) ** 2))
+    peak = 255.0 if arr.dtype == np.uint8 else max(float(arr.max()) - float(arr.min()), 1e-12)
+    psnr = 10 * np.log10(peak ** 2 / mse) if mse > 0 else float("inf")
+    bpv = 8 * nbytes / arr.size
+    ratio = arr.nbytes / nbytes
+    t = f"  {t_comp:.1f}s/{t_dec:.1f}s" if t_comp is not None else ""
+    print(f"  [{label:6s}] {nbytes:>10} B  ratio {ratio:7.2f}  {bpv:7.3f} bpv  "
+          f"PSNR {psnr:6.2f} dB  maxerr {max_err:.3g} "
+          f"{'PASS' if max_err <= eb else 'FAIL'}{t}")
+    return max_err <= eb
 
 
 def load_tensor(path: str) -> np.ndarray:
@@ -105,22 +136,51 @@ def main(argv=None):
         rec = decompress(stream, lambda hdr: build_predictor(args, hdr))
         t_dec = time.time() - t0
 
-    a = arr.astype(np.float64)
-    r = rec.reshape(arr.shape).astype(np.float64)
-    max_err = float(np.abs(a - r).max())
-    mse = float(np.mean((a - r) ** 2))
-    peak = 255.0 if arr.dtype == np.uint8 else max(float(arr.max()) - float(arr.min()), 1e-12)
-    psnr = 10 * np.log10(peak ** 2 / mse) if mse > 0 else float("inf")
-    bpv = 8 * len(stream) / arr.size
+    print(f"tensor {args.input} {arr.shape} {arr.dtype}, eb={eb} "
+          f"(orig {orig_bytes} B)")
+    main_label = "mock" if args.mock else args.predictor
+    bound_ok = report(main_label, arr, rec, len(stream), eb, t_comp, t_dec)
+    print(f"  ({main_label}: outliers {stats['outliers']} "
+          f"= {100*stats['outliers']/arr.size:.3f}%)")
 
-    bound_ok = max_err <= eb
-    ratio = orig_bytes / len(stream)
-    print(f"tensor {args.input} {arr.shape} {arr.dtype}, eb={eb}")
-    print(f"  compressed:  {len(stream)} bytes, ratio {ratio:.2f}, {bpv:.3f} bits/value")
-    print(f"  PSNR:        {psnr:.2f} dB")
-    print(f"  max abs err: {max_err} <= eb: {'PASS' if bound_ok else 'FAIL'}")
-    print(f"  outliers:    {stats['outliers']} ({100*stats['outliers']/arr.size:.3f}%)")
-    print(f"  time:        compress {t_comp:.1f}s, decompress {t_dec:.1f}s")
+    # Baselines at the identical eb. Two gotchas this handles:
+    #  * interp compresses the whole field un-chunked -> OOMs on a big field
+    #    (the GNN run chunks; interp doesn't), so it runs on a memory-capped crop.
+    #  * bits/value is NOT scale-invariant: a small crop costs more bpv than the
+    #    whole field for ANY codec. So sz3 runs on the SAME crop (fair vs interp)
+    #    AND on the full field (the headline vs the GNN).
+    # DEEPSZ_BASELINE_MAXVOX=0 disables the cap (interp whole-field; may OOM).
+    from deepsz.baselines import _sz3_pysz
+
+    def sz3(field):
+        tag = "sz3" if field.shape == arr.shape else f"sz3{list(field.shape)}"
+        try:
+            r = _sz3_pysz(np.ascontiguousarray(field, np.float32), eb)
+        except Exception as exc:  # pysz can reject high-rank shapes; keep going
+            print(f"  [{tag:6s}] failed: {exc}")
+            return
+        if r is not None:
+            report(tag, field, r[1], r[0], eb)
+
+    if main_label not in ("interp", "interp-linear"):
+        cap = int(os.environ.get("DEEPSZ_BASELINE_MAXVOX", 1 << 24))
+        sub = _cap_crop(arr, args.anchor_stride, cap) if cap else arr
+        cropped = sub.shape != arr.shape
+        bargs = copy.copy(args)
+        bargs.predictor, bargs.mock, bargs.tile = "interp", False, 512
+        t0 = time.time()
+        b_stream, _ = run_compress(sub, bargs)
+        b_tc = time.time() - t0
+        t0 = time.time()
+        b_rec = decompress(b_stream, lambda hdr: build_predictor(bargs, hdr))
+        report(f"interp{list(sub.shape) if cropped else ''}", sub, b_rec,
+               len(b_stream), eb, b_tc, time.time() - t0)
+        sz3(sub)                 # same crop -> fair interp-vs-sz3
+        if cropped:
+            sz3(arr)             # full field -> headline vs the GNN
+    else:
+        sz3(arr)
+
     if not bound_ok:
         raise SystemExit(1)
 

@@ -59,6 +59,18 @@ def load_tensor(path: str) -> np.ndarray:
     raise ValueError(f"unsupported extension: {path} (use .npy/.pt/.pth)")
 
 
+def normalize_tensor(tensor: np.ndarray) -> np.ndarray:
+    """Min-max normalize a finite tensor to the closed interval ``[0, 1]``."""
+    tensor = np.asarray(tensor, dtype=np.float32)
+    if not np.isfinite(tensor).all():
+        raise ValueError("cannot normalize an eval tensor containing NaN or infinity")
+    lo = float(tensor.min())
+    hi = float(tensor.max())
+    if hi == lo:
+        return np.zeros_like(tensor)
+    return (tensor - lo) / (hi - lo)
+
+
 @lru_cache(maxsize=1024)
 def _decode_rgb(path):
     """Decode the whole image once and keep it in RAM (uint8 RGB). Random crops
@@ -187,6 +199,26 @@ def prefetch_batches(paths, batch, crop, steps, workers):
                 futs.append(ex.submit(sample_batch, paths, batch, crop))
                 submitted += 1
             yield b
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
+def prefetch_synthetic_batches(batch, shape, correlation, rng, steps):
+    """Generate synthetic fields one step ahead on a CPU worker.
+
+    Gaussian filtering is CPU-bound and otherwise leaves the accelerator idle
+    between the image and synthetic passes.  A single worker preserves the
+    seeded RNG order while overlapping generation with the preceding GPU step.
+    """
+    ex = ThreadPoolExecutor(max_workers=1)
+    future = ex.submit(sample_synthetic_batch, batch, shape, correlation, rng)
+    try:
+        for i in range(steps):
+            result = future.result()
+            if i + 1 < steps:
+                future = ex.submit(sample_synthetic_batch, batch, shape,
+                                   correlation, rng)
+            yield result
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
 
@@ -577,6 +609,9 @@ def main():
     ap.add_argument("--out", default=str(Path(__file__).resolve().parent.parent
                                          / "data" / "gnn_predictor.pt"))
     ap.add_argument("--steps", type=int, default=3000)
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="save a numbered checkpoint every N steps "
+                         "(0 disables periodic checkpoints)")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--crop", type=int, default=128)
     ap.add_argument("--synthetic-frac", type=float, default=0.5,
@@ -631,6 +666,9 @@ def main():
                          "distortion / rate / peak-RAM / inference-time to wandb")
     ap.add_argument("--eval-tensor-eb", type=float, default=None,
                     help="absolute error bound for --eval-tensor (default: --eval-eb)")
+    ap.add_argument("--eval-tensor-normalize", action="store_true",
+                    help="min-max normalize --eval-tensor to [0,1] before its "
+                         "codec roundtrip (the error bound is then in normalized units)")
     ap.add_argument("--eval-tensor-every", type=int, default=500,
                     help="run the --eval-tensor codec roundtrip every N steps "
                          "(full compress+decompress; keep it a multiple of eval-every)")
@@ -676,6 +714,8 @@ def main():
         raise SystemExit("--synthetic-stride must be a power of two >= 2")
     if args.agg_level < 1:
         raise SystemExit("--agg-level must be >= 1")
+    if args.save_every < 0:
+        raise SystemExit("--save-every must be >= 0")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -765,11 +805,13 @@ def main():
                       else args.eval_tensor_eb)
     if args.eval_tensor:
         eval_tensor = load_tensor(args.eval_tensor).astype(np.float32)
-        print(f"eval-tensor: {args.eval_tensor} {eval_tensor.shape} "
-              f"eb={eval_tensor_eb}")
+        if args.eval_tensor_normalize:
+            eval_tensor = normalize_tensor(eval_tensor)
 
     run_loss = 0.0
     last_eval = float("nan")
+    last_tensor_metrics = None
+    last_saved_step = None
 
     prof = None
     if args.profile:
@@ -784,19 +826,20 @@ def main():
         prof.start()
         args.steps = args.profile + 2  # wait + warmup + active
 
+    # These weights are constant for the run. Both generators maintain CPU
+    # work ahead of the training loop after their first batch is requested.
+    image_weight = 1.0 - synthetic_point_fraction
+    synthetic_weight = synthetic_point_fraction
     batches = prefetch_batches(paths, image_batch, args.crop, args.steps,
                                args.workers)
+    synthetic_batches = (prefetch_synthetic_batches(
+        synthetic_batch, tuple(args.synthetic_shape),
+        tuple(args.synthetic_correlation), synthetic_rng, args.steps)
+        if synthetic_weight else None)
     bar = tqdm(range(1, args.steps + 1), desc="train")
     for step in bar:
         opt.zero_grad()
-        # Weight each source mean by its *actual number of scalar points* in
-        # this mixed batch. Thus the objective is the mean over all points used
-        # by the step, including rounding needed for indivisible examples.
-        image_weight = 1.0 - synthetic_point_fraction
-        synthetic_weight = synthetic_point_fraction
-        combined_loss = 0.0
-        combined_mae = 0.0
-        train_log = {}
+        metric_tensors = {}
 
         # The 2-D and 4-D examples cannot share a rectangular tensor batch.
         # Run them sequentially and backward immediately so their gradients
@@ -823,16 +866,12 @@ def main():
             image_loss = nll / max(npix, 1)
             image_mae = aux["abs_err"].detach() / max(npix, 1)
             scaler.scale(image_weight * image_loss).backward()
-            combined_loss += image_weight * image_loss.item()
-            combined_mae += image_weight * image_mae.item()
-            train_log.update({"train/image_bpp": image_loss.item(),
-                              "train/image_mae": image_mae.item()})
+            metric_tensors.update({"train/image_bpp": image_loss.detach(),
+                                   "train/image_mae": image_mae})
 
         if synthetic_weight:
             field_shape = tuple(args.synthetic_shape)
-            x = sample_synthetic_batch(
-                synthetic_batch, field_shape,
-                args.synthetic_correlation, synthetic_rng).to(device)
+            x = next(synthetic_batches).to(device)
             stride = args.synthetic_stride
             levels = args.levels or stride.bit_length() - 1
             eb = sample_noise(x.shape[0], args, device)
@@ -846,18 +885,34 @@ def main():
             synthetic_loss = nll / max(npix, 1)
             synthetic_mae = aux["abs_err"].detach() / max(npix, 1)
             scaler.scale(synthetic_weight * synthetic_loss).backward()
-            combined_loss += synthetic_weight * synthetic_loss.item()
-            combined_mae += synthetic_weight * synthetic_mae.item()
-            train_log.update({"train/synthetic_bpp": synthetic_loss.item(),
-                              "train/synthetic_mae": synthetic_mae.item()})
+            metric_tensors.update({
+                "train/synthetic_bpp": synthetic_loss.detach(),
+                "train/synthetic_mae": synthetic_mae})
 
         scaler.step(opt)
         scaler.update()
         sched.step()
-        run_loss += combined_loss
-        train_log.update({"train/bpp": combined_loss,
-                          "train/mae": combined_mae,
-                          "train/synthetic_point_fraction":
+        combined_loss = sum(
+            weight * metric_tensors[key]
+            for weight, key in ((image_weight, "train/image_bpp"),
+                                (synthetic_weight, "train/synthetic_bpp"))
+            if weight)
+        combined_mae = sum(
+            weight * metric_tensors[key]
+            for weight, key in ((image_weight, "train/image_mae"),
+                                (synthetic_weight, "train/synthetic_mae"))
+            if weight)
+        metric_tensors.update({"train/bpp": combined_loss,
+                               "train/mae": combined_mae})
+        # Transfer all scalar metrics together.  Calling .item() for the image
+        # metrics before launching the synthetic pass introduced several host
+        # synchronizations and exposed the CPU field-generation latency.
+        names = tuple(metric_tensors)
+        values = torch.stack([metric_tensors[name].float()
+                              for name in names]).cpu().tolist()
+        train_log = dict(zip(names, values))
+        run_loss += train_log["train/bpp"]
+        train_log.update({"train/synthetic_point_fraction":
                               synthetic_point_fraction,
                           "lr": sched.get_last_lr()[0]})
         wandb.log(train_log, step=step)
@@ -898,17 +953,28 @@ def main():
                                              eval_tensor_ckpt)
             model.train()
             wandb.log(tmetrics, step=step)
-            print(f"[{step}] eval-tensor: "
-                  f"PSNR={tmetrics['eval_tensor/psnr_db']:.2f}dB "
-                  f"bpv={tmetrics['eval_tensor/bits_per_value']:.3f} "
-                  f"maxerr={tmetrics['eval_tensor/max_abs_err']:.3g} "
-                  f"host={tmetrics['eval_tensor/peak_host_mb']:.0f}MB "
-                  f"enc={tmetrics['eval_tensor/compress_s']:.2f}s "
-                  f"dec={tmetrics['eval_tensor/decompress_s']:.2f}s")
+            last_tensor_metrics = tmetrics
+
+        if args.save_every and step % args.save_every == 0:
+            checkpoint = run_dir / f"{out.stem}-step-{step:06d}{out.suffix}"
+            torch.save({
+                "state_dict": model.state_dict(),
+                "d": args.d,
+                "version": CKPT_VERSION,
+            }, checkpoint)
+            last_saved_step = step
 
         if step % 100 == 0:
-            bar.set_postfix(bpp=f"{run_loss / 100:.5f}",
-                            eval_bpp=f"{last_eval:.5f}")
+            postfix = {"bpp": f"{run_loss / 100:.5f}",
+                       "eval_bpp": f"{last_eval:.5f}"}
+            if last_tensor_metrics is not None:
+                postfix["tensor_bpv"] = (
+                    f"{last_tensor_metrics['eval_tensor/bits_per_value']:.3f}")
+                postfix["tensor_psnr"] = (
+                    f"{last_tensor_metrics['eval_tensor/psnr_db']:.2f}")
+            if last_saved_step is not None:
+                postfix["saved"] = last_saved_step
+            bar.set_postfix(postfix)
             run_loss = 0.0
 
         if prof is not None:
