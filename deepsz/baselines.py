@@ -23,7 +23,7 @@ _pysz_warned = False
 def _sz3_pysz(channel: np.ndarray, eb: float) -> tuple[int, np.ndarray] | None:
     global _pysz_warned
     try:
-        from pysz import sz, szConfig, szErrorBoundMode
+        from pysz import sz, szAlgorithm, szConfig, szErrorBoundMode
     except ImportError as exc:
         if not _pysz_warned:  # ponytail: warn once, not once per channel
             print(f"[sz3] pysz unavailable ({exc}); `pip install pysz` or "
@@ -33,6 +33,11 @@ def _sz3_pysz(channel: np.ndarray, eb: float) -> tuple[int, np.ndarray] | None:
     config = szConfig()
     config.errorBoundMode = szErrorBoundMode.ABS
     config.absErrorBound = eb
+    # Use SZ3's tuned hybrid explicitly instead of relying on szConfig's
+    # version-dependent default.  INTERP_LORENZO profiles the field and tunes
+    # interpolation order/direction and its error-distribution parameters,
+    # selecting the best-rate prediction path at this error bound.
+    config.cmprAlgo = szAlgorithm.INTERP_LORENZO
     compressed, _ratio = sz.compress(channel, config)
     rec, _cfg = sz.decompress(compressed, channel.dtype, channel.shape)
     return len(compressed), rec

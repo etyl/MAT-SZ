@@ -37,7 +37,8 @@ def v5_ckpt(tmp_path):
 def _codec(path, *, eb=1e-2, chunk_size):
     return GNNCompressorCodec(
         path, error_bound=eb, levels=LEVELS, anchor_stride=STRIDE,
-        anchor_block=1, max_radius=4, chunk_size=chunk_size)
+        anchor_block=1, max_radius=4, chunk_size=chunk_size,
+        fp16=False, compile=False)
 
 
 def _maxerr(y, x):
@@ -152,7 +153,8 @@ def test_fp16_flag_roundtrips_and_persists(v5_ckpt):
     x = rng.rand(8, 8).astype(np.float32)
     codec = GNNCompressorCodec(
         v5_ckpt, error_bound=0.02, levels=LEVELS, anchor_stride=STRIDE,
-        anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=True)
+        anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=True,
+        compile=False)
 
     stream = codec.compress(x)
     meta, _ = _read_stream(bytes(stream))
@@ -169,7 +171,8 @@ def test_compile_flag_roundtrips_and_persists(v5_ckpt):
     x = rng.rand(8, 8).astype(np.float32)
     codec = GNNCompressorCodec(
         v5_ckpt, error_bound=0.02, levels=LEVELS, anchor_stride=STRIDE,
-        anchor_block=1, max_radius=4, chunk_size=STRIDE, compile=True)
+        anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=False,
+        compile=True)
 
     stream = codec.compress(x)
     meta, _ = _read_stream(bytes(stream))

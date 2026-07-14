@@ -47,7 +47,9 @@ pip install -e ".[test]"
 ```python
 from deepsz import GNNCodec
 
-codec = GNNCodec("path/to/gnn_checkpoint.pt", error_bound=1e-3)
+# Defaults match eval_tensor.sh: eb=.01, levels/stride/chunk=5/32/32,
+# agg_level=2, chunk_batch=1, fp16 + torch.compile enabled.
+codec = GNNCodec("path/to/gnn_checkpoint.pt")
 
 compressed = codec.compress(array_or_tensor)  # numpy array or torch tensor, any rank
 reconstructed = codec.uncompress(compressed)  # torch.Tensor

@@ -30,7 +30,24 @@ def _codec(path, eb=1e-3):
         anchor_stride=4,
         anchor_block=1,
         max_radius=4,
+        chunk_size=0,
+        fp16=False,
+        compile=False,
     )
+
+
+def test_defaults_match_eval_tensor(tiny_checkpoint):
+    codec = GNNCompressorCodec(tiny_checkpoint)
+
+    assert codec.error_bound == 0.01
+    assert codec.levels == 5
+    assert codec.anchor_stride == 32
+    assert codec.anchor_block == 1
+    assert codec.agg_level == 2
+    assert codec.chunk_size == 32
+    assert codec.chunk_batch == 1
+    assert codec.fp16 is True
+    assert codec.compile is True
 
 
 def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):

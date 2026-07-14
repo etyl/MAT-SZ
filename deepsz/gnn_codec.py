@@ -475,23 +475,23 @@ class GNNCompressorCodec:
     def __init__(
         self,
         checkpoint_path: str | Path,
-        error_bound: float = 1e-3,
+        error_bound: float = 1e-2,
         *,
-        levels: int = 4,
-        anchor_stride: int = 16,
+        levels: int = 5,
+        anchor_stride: int = 32,
         anchor_block: int = 1,
         radius: int = 1 << 15,
         max_radius: int = 64,
-        agg_level: int | None = None,
+        agg_level: int | None = 2,
         device: str | None = None,   # None -> cuda if available, else cpu
         zstd_level: int = 9,
         eb_ratio: float | None = None,  # None = auto: fast -> 0.8, size -> sweep
         tune: str = "fast",
         strict_checkpoint: bool = True,
-        chunk_size: int | tuple[int, ...] | None = None,
-        chunk_batch: int | None = None,
-        fp16: bool = False,
-        compile: bool = False,
+        chunk_size: int | tuple[int, ...] | None = 32,
+        chunk_batch: int | None = 1,
+        fp16: bool = True,
+        compile: bool = True,
         overlap: bool = False,
     ):
         self.checkpoint_path = Path(checkpoint_path)

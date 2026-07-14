@@ -20,7 +20,7 @@ DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak}
 # D128 checkpoint
 # CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
 # D32 checkpoint
-CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-232158-afc995/gnn_predictor.pt}
+CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260714-095239-e16d09/gnn_predictor.pt}
 
 TUNE=${TUNE:-rd}               # fast (1 encode) | size/rd (4 encodes)
 TUNE_SIZE_SLACK=${TUNE_SIZE_SLACK:-1.05}
