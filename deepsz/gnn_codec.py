@@ -490,7 +490,7 @@ class GNNCompressorCodec:
         strict_checkpoint: bool = True,
         chunk_size: int | tuple[int, ...] | None = 32,
         chunk_batch: int | None = 1,
-        fp16: bool = True,
+        fp16: bool = False,
         compile: bool = True,
         overlap: bool = False,
     ):
