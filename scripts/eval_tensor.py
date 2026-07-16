@@ -98,6 +98,17 @@ def main(argv=None):
                     help="gnn only: torch.compile the message-pass embed (fuses "
                          "the elementwise ~40%%; one-off compile cost on first "
                          "chunk). Same float path replayed at decode")
+    ap.add_argument("--codec", choices=("gnn", "skel"), default="gnn",
+                    help="gnn only: 'gnn' = the chunked GNN codec (default); "
+                         "'skel' = SkeletonGNNCodec (anchor-grid lines coded "
+                         "globally with SZ interp, chunk interiors by the GNN)")
+    ap.add_argument("--line-order", choices=("cubic", "linear"), default="cubic",
+                    help="skel codec only: interpolation order for the global "
+                         "line pass")
+    ap.add_argument("--interfaces", action="store_true",
+                    help="skel codec only: Milestone B -- code chunk-boundary "
+                         "interiors (interfaces) in a global phase 1 so a chunk's "
+                         "strict interiors see the neighbour's reconstructed face")
     args = ap.parse_args(argv)
 
     arr = load_tensor(args.input)
@@ -117,9 +128,8 @@ def main(argv=None):
         # GNNCompressorCodec auto-chunks large tensors; the codec.compress path
         # allocates a dense embedding field over the whole tensor and OOMs.
         os.environ.setdefault("DEEPSZ_PROGRESS", "1")  # per-chunk progress to stderr
-        from deepsz.gnn_codec import GNNCompressorCodec
-        codec = GNNCompressorCodec(
-            args.gnn_checkpoint, error_bound=eb, levels=args.levels,
+        codec_kw = dict(
+            error_bound=eb, levels=args.levels,
             anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
             agg_level=args.agg_level,
             radius=args.radius, zstd_level=args.zstd_level,
@@ -127,6 +137,17 @@ def main(argv=None):
             tune=args.tune if args.tune in ("fast", "size") else "fast",
             chunk_size=args.chunk_size, chunk_batch=args.chunk_batch,
             fp16=args.fp16, compile=args.compile, overlap=args.overlap)
+        if args.codec == "skel":
+            from deepsz.skel_codec import SkeletonGNNCodec
+            # skel always chunks (global line context across seams); overlap is a
+            # chunked-GNN-only knob, so drop it from the skeleton construction.
+            codec_kw.pop("overlap")
+            codec = SkeletonGNNCodec(args.gnn_checkpoint,
+                                     line_order=args.line_order,
+                                     interfaces=args.interfaces, **codec_kw)
+        else:
+            from deepsz.gnn_codec import GNNCompressorCodec
+            codec = GNNCompressorCodec(args.gnn_checkpoint, **codec_kw)
         t0 = time.time()
         stream = codec.compress(arr)
         t_comp = time.time() - t0
@@ -145,7 +166,9 @@ def main(argv=None):
 
     print(f"tensor {args.input} {arr.shape} {arr.dtype}, eb={eb} "
           f"(orig {orig_bytes} B)")
-    main_label = "mock" if args.mock else args.predictor
+    main_label = ("mock" if args.mock else
+                  "skel" if args.predictor == "gnn" and args.codec == "skel"
+                  else args.predictor)
     bound_ok = report(main_label, arr, rec, len(stream), eb, t_comp, t_dec)
     print(f"  ({main_label}: outliers {stats['outliers']} "
           f"= {100*stats['outliers']/arr.size:.3f}%)")

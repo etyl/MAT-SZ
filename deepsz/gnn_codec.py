@@ -26,6 +26,7 @@ from .rans import build_laplace_tables, scale_to_level
 _MAGIC = b"MATSZGNN"
 _VERSION = 2          # whole-tensor streams
 _VERSION_CHUNKED = 3  # chunk-major streams (global anchors + per-chunk stages)
+_VERSION_SKEL = 4     # skeleton streams (global anchors + lines + chunk interiors)
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
 
@@ -117,7 +118,7 @@ def _read_stream(stream: bytes) -> tuple[dict[str, Any], bytes]:
     magic, version, header_len = struct.unpack_from(_PREFIX, stream, 0)
     if magic != _MAGIC:
         raise ValueError(f"not a DeepSZ GNN stream (bad magic {magic!r})")
-    if version not in (_VERSION, _VERSION_CHUNKED):
+    if version not in (_VERSION, _VERSION_CHUNKED, _VERSION_SKEL):
         raise ValueError(f"unsupported DeepSZ GNN stream version {version}")
     off = _PREFIX_SIZE
     meta = json.loads(stream[off:off + header_len].decode("utf-8"))
@@ -486,6 +487,11 @@ class GNNCompressorCodec:
     dtype.
     """
 
+    # Chunked-inference predictor class; subclasses (e.g. the skeleton codec)
+    # swap in a halo-free variant. Kept as an attribute to avoid importing the
+    # subclass here (that module imports this one).
+    _CHUNKED_PREDICTOR = ChunkedGNNPredictor
+
     def __init__(
         self,
         checkpoint_path: str | Path,
@@ -750,7 +756,7 @@ class GNNCompressorCodec:
         anchor_block = (self.anchor_block if meta is None
                         else int(meta["anchor_block"]))
         agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
-        predictor = ChunkedGNNPredictor(
+        predictor = self._CHUNKED_PREDICTOR(
             self.checkpoint_path,
             vmin,
             vmax,

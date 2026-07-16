@@ -3,6 +3,8 @@
 
 from .codec import compress, decompress
 from .gnn_codec import GNNCodec, GNNCompressorCodec
+from .skel_codec import SkeletonGNNCodec
 
-__all__ = ["compress", "decompress", "GNNCompressorCodec", "GNNCodec"]
+__all__ = ["compress", "decompress", "GNNCompressorCodec", "GNNCodec",
+           "SkeletonGNNCodec"]
 __version__ = "0.1.0"
