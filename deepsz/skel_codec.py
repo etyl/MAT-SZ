@@ -33,6 +33,7 @@ from .gnn_codec import (
     _decode_anchor_stage,
     _dtype_meta,
     _log,
+    _progress_bar,
     _VERSION_SKEL,
     _read_stream,
     _restore_dtype,
@@ -528,13 +529,19 @@ def _compress_skeleton(values, ebs, radius, round_output, predictor, edges,
                              radius, order, round_output)
     _log(f"skel encode: shape={shape} edges={edges} anchors+lines done")
     predictor.begin(shape, edges, channels=c)
+    _log("skel encode: chunk geometry ready, sizing model batch...")
     B_cap = predictor.max_batch(tuple(min(e, n) for e, n in zip(edges, shape)))
     if batch_cap is not None:
         B_cap = max(1, min(B_cap, int(batch_cap)))
     predictor.chunk_batch = B_cap
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     mask_cache: dict = {}
-    for group in _skel_waves(predictor.grid):
+    waves = _skel_waves(predictor.grid)
+    n_sub = sum(-(-len(group) // B_cap) for group in waves)
+    _log(f"skel encode: {predictor.n_chunks} chunks, batch={B_cap}, "
+         f"{n_sub} model-waves")
+    bar = _progress_bar("skel encode", predictor.n_chunks, unit="chunk")
+    for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
             cshape = tuple(sl.stop - sl.start
@@ -566,6 +573,8 @@ def _compress_skeleton(values, ebs, radius, round_output, predictor, edges,
                             scale[bi][sel][None, :], ebs[s]).reshape(-1),
                         rans_tables=stage_tables[s]))
             predictor.finish_wave(recon)
+            bar.update(len(ids))
+    bar.close()
     return b"".join(parts)
 
 
@@ -583,7 +592,12 @@ def _decompress_skeleton(payload, shape, ebs, radius, predictor, edges, batch,
     B_cap = max(1, int(batch))
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     mask_cache: dict = {}
-    for group in _skel_waves(predictor.grid):
+    waves = _skel_waves(predictor.grid)
+    n_sub = sum(-(-len(group) // B_cap) for group in waves)
+    _log(f"skel decode: {predictor.n_chunks} chunks, batch={B_cap}, "
+         f"{n_sub} model-waves")
+    bar = _progress_bar("skel decode", predictor.n_chunks, unit="chunk")
+    for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
             cshape = tuple(sl.stop - sl.start
@@ -612,6 +626,8 @@ def _decompress_skeleton(payload, shape, ebs, radius, predictor, edges, batch,
                         pred[bi][sel][None, :], codes, outliers, ebs[s],
                         radius).reshape(c, n_int)
             predictor.finish_wave(recon)
+            bar.update(len(ids))
+    bar.close()
     if off != len(payload):
         raise ValueError("trailing bytes in skeleton payload")
     return recon[0]
@@ -641,6 +657,9 @@ def _skel_iface_passes(values, recon, ebs, radius, round_output, predictor,
     sub_cache: dict = {}
     for phase, known_pred in (("iface", known_iface),
                               ("interior", known_interior)):
+        direction = "decode" if decode else "encode"
+        bar = _progress_bar(f"skel {phase} {direction}", predictor.n_chunks,
+                            unit="chunk")
         for ci in range(predictor.n_chunks):
             sls = predictor.chunk_slices(ci)
             origin = np.array([sl.start for sl in sls], np.int64)
@@ -655,6 +674,7 @@ def _skel_iface_passes(values, recon, ebs, radius, round_output, predictor,
                                 predictor.agg_level)
                 sub_cache[key] = sub
             if len(sub.chain) <= 1:                 # no query cells this phase
+                bar.update(1)
                 continue
             predictor.start_sub(ci, recon, sub, known_pred)
             for jj in range(1, len(sub.chain)):
@@ -680,6 +700,8 @@ def _skel_iface_passes(values, recon, ebs, radius, round_output, predictor,
                     parts.append(pack_stage(codes, outliers, rans_levels=lvl,
                                             rans_tables=stage_tables[s]))
             predictor.finish_sub()
+            bar.update(1)
+        bar.close()
     return off if decode else parts
 
 

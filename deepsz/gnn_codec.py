@@ -59,10 +59,10 @@ def _cuda_peak(predictor):
     return peak
 
 
-def _progress_bar(tag, n):
+def _progress_bar(tag, n, unit="wave"):
     # env-gated (DEEPSZ_PROGRESS) so tests/CLI stay quiet; disabled bar is a no-op.
     from tqdm import tqdm
-    return tqdm(total=n, desc=tag, unit="wave", file=sys.stderr,
+    return tqdm(total=n, desc=tag, unit=unit, file=sys.stderr,
                 disable=not os.environ.get("DEEPSZ_PROGRESS"))
 
 
@@ -311,7 +311,9 @@ def _compress_chunked(
          f"coding anchors...")
     parts = [_code_anchor_stage(values, recon, axes, ebs[0], radius,
                                 round_output)]
+    _log("encode: anchors quantized, building chunk geometry...")
     predictor.begin(shape, edges, channels=c)
+    _log("encode: chunk geometry ready, initializing anchor context...")
     predictor.anchor_coarse(recon)
     B_cap = predictor.max_batch(tuple(min(e, n) for e, n in zip(edges, shape)))
     if batch_cap is not None:                        # user cap (never above safe)
@@ -319,6 +321,7 @@ def _compress_chunked(
     predictor.chunk_batch = B_cap                    # surfaced into stream meta
     waves = _chunk_waves(predictor.grid)
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
+    _log("encode: anchor context ready, building stage schedule...")
     _log(f"encode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
          f"{n_sub} model-waves")
     # Optional background rANS: pack_stage runs on a worker while the main thread
@@ -365,7 +368,7 @@ def _compress_chunked(
 
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     mask_cache: dict = {}    # cshape -> (stage masks, per-stage counts)
-    bar = _progress_bar("encode", n_sub)
+    bar = _progress_bar("encode", predictor.n_chunks, unit="chunk")
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
@@ -401,7 +404,7 @@ def _compress_chunked(
             peak = _cuda_peak(predictor)
             if peak:
                 bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
-            bar.update(1)
+            bar.update(len(ids))
     bar.close()
     if overlap:
         task_q.put(None)
@@ -432,11 +435,12 @@ def _decompress_chunked(
     B_cap = max(1, int(batch))
     waves = _chunk_waves(predictor.grid)
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
+    _log("decode: anchor context ready, building stage schedule...")
     _log(f"decode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
          f"{n_sub} model-waves")
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     mask_cache: dict = {}    # cshape -> (stage masks, per-stage counts)
-    bar = _progress_bar("decode", n_sub)
+    bar = _progress_bar("decode", predictor.n_chunks, unit="chunk")
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
@@ -471,7 +475,7 @@ def _decompress_chunked(
             peak = _cuda_peak(predictor)
             if peak:
                 bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
-            bar.update(1)
+            bar.update(len(ids))
     bar.close()
     if off != len(payload):
         raise ValueError("trailing bytes in DeepSZ GNN payload")

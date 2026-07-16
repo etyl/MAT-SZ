@@ -111,7 +111,12 @@ def _nearest_steps_at(pat: np.ndarray, dvec, P: int, res) -> np.ndarray:
     path. ponytail: tile capped at 2^20 cells (4-D at stride 32); beyond that
     fall back to the direct path rather than build a giant tile."""
     M = len(res[0])
-    if pat.size > 1 << 20 or pat.size > P * M:
+    # Both paths scan up to P steps. The full-tile path therefore costs
+    # O(P * pat.size), not O(pat.size); compare pat.size directly with M.
+    # The old ``pat.size > P*M`` test switched to a 32^4 tile at the first
+    # finest 4-D stage (M=16^4), doing ~16x excess work per direction and
+    # retaining each million-entry result in the cache.
+    if pat.size > 1 << 20 or pat.size > M:
         return _nearest_steps(pat, dvec, P, res)
     key = (pat.tobytes(), pat.shape, tuple(int(c) for c in dvec), P)
     tile = _NEAREST_TILE_CACHE.get(key)
@@ -842,18 +847,37 @@ class _ChunkGeoms:
         self.padded_shape = tuple(n + 2 * stride for n in self.chunk_shape)
         self.n_padded = int(np.prod(self.padded_shape))
 
-        masks = stage_masks(self.chunk_shape, levels, stride, block)
-        pats = _period_prefixes(self.chunk_shape, levels, stride, block)
-        self.geoms, self.coords = [], []   # per stage; None for empty stages
-        for s, mask in enumerate(masks):
-            Q = np.stack(np.nonzero(mask), axis=1)   # chunk-frame coords
-            if not len(Q):
-                self.geoms.append(None)
-                self.coords.append(None)
-                continue
-            self.geoms.append(_StageGeom(pats[s], Q + stride, self.padded_shape,
-                                         stride, torch, device, agg_level))
-            self.coords.append(Q)
+        # Geometry construction can dominate startup for high-rank chunks. Show
+        # its two schedule-building steps and every per-stage geometry so a cold
+        # cache does not look like a stalled GPU model.
+        from tqdm import tqdm
+        n_stages = 1 + levels * ((1 << ndim) - 1)
+        bar = tqdm(total=n_stages + 2,
+                   desc=f"geometry {'x'.join(map(str, self.chunk_shape))}",
+                   unit="step", mininterval=1.0,
+                   disable=not os.environ.get("DEEPSZ_PROGRESS"))
+        try:
+            bar.set_postfix_str("stage masks")
+            masks = stage_masks(self.chunk_shape, levels, stride, block)
+            bar.update(1)
+            bar.set_postfix_str("period patterns")
+            pats = _period_prefixes(self.chunk_shape, levels, stride, block)
+            bar.update(1)
+            self.geoms, self.coords = [], []  # per stage; None for empty stages
+            for s, mask in enumerate(masks):
+                bar.set_postfix_str(f"stage {s}/{len(masks) - 1}")
+                Q = np.stack(np.nonzero(mask), axis=1)  # chunk-frame coords
+                if not len(Q):
+                    self.geoms.append(None)
+                    self.coords.append(None)
+                else:
+                    self.geoms.append(_StageGeom(
+                        pats[s], Q + stride, self.padded_shape, stride, torch,
+                        device, agg_level))
+                    self.coords.append(Q)
+                bar.update(1)
+        finally:
+            bar.close()
         # prediction chain: stage 0 is always the base (anchors, possibly empty
         # in a ragged tail chunk -> None geom, nothing to finalize), followed by
         # every non-empty refinement stage in order.
