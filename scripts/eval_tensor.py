@@ -87,6 +87,9 @@ def main(argv=None):
                     help="gnn only: fp16 autocast on the GNN message pass (cuda; "
                          "~2x forward, readout stays fp32). May cost a little ratio "
                          "at small eb -- compare bits/value with and without")
+    ap.add_argument("--normalize", action="store_true",
+                    help="min-max scale the tensor to [0,1] before compressing, so "
+                         "eb is comparable across tensors of different raw scale")
     ap.add_argument("--overlap", action="store_true",
                     help="gnn chunked only: pack the per-stage rANS on a "
                          "background thread so it hides behind the next stage's "
@@ -102,6 +105,10 @@ def main(argv=None):
     if arr.dtype == np.float64:  # codec pipeline is float32; store as such
         print("note: float64 input cast to float32 (float32-precision reconstruction)")
         arr = arr.astype(np.float32)
+    if args.normalize:
+        lo, hi = float(arr.min()), float(arr.max())
+        arr = ((arr.astype(np.float32) - lo) / max(hi - lo, 1e-12))
+        print(f"normalized [{lo:.4g},{hi:.4g}] -> [0,1]")
     eb = args.eb
     if args.rel:
         eb = args.eb * max(float(arr.max()) - float(arr.min()), 1.0)

@@ -107,41 +107,90 @@ def sample_batch(paths, batch, crop):
 
 
 def sample_synthetic_batch(batch, shape, correlation, rng=None,
-                           permute_axes=True):
-    """Return smooth anisotropic Gaussian random fields in ``[0, 1]``.
+                           randomize=True, device="cpu"):
+    """Return smooth scientific-like random fields in ``[0, 1]``.
 
-    The entries of ``correlation`` are Gaussian smoothing sigmas in grid cells;
-    a larger value makes adjacent values more correlated. By default their axis
-    assignment is independently shuffled for each field, preventing the model
-    from memorizing that one fixed axis is always the most useful. Two filtered
-    scales keep samples richer than a single blurred-noise realization.
-    Reflecting boundaries avoid teaching the model an artificial periodic seam.
+    Instead of one fixed texture, each field randomizes its generative knobs so
+    the training distribution *covers* the variety real scientific fields show,
+    rather than memorizing a single one — a narrow prior is exactly what a
+    high-capacity model overfits (it then generalizes worse on out-of-domain
+    eval even as train/in-domain loss improves). Per field we randomize:
+
+      * smoothness & anisotropy: a per-field base sigma is drawn log-uniformly
+        within the band set by ``correlation`` (its min/max); each axis then
+        jitters off it by a per-field random spread, so the axis-ratio itself
+        ranges from near-isotropic (spread~0) to strongly anisotropic;
+      * spectrum: a fine scale plus a 2x-coarser one, keeping two-scale content;
+      * value marginal: a random monotone warp (identity / signed power / tanh)
+        yields unimodal, skewed, or bimodal histograms.
+
+    Filtering runs as an FFT product on ``device`` (mirror-doubling each axis
+    gives an exact 'reflect' boundary, avoiding an artificial periodic seam),
+    so generation is GPU-fast and its cost is independent of sigma. Random
+    knobs and the raw noise come from the numpy ``rng``, keeping seeded runs
+    reproducible. ``randomize=False`` is the deterministic single-texture path
+    (exact ``correlation`` per axis, Gaussian marginal) for diagnostics.
     """
-    from scipy.ndimage import gaussian_filter
-
     shape = tuple(int(n) for n in shape)
     correlation = tuple(float(s) for s in correlation)
     rng = np.random.default_rng() if rng is None else rng
-    fields = []
+    ndim = len(shape)
+    lo_s, hi_s = min(correlation) * 0.5, max(correlation)
+    sigmas, warps = [], []
     for _ in range(batch):
-        sigma = correlation
-        if permute_axes:
-            sigma = tuple(np.asarray(correlation)[rng.permutation(len(shape))])
-        fine = gaussian_filter(rng.standard_normal(shape), sigma=sigma,
-                               mode="reflect")
-        coarse = gaussian_filter(rng.standard_normal(shape),
-                                 sigma=tuple(2.0 * s for s in sigma),
-                                 mode="reflect")
-        field = fine + 0.5 * coarse
+        if randomize:
+            base = float(np.exp(rng.uniform(np.log(lo_s), np.log(hi_s))))
+            spread = float(rng.uniform(0.0, 1.0))  # 0 isotropic -> large aniso
+            sigmas.append([max(0.3, base * float(np.exp(rng.normal(0.0, spread))))
+                           for _ in range(ndim)])
+            kind = int(rng.integers(3))
+            param = (float(rng.uniform(0.4, 3.0)) if kind == 1   # power
+                     else float(rng.uniform(1.5, 4.0)))          # tanh gain
+            warps.append((kind, param))
+        else:
+            sigmas.append(list(correlation))
+            warps.append((0, 0.0))
+    # Fine noise plus an independent 2x-coarser realization, filtered in one
+    # batched FFT: rows [0, B) are fine, rows [B, 2B) their coarse partners.
+    sig = torch.tensor(sigmas + [[2.0 * s for s in row] for row in sigmas],
+                       dtype=torch.float32, device=device)
+    x = torch.from_numpy(rng.standard_normal((2 * batch, *shape))
+                         .astype(np.float32)).to(device)
+    dims = tuple(range(1, ndim + 1))
+    for ax in dims:                       # even extension -> exact 'reflect'
+        x = torch.cat([x, x.flip(ax)], dim=ax)
+    spec = torch.fft.rfftn(x, dim=dims)
+    for k, n in enumerate(shape):
+        f = (torch.fft.rfftfreq if k == ndim - 1
+             else torch.fft.fftfreq)(2 * n, device=device)
+        g = torch.exp(-2.0 * (math.pi * f) ** 2 * sig[:, k, None] ** 2)
+        spec = spec * g.reshape(2 * batch,
+                                *(len(f) if a == k else 1 for a in range(ndim)))
+    x = torch.fft.irfftn(spec, s=x.shape[1:], dim=dims)
+    x = x[(slice(None),) + tuple(slice(n) for n in shape)]
+    field = x[:batch] + 0.5 * x[batch:]
+    fields = []
+    for i in range(batch):
+        fi = field[i]
+        s = float(fi.std())
+        if s >= 1e-8:
+            z = (fi - fi.mean()) / s
+            kind, param = warps[i]
+            if kind == 1:                 # <1 peaks, >1 heavy tails
+                z = z.sign() * z.abs() ** param
+            elif kind == 2:               # push toward two phases
+                z = torch.tanh(param * z)
+            fi = z
         # Robust scaling retains local variation when one realization contains
         # a rare extreme. Values match the normalized image training range.
-        lo, hi = np.percentile(field, (1.0, 99.0))
-        if hi <= lo:  # only realistically reachable for degenerate tiny shapes
-            field = np.full(shape, 0.5, np.float32)
+        lo, hi = torch.quantile(fi.reshape(-1),
+                                torch.tensor([0.01, 0.99], device=device))
+        if float(hi) <= float(lo):  # realistically only degenerate tiny shapes
+            fi = torch.full(shape, 0.5, device=device)
         else:
-            field = np.clip((field - lo) / (hi - lo), 0.0, 1.0)
-        fields.append(field.astype(np.float32, copy=False))
-    return torch.from_numpy(np.stack(fields)).reshape(batch, -1)
+            fi = ((fi - lo) / (hi - lo)).clamp(0.0, 1.0)
+        fields.append(fi)
+    return torch.stack(fields).reshape(batch, -1)
 
 
 def mixed_batch_sizes(crop, synthetic_shape, synthetic_fraction,
@@ -199,26 +248,6 @@ def prefetch_batches(paths, batch, crop, steps, workers):
                 futs.append(ex.submit(sample_batch, paths, batch, crop))
                 submitted += 1
             yield b
-    finally:
-        ex.shutdown(wait=False, cancel_futures=True)
-
-
-def prefetch_synthetic_batches(batch, shape, correlation, rng, steps):
-    """Generate synthetic fields one step ahead on a CPU worker.
-
-    Gaussian filtering is CPU-bound and otherwise leaves the accelerator idle
-    between the image and synthetic passes.  A single worker preserves the
-    seeded RNG order while overlapping generation with the preceding GPU step.
-    """
-    ex = ThreadPoolExecutor(max_workers=1)
-    future = ex.submit(sample_synthetic_batch, batch, shape, correlation, rng)
-    try:
-        for i in range(steps):
-            result = future.result()
-            if i + 1 < steps:
-                future = ex.submit(sample_synthetic_batch, batch, shape,
-                                   correlation, rng)
-            yield result
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
 
@@ -533,16 +562,17 @@ def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
 def run_chunked_scene(model, x, hw, axis, order, levels, stride, d, device, eb,
                       agg_level=None):
     """Teacher-forced two-chunk closed loop, mirroring the chunked codec: the
-    square scene is split in half along ``axis``; global anchors are revealed
+    n-D scene (``hw`` = full shape) is split in half along ``axis``; anchors revealed
     and give every chunk its level-0 coarse embedding, then the chunks are
     coded in ``order`` — the first sees only anchor context across the border,
     the second sees the first's per-level coarse embeddings as coded halo.
     Same geometry/halo/coarse code as ChunkedGNNPredictor, with gradients."""
     B, N = x.shape
-    h, w = hw
+    shape = tuple(int(s) for s in hw)
+    ndim = len(shape)
     eb = _batch_scalar(eb, B, device)
-    edges = (h, w // 2) if axis == 1 else (h // 2, w)
-    grid = (1, 2) if axis == 1 else (2, 1)
+    edges = tuple(s // 2 if k == axis else s for k, s in enumerate(shape))
+    grid = tuple(2 if k == axis else 1 for k in range(ndim))
     known_vals = torch.full_like(x, 0.5)
 
     def reveal(idx):
@@ -552,18 +582,19 @@ def run_chunked_scene(model, x, hw, axis, order, levels, stride, d, device, eb,
         known_vals[:, idx] = (x[:, idx] + nz).clamp(0, 1)
 
     # global anchor pass + per-chunk level-0 coarse
-    coarse = torch.zeros(B, 2, levels + 1, 2, d, device=device)
+    coarse = torch.zeros(B, 2, levels + 1, ndim, d, device=device)
     origins, aidx = [], []
     for ci in range(2):
         starts = tuple(g * e for g, e in zip(np.unravel_index(ci, grid), edges))
         origins.append(starts)
         axes = [o + np.arange(e)[(np.arange(e) + o) % stride == 0]
                 for o, e in zip(starts, edges)]
-        aidx.append((axes[0][:, None] * w + axes[1][None, :]).reshape(-1))
+        mg = np.meshgrid(*axes, indexing="ij")
+        aidx.append(np.ravel_multi_index([m.reshape(-1) for m in mg], shape))
     for ci in range(2):
         reveal(aidx[ci])
     for ci in range(2):
-        fin = anchor_finalize(model, known_vals[:, aidx[ci]], 2)
+        fin = anchor_finalize(model, known_vals[:, aidx[ci]], ndim)
         coarse[:, ci, 0] = model.coarse(fin.mean(1), math.log2(stride))
 
     cg = build_chunk_geoms(edges, levels, stride, 1, torch, device, agg_level)
@@ -572,9 +603,9 @@ def run_chunked_scene(model, x, hw, axis, order, levels, stride, d, device, eb,
     abs_err = torch.zeros((), device=device)
     npix = 0
     for ci in order:
-        frame = _CompactFrame(cg, origins[ci], hw, edges, grid, coded,
+        frame = _CompactFrame(cg, origins[ci], shape, edges, grid, coded,
                               torch, device)
-        E = torch.zeros(B, frame.n_compact, 2, d, device=device)
+        E = torch.zeros(B, frame.n_compact, ndim, d, device=device)
         if len(frame.h_gflat):                             # trailing halo block
             ids_t = torch.from_numpy(frame.h_ids).to(device)
             lv_t = torch.from_numpy(frame.h_lv.astype(np.int64)).to(device)
@@ -583,7 +614,7 @@ def run_chunked_scene(model, x, hw, axis, order, levels, stride, d, device, eb,
             halo = model.finalize(cvec, known_vals[:, gflat_t])
             E = torch.cat([E[:, :frame.halo_rows.start], halo], dim=1)
         gidx = [None if c is None else torch.from_numpy(np.ravel_multi_index(
-            [(c[:, k] + origins[ci][k]) for k in range(2)], hw)).to(device)
+            [(c[:, k] + origins[ci][k]) for k in range(ndim)], shape)).to(device)
             for c in cg.coords]
         n1, np1, a1, E = _run_chunk(model, cg, frame.geoms, E, known_vals, x,
                                     gidx, eb, device, reveal)
@@ -621,11 +652,11 @@ def main():
     ap.add_argument("--synthetic-shape", type=int, nargs=4,
                     default=(16, 16, 16, 16), metavar=("N0", "N1", "N2", "N3"),
                     help="shape of each generated 4-D training field")
-    ap.add_argument("--synthetic-correlation", type=float, nargs=4,
-                    default=(6.0, 3.0, 1.5, 0.75),
-                    metavar=("S0", "S1", "S2", "S3"),
-                    help="Gaussian correlation length (grid cells) per axis; "
-                         "larger means smoother/more correlated")
+    ap.add_argument("--synthetic-correlation", type=float, nargs=2,
+                    default=(1.0, 8.0), metavar=("MIN", "MAX"),
+                    help="Gaussian correlation-length band (grid cells): each "
+                         "field draws a base sigma log-uniformly in [MIN/2, MAX] "
+                         "then jitters it per axis, so smoothness/anisotropy vary")
     ap.add_argument("--synthetic-batch", type=int, default=1,
                     help="number of 4-D fields per optimizer step; with a mixed "
                          "step, --batch is derived from the target point fraction")
@@ -694,8 +725,9 @@ def main():
     ap.add_argument("--wandb-project", default="gnn-sz")
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--profile", type=int, default=0,
-                    help="profile this many steps with torch.profiler, print "
-                         "the op table + write trace.json, then exit")
+                    help="warm up this many steps (compile, caches), then "
+                         "record exactly 1 step with torch.profiler, print "
+                         "the op table + write trace.json, and exit")
     args = ap.parse_args()
     if args.noise_range is not None:
         lo, hi = args.noise_range
@@ -766,8 +798,25 @@ def main():
     model = build_model(args.d).to(device)
     if args.compile:
         mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
+        # dynamic=True is required: embed specializes on geom.M (per-stage
+        # query count) and the schedule has hundreds of distinct M values --
+        # static shapes blow the recompile limit and fall back to eager.
+        # CUDA graphs would need M padded to a few buckets first.
+        # Raised limit: the M<=_M_TILE branch / ndim / dtype variants can
+        # still exceed the default of 8.
+        torch._dynamo.config.cache_size_limit = 64
+        # embed is the bulk of the FLOPs; finalize + head_of are the eager
+        # remainder (addmm/mul/sum storm of ~10us kernels, launch-bound).
+        # finalize/head_of never get reduce-overhead: stage_forward chains
+        # embed's ctx output across stages, and a CUDA-graph replay of any
+        # sibling graph overwrites that static buffer before finalize reads
+        # it ("output overwritten by a subsequent run"). Default mode still
+        # fuses their kernel storm without cudagraphs.
         model.embed = torch.compile(model.embed, dynamic=True, mode=mode)
-        print(f"torch.compile enabled for model.embed (mode={mode or 'default'})")
+        model.finalize = torch.compile(model.finalize, dynamic=True)
+        model.head_of = torch.compile(model.head_of, dynamic=True)
+        print("torch.compile enabled for embed/finalize/head_of "
+              f"(embed mode={mode or 'default'})")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     decay_start = int(args.steps * 0.7)  # linear lr decay over the last 30% steps
@@ -818,26 +867,24 @@ def main():
         acts = [torch.profiler.ProfilerActivity.CPU]
         if device.type == "cuda":
             acts.append(torch.profiler.ProfilerActivity.CUDA)
-        prof = torch.profiler.profile(
-            activities=acts,
-            schedule=torch.profiler.schedule(wait=1, warmup=1,
-                                             active=args.profile),
-            record_shapes=True, with_stack=True)
-        prof.start()
-        args.steps = args.profile + 2  # wait + warmup + active
+        # ponytail: no profiler schedule -- started by hand on the last step,
+        # after args.profile warmup steps (compile, caches), so exactly one
+        # fully warmed-up step is recorded.
+        prof = torch.profiler.profile(activities=acts, record_shapes=True,
+                                      with_stack=True)
+        args.steps = args.profile + 1  # warmup + 1 recorded step
 
-    # These weights are constant for the run. Both generators maintain CPU
-    # work ahead of the training loop after their first batch is requested.
+    # These weights are constant for the run. The image generator maintains
+    # CPU decode work ahead of the training loop; synthetic fields are FFT-
+    # generated directly on the device, so they need no prefetch.
     image_weight = 1.0 - synthetic_point_fraction
     synthetic_weight = synthetic_point_fraction
     batches = prefetch_batches(paths, image_batch, args.crop, args.steps,
                                args.workers)
-    synthetic_batches = (prefetch_synthetic_batches(
-        synthetic_batch, tuple(args.synthetic_shape),
-        tuple(args.synthetic_correlation), synthetic_rng, args.steps)
-        if synthetic_weight else None)
     bar = tqdm(range(1, args.steps + 1), desc="train")
     for step in bar:
+        if prof is not None and step == args.steps:
+            prof.start()  # record only the final, fully warmed-up step
         opt.zero_grad()
         metric_tensors = {}
 
@@ -871,14 +918,17 @@ def main():
 
         if synthetic_weight:
             field_shape = tuple(args.synthetic_shape)
-            x = next(synthetic_batches).to(device)
+            x = sample_synthetic_batch(
+                synthetic_batch, field_shape,
+                tuple(args.synthetic_correlation), synthetic_rng,
+                device=device)
             stride = args.synthetic_stride
             levels = args.levels or stride.bit_length() - 1
             eb = sample_noise(x.shape[0], args, device)
-            geoms, _ = build_stage_geoms(
-                field_shape, levels, stride, 1, args.max_radius, torch, device,
-                args.agg_level)
             with training_autocast(args.fp16, device):
+                geoms, _ = build_stage_geoms(
+                    field_shape, levels, stride, 1, args.max_radius, torch,
+                    device, args.agg_level)
                 nll, npix, _, _, aux = run_stages(
                     model, x, geoms, args.d, device, eb=eb,
                     teacher_force=True)
@@ -977,14 +1027,14 @@ def main():
             bar.set_postfix(postfix)
             run_loss = 0.0
 
-        if prof is not None:
-            prof.step()
-
     if prof is not None:
         prof.stop()
         sort_key = ("cuda_time_total" if device.type == "cuda"
                     else "cpu_time_total")
         print(prof.key_averages().table(sort_by=sort_key, row_limit=25))
+        # self-CPU view: cudaLaunchKernel/dispatch on top = launch-bound
+        print(prof.key_averages().table(sort_by="self_cpu_time_total",
+                                        row_limit=15))
         prof.export_chrome_trace("trace.json")
         print("wrote trace.json (open in chrome://tracing or perfetto.dev)")
         return

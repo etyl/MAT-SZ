@@ -7,8 +7,7 @@ torch = pytest.importorskip("torch")
 
 from scripts.train_gnn import (discretized_laplace_nll, sample_noise,
                                sample_synthetic_batch, mixed_batch_sizes,
-                               normalize_tensor,
-                               prefetch_synthetic_batches, training_autocast,
+                               normalize_tensor, training_autocast,
                                run_chunked_scene)
 from deepsz.gnn_predictor import build_model
 
@@ -88,7 +87,7 @@ def test_synthetic_axis_smoothness_follows_correlation_lengths():
     correlation = (5.0, 3.0, 1.5, 0.6)
     fields = sample_synthetic_batch(
         3, shape, correlation, np.random.default_rng(7),
-        permute_axes=False).reshape(3, *shape)
+        randomize=False).reshape(3, *shape)
 
     # Mean adjacent differences are smaller on axes with longer correlation.
     variation = []
@@ -111,19 +110,6 @@ def test_synthetic_fields_randomly_permute_correlation_axes():
                      for axis in range(4)]
         smoothest_axes.append(int(np.argmin(variation)))
     assert len(set(smoothest_axes)) > 1
-
-
-def test_synthetic_prefetch_preserves_seeded_sequence():
-    shape = (8, 6, 4, 4)
-    correlation = (3.0, 2.0, 1.0, 0.5)
-    expected_rng = np.random.default_rng(31)
-    expected = [sample_synthetic_batch(2, shape, correlation, expected_rng)
-                for _ in range(3)]
-
-    actual = list(prefetch_synthetic_batches(
-        2, shape, correlation, np.random.default_rng(31), 3))
-
-    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
 
 
 def test_mixed_batch_fraction_counts_scalar_points():
