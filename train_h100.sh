@@ -47,7 +47,7 @@ python scripts/train_gnn.py \
     --synthetic-batch 4 \
     --synthetic-stride 8 \
     --workers 4 \
-    --agg-level 2 \
+    --agg-level 1 \
     --d 64 \
     --lr 0.0005 \
     --noise-range 0.0001 0.05 \
@@ -61,7 +61,7 @@ python scripts/train_gnn.py \
     --eval-tensor-every 500 \
     --device cuda \
     --wandb-mode offline \
-    --run-name gnn-axis-4d \
+    --run-name gnn-agg1 \
     --compile \
     "$@"
 

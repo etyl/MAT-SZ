@@ -44,4 +44,5 @@ python scripts/eval_tensor.py "$DATA" \
     --tune "$TUNE" \
     --tune-size-slack "$TUNE_SIZE_SLACK" \
     --normalize \
+    --compile \
     "$@"
