@@ -45,7 +45,6 @@ from .gnn_predictor import (
     _build_remap,
     _CompactGeom,
     _StageGeom,
-    _period_prefixes,
     anchor_finalize,
 )
 from .bitstream import pack_stage, unpack_stage
@@ -228,6 +227,36 @@ def _classify(cshape, origin, edges, stride):
     return iface, strict
 
 
+class _SubsetStageGeom:
+    """Query-row subset of an existing ``_StageGeom``.
+
+    The neighbour search depends only on the base stage and the query coordinate,
+    so rebuilding ``_StageGeom`` for every interface signature repeats the most
+    expensive part of geometry construction.  Slice its query dimension instead;
+    static direction tensors are shared.
+    """
+
+    __slots__ = _StageGeom.__slots__
+
+    def __init__(self, base, take, torch, device):
+        take = np.asarray(take, bool)
+        idx_np = np.flatnonzero(take).astype(np.int64)
+        idx = torch.from_numpy(idx_np).to(device)
+        for name in ("ip", "in_", "dp", "dn", "vp", "vn"):
+            setattr(self, name, getattr(base, name).index_select(1, idx))
+        self.query_idx = base.query_idx.index_select(0, idx)
+        self.idx_np = base.idx_np[take]
+        self.M = int(len(idx_np))
+        self.ndim = base.ndim
+        self.cos = base.cos
+        self.lognnz = base.lognnz
+
+
+_SUB_GEOM_CACHE: dict = {}
+_SUB_FRAME_CACHE: dict = {}
+_SUB_FRAME_CACHE_MAX = 8  # compact remaps are large for 32^4; bound GPU residency
+
+
 class _SubGeoms:
     """Stage geometry for a *subset* of a chunk's refinement points (the interface
     or the strict-interior cells), in the halo-padded local frame. Mirrors
@@ -239,32 +268,35 @@ class _SubGeoms:
 
     __slots__ = ("ndim", "padded_shape", "n_padded", "levels", "stride", "block",
                  "geoms", "coords", "chain", "interior_flat", "ref_halo_flat",
-                 "ref_halo_coords")
+                 "ref_halo_coords", "cache_key")
 
-    def __init__(self, cshape, levels, stride, block, qmask, torch, device,
-                 agg_level):
-        ndim = len(cshape)
-        self.ndim = ndim
-        self.levels, self.stride, self.block = levels, stride, block
-        self.padded_shape = tuple(n + 2 * stride for n in cshape)
-        self.n_padded = int(np.prod(self.padded_shape))
-        masks = stage_masks(cshape, levels, stride, block)
-        pats = _period_prefixes(cshape, levels, stride, block)
+    def __init__(self, base, qmask, torch, device, cache_key):
+        self.ndim = base.ndim
+        self.levels, self.stride, self.block = (
+            base.levels, base.stride, base.block)
+        self.padded_shape = base.padded_shape
+        self.n_padded = base.n_padded
+        self.cache_key = cache_key
         self.geoms, self.coords = [], []
-        for s, mask in enumerate(masks):
-            Q = np.stack(np.nonzero(mask & qmask), axis=1)
-            if not len(Q):
+        for base_geom, base_coords in zip(base.geoms, base.coords):
+            if base_geom is None:
                 self.geoms.append(None)
                 self.coords.append(None)
                 continue
-            self.geoms.append(_StageGeom(pats[s], Q + stride, self.padded_shape,
-                                         stride, torch, device, agg_level))
-            self.coords.append(Q)
+            take = qmask[tuple(base_coords[:, k]
+                               for k in range(self.ndim))]
+            if not take.any():
+                self.geoms.append(None)
+                self.coords.append(None)
+                continue
+            self.geoms.append(_SubsetStageGeom(base_geom, take, torch, device))
+            self.coords.append(base_coords[take])
         self.chain = [0] + [s for s in range(1, len(self.geoms))
                             if self.geoms[s] is not None]
         qc = np.stack(np.nonzero(qmask), axis=1)
         self.interior_flat = (
-            np.ravel_multi_index([(qc[:, k] + stride) for k in range(ndim)],
+            np.ravel_multi_index([(qc[:, k] + self.stride)
+                                  for k in range(self.ndim)],
                                  self.padded_shape)
             if len(qc) else np.zeros(0, np.int64))
         seen = []
@@ -277,7 +309,21 @@ class _SubGeoms:
                else np.zeros(0, np.int64))
         self.ref_halo_flat = ref[~np.isin(ref, self.interior_flat)].astype(np.int64)
         self.ref_halo_coords = (np.stack(
-            np.unravel_index(self.ref_halo_flat, self.padded_shape), 1) - stride)
+            np.unravel_index(self.ref_halo_flat, self.padded_shape), 1)
+                                - self.stride)
+
+
+def _build_sub_geoms(cshape, levels, stride, block, qmask, torch, device,
+                     agg_level, cache_key):
+    """Build/cache an interface subset by slicing the shared chunk geometry."""
+    key = (tuple(cshape), levels, stride, block, agg_level, str(device), cache_key)
+    hit = _SUB_GEOM_CACHE.get(key)
+    if hit is None:
+        base = build_chunk_geoms(cshape, levels, stride, block, torch, device,
+                                 agg_level)
+        hit = _SubGeoms(base, qmask, torch, device, key)
+        _SUB_GEOM_CACHE[key] = hit
+    return hit
 
 
 def _interior_split(cshape, cmasks, stride):
@@ -308,6 +354,23 @@ class _SkelFrame:
         self.n_compact = n_compact
         self.halo_rows = halo_rows
         self.h_gflat = h_gflat
+
+
+class _SubFrame:
+    """Cached compact layout for one subset/boundary signature.
+
+    Geometry/remapping is translation invariant.  Only the global indices used
+    to gather halo values change between chunks, so retain relative coordinates.
+    """
+
+    __slots__ = ("geoms", "n_interior", "n_compact", "halo_rows", "h_rel")
+
+    def __init__(self, geoms, n_interior, n_compact, halo_rows, h_rel):
+        self.geoms = geoms
+        self.n_interior = n_interior
+        self.n_compact = n_compact
+        self.halo_rows = halo_rows
+        self.h_rel = h_rel
 
 
 class SkeletonGNNPredictor(ChunkedGNNPredictor):
@@ -453,38 +516,53 @@ class SkeletonGNNPredictor(ChunkedGNNPredictor):
         (value + null context), like the halo-free path."""
         torch = self._torch
         ndim = len(self.shape)
+        cidx = tuple(int(origin[k] // self.edges[k]) for k in range(ndim))
+        bsig = tuple((i == 0, i == self.grid[k] - 1)
+                     for k, i in enumerate(cidx))
+        key = (sub.cache_key, self.shape, self.edges, bsig)
+        hit = _SUB_FRAME_CACHE.get(key)
+        if hit is not None:
+            return hit
         gc = sub.ref_halo_coords + np.asarray(origin, np.int64)
         shp = np.asarray(self.shape)
         inb = np.all((gc >= 0) & (gc < shp), axis=1)
         gci = gc[inb]
         keep = known_pred(gci) if len(gci) else np.zeros(0, bool)
         halo_present = sub.ref_halo_flat[inb][keep]
-        h_gflat = (np.ravel_multi_index([gci[keep][:, k] for k in range(ndim)],
-                                        self.shape)
-                   if keep.any() else np.zeros(0, np.int64))
+        h_rel = (gci[keep] - np.asarray(origin, np.int64)
+                 if keep.any() else np.zeros((0, ndim), np.int64))
         n_interior = int(len(sub.interior_flat))
         present = np.concatenate([sub.interior_flat, halo_present])
         n_compact = 1 + len(present)
         remap = _build_remap(present, sub.n_padded, torch, self.device)
         geoms = [None if g is None else _CompactGeom(g, remap) for g in sub.geoms]
-        return geoms, n_interior, n_compact, slice(n_interior + 1, n_compact), h_gflat
+        hit = _SubFrame(geoms, n_interior, n_compact,
+                        slice(n_interior + 1, n_compact), h_rel)
+        _SUB_FRAME_CACHE[key] = hit
+        if len(_SUB_FRAME_CACHE) > _SUB_FRAME_CACHE_MAX:
+            _SUB_FRAME_CACHE.pop(next(iter(_SUB_FRAME_CACHE)))
+        return hit
 
     def start_sub(self, ci, recon, sub, known_pred):
         torch = self._torch
         sls = self.chunk_slices(ci)
         origin = np.array([sl.start for sl in sls], np.int64)
-        geoms, n_int, n_comp, halo_rows, h_gflat = self._sub_frame(
-            sub, origin, known_pred)
-        E = torch.zeros(self.C, n_comp, sub.ndim, self.d, device=self.device)
+        frame = self._sub_frame(sub, origin, known_pred)
+        E = torch.zeros(self.C, frame.n_compact, sub.ndim, self.d,
+                        device=self.device)
+        gc = frame.h_rel + origin
+        h_gflat = (np.ravel_multi_index([gc[:, k] for k in range(sub.ndim)],
+                                        self.shape)
+                   if len(gc) else np.zeros(0, np.int64))
         if len(h_gflat):
             vals = self._norm(recon.reshape(self.C, -1)[:, h_gflat])
             with torch.no_grad():
-                E[:, halo_rows] = anchor_finalize(
+                E[:, frame.halo_rows] = anchor_finalize(
                     self.model, vals, sub.ndim).to(E.dtype)
         self._cg = sub
         self._ci = ci
         self._E = E
-        self._geoms = geoms
+        self._geoms = frame.geoms
         self._gidx = [None if c is None else np.ravel_multi_index(
             [(c[:, k] + origin[k]) for k in range(len(self.shape))], self.shape)
             for c in sub.coords]
@@ -492,6 +570,38 @@ class SkeletonGNNPredictor(ChunkedGNNPredictor):
         self._pos = 0
 
     def finish_sub(self):
+        self._E = self._ctx = self._cg = None
+
+    def start_sub_wave(self, chunk_ids, recon, sub, known_pred):
+        """Batched twin of ``start_sub`` for equal-boundary-signature chunks."""
+        torch = self._torch
+        ndim = len(self.shape)
+        origins = np.array([[sl.start for sl in self.chunk_slices(ci)]
+                            for ci in chunk_ids], np.int64)
+        frame = self._sub_frame(sub, origins[0], known_pred)
+        E = torch.zeros(len(chunk_ids), frame.n_compact, ndim, self.d,
+                        device=self.device)
+        if len(frame.h_rel):
+            strides = np.cumprod((1,) + self.shape[:0:-1])[::-1].astype(np.int64)
+            gflat = ((frame.h_rel @ strides)[None, :]
+                     + origins @ strides[:, None])
+            vals = self._norm(recon.reshape(-1)[gflat])
+            with torch.no_grad(), self._amp():
+                E[:, frame.halo_rows] = anchor_finalize(
+                    self.model, vals, ndim).to(E.dtype)
+        strides = np.cumprod((1,) + self.shape[:0:-1])[::-1].astype(np.int64)
+        obase = origins @ strides
+        self._wave_gidx = [None if coords is None else
+                           (coords @ strides)[None, :] + obase[:, None]
+                           for coords in sub.coords]
+        self._cg = sub
+        self._wave_ids = list(chunk_ids)
+        self._E = E
+        self._geoms = frame.geoms
+        self._ctx = None
+        self._pos = 0
+
+    def finish_sub_wave(self):
         self._E = self._ctx = self._cg = None
 
 
@@ -633,9 +743,9 @@ def _decompress_skeleton(payload, shape, ebs, radius, predictor, edges, batch,
     return recon[0]
 
 
-def _skel_iface_passes(values, recon, ebs, radius, round_output, predictor,
-                       shape, stride, block, *, decode=False, payload=None,
-                       off0=0):
+def _skel_iface_passes_legacy(values, recon, ebs, radius, round_output, predictor,
+                              shape, stride, block, *, decode=False, payload=None,
+                              off0=0):
     """Shared two-phase driver — phase 1 codes every chunk's interface cells
     (skeleton-only context), phase 2 its strict interiors (skeleton + the now-
     reconstructed interfaces). Encodes (returns the list of packed parts) or
@@ -669,9 +779,10 @@ def _skel_iface_passes(values, recon, ebs, radius, round_output, predictor,
             if sub is None:
                 iface, strict = _classify(cshape, origin, edges, stride)
                 qmask = iface if phase == "iface" else strict
-                sub = _SubGeoms(cshape, predictor.levels, stride, block, qmask,
-                                predictor._torch, predictor.device,
-                                predictor.agg_level)
+                sub = _build_sub_geoms(
+                    cshape, predictor.levels, stride, block, qmask,
+                    predictor._torch, predictor.device, predictor.agg_level,
+                    (phase, key[1]))
                 sub_cache[key] = sub
             if len(sub.chain) <= 1:                 # no query cells this phase
                 bar.update(1)
@@ -705,8 +816,119 @@ def _skel_iface_passes(values, recon, ebs, radius, round_output, predictor,
     return off if decode else parts
 
 
+def _iface_groups(predictor):
+    """Chunks grouped by subset geometry and tensor-boundary clipping."""
+    groups: dict = {}
+    for ci in range(predictor.n_chunks):
+        sls = predictor.chunk_slices(ci)
+        cshape = tuple(sl.stop - sl.start for sl in sls)
+        cidx = np.unravel_index(ci, predictor.grid)
+        low = tuple(int(i) > 0 for i in cidx)
+        bsig = tuple((int(i) == 0, int(i) == g - 1)
+                     for i, g in zip(cidx, predictor.grid))
+        groups.setdefault((cshape, low, bsig), []).append(ci)
+    return list(groups.items())
+
+
+def _skel_iface_passes_batched(values, recon, ebs, radius, round_output,
+                               predictor, shape, stride, block, batch,
+                               *, decode=False, payload=None, off0=0):
+    """Two-phase interface driver batched by equal subset/boundary geometry."""
+    edges = predictor.edges
+    stage_tables = [build_laplace_tables(e, radius) for e in ebs]
+    c = 1 if decode else values.shape[0]
+    parts: list[bytes] = []
+    off = off0
+
+    def known_iface(gci):
+        return _offgrid_global(gci, stride) <= 1
+
+    def known_interior(gci):
+        return ((_offgrid_global(gci, stride) <= 1)
+                | _on_internal_boundary(gci, edges))
+
+    groups = _iface_groups(predictor)
+    sub_cache: dict = {}
+    for phase, known_pred in (("iface", known_iface),
+                              ("interior", known_interior)):
+        direction = "decode" if decode else "encode"
+
+        def get_sub(cshape, low):
+            key = (cshape, low, phase)
+            sub = sub_cache.get(key)
+            if sub is None:
+                origin = np.array([edge if flag else 0
+                                   for edge, flag in zip(edges, low)], np.int64)
+                iface, strict = _classify(cshape, origin, edges, stride)
+                qmask = iface if phase == "iface" else strict
+                sub = _build_sub_geoms(
+                    cshape, predictor.levels, stride, block, qmask,
+                    predictor._torch, predictor.device, predictor.agg_level,
+                    (phase, low))
+                sub_cache[key] = sub
+            return sub
+
+        # Geometry construction is intentionally outside the chunk progress bar:
+        # on a cold cache this makes setup cost visible instead of reporting it as
+        # a 20-80 second "chunk". Compact frames stay in a small bounded cache and
+        # are built on first use; retaining all 3**ndim boundary variants can use
+        # many GB for a 32^4 chunk.
+        gbar = _progress_bar(f"skel {phase} geometry", len(groups), unit="group")
+        for (cshape, low, _bsig), group in groups:
+            get_sub(cshape, low)
+            gbar.update(1)
+        gbar.close()
+
+        bar = _progress_bar(f"skel {phase} {direction}", predictor.n_chunks,
+                            unit="chunk")
+        for (cshape, low, _bsig), group in groups:
+            sub = get_sub(cshape, low)
+            if len(sub.chain) <= 1:
+                bar.update(len(group))
+                continue
+            for i in range(0, len(group), batch):
+                ids = group[i:i + batch]
+                predictor.start_sub_wave(ids, recon, sub, known_pred)
+                for jj in range(1, len(sub.chain)):
+                    s = sub.chain[jj]
+                    pred, scale = predictor.predict_wave_stage(s, recon, ebs[s])
+                    Q = sub.coords[s]
+                    qidx = tuple(Q[:, k] for k in range(len(cshape)))
+                    M = len(Q)
+                    for bi, ci in enumerate(ids):
+                        sls = predictor.chunk_slices(ci)
+                        lvl = scale_to_level(
+                            scale[bi][None, :], ebs[s]).reshape(-1)
+                        if decode:
+                            codes, outliers, off = unpack_stage(
+                                payload, off, rans_levels=lvl,
+                                rans_tables=stage_tables[s])
+                            recon[(slice(None), *sls)][
+                                (slice(None), *qidx)] = dequantize(
+                                    pred[bi][None, :], codes, outliers, ebs[s],
+                                    radius).reshape(c, M)
+                        else:
+                            p = pred[bi][None, :]
+                            cvals = values[(slice(None), *sls)][
+                                (slice(None), *qidx)]
+                            codes, outliers = quantize(
+                                cvals, p, ebs[s], radius,
+                                round_output=round_output)
+                            recon[(slice(None), *sls)][
+                                (slice(None), *qidx)] = dequantize(
+                                    p, codes, outliers, ebs[s], radius
+                                ).reshape(c, M)
+                            parts.append(pack_stage(
+                                codes, outliers, rans_levels=lvl,
+                                rans_tables=stage_tables[s]))
+                predictor.finish_sub_wave()
+                bar.update(len(ids))
+        bar.close()
+    return off if decode else parts
+
+
 def _compress_skeleton_iface(values, ebs, radius, round_output, predictor, edges,
-                             eb, eb_ratio, order):
+                             eb, eb_ratio, order, batch_cap=None):
     """Encode with the Milestone-B interface class (see ``_skel_iface_passes``)."""
     c = values.shape[0]
     shape = values.shape[1:]
@@ -720,13 +942,18 @@ def _compress_skeleton_iface(values, ebs, radius, round_output, predictor, edges
                              radius, order, round_output)
     _log(f"skel(iface) encode: shape={shape} edges={edges} anchors+lines done")
     predictor.begin(shape, edges, channels=c)
-    parts += _skel_iface_passes(values, recon, ebs, radius, round_output,
-                                predictor, shape, stride, block)
+    batch = predictor.max_batch(tuple(min(e, n) for e, n in zip(edges, shape)))
+    if batch_cap is not None:
+        batch = max(1, min(batch, int(batch_cap)))
+    predictor.chunk_batch = batch
+    parts += _skel_iface_passes_batched(
+        values, recon, ebs, radius, round_output, predictor, shape, stride,
+        block, batch)
     return b"".join(parts)
 
 
 def _decompress_skeleton_iface(payload, shape, ebs, radius, predictor, edges,
-                               eb, eb_ratio, order):
+                               eb, eb_ratio, order, batch=1, layout="legacy"):
     """Decoder twin of ``_compress_skeleton_iface`` (identical phase/chunk/stage
     order)."""
     stride, block = predictor.anchor_stride, predictor.anchor_block
@@ -736,8 +963,13 @@ def _decompress_skeleton_iface(payload, shape, ebs, radius, predictor, edges,
     off = _decode_line_pass(payload, off, recon, shape, stride, block, eb,
                             eb_ratio, radius, order)
     predictor.begin(shape, edges, channels=1)
-    off = _skel_iface_passes(None, recon, ebs, radius, None, predictor, shape,
-                             stride, block, decode=True, payload=payload, off0=off)
+    driver = (_skel_iface_passes_batched if layout == "batched-v1"
+              else _skel_iface_passes_legacy)
+    args = (None, recon, ebs, radius, None, predictor, shape, stride, block)
+    if layout == "batched-v1":
+        off = driver(*args, batch, decode=True, payload=payload, off0=off)
+    else:
+        off = driver(*args, decode=True, payload=payload, off0=off)
     if off != len(payload):
         raise ValueError("trailing bytes in skeleton payload")
     return recon[0]
@@ -805,7 +1037,7 @@ class SkeletonGNNCodec(GNNCompressorCodec):
             if self.interfaces:
                 payload = _compress_skeleton_iface(
                     values, ebs, self.radius, dtype.kind in "bi", predictor,
-                    edges, eb, ratio, self.line_order)
+                    edges, eb, ratio, self.line_order, self.chunk_batch)
             else:
                 payload = _compress_skeleton(
                     values, ebs, self.radius, dtype.kind in "bi", predictor,
@@ -826,6 +1058,8 @@ class SkeletonGNNCodec(GNNCompressorCodec):
                 "m_tile": int(_gp._M_TILE), "fp16": bool(self.fp16),
                 "compiled": bool(use_compile),
             }
+            if self.interfaces:
+                meta["interface_layout"] = "batched-v1"
             stream = _write_stream(meta, payload, self.zstd_level, _VERSION_SKEL)
             candidates.append((len(stream), stream))
         return min(candidates, key=lambda it: it[0])[1]
@@ -858,7 +1092,9 @@ class SkeletonGNNCodec(GNNCompressorCodec):
                 values = _decompress_skeleton_iface(
                     payload, shape, ebs, int(meta["radius"]), predictor, edges,
                     float(meta["error_bound"]), float(meta["eb_ratio"]),
-                    meta.get("line_order", "cubic"))
+                    meta.get("line_order", "cubic"),
+                    int(meta.get("chunk_batch", 1)),
+                    meta.get("interface_layout", "legacy"))
             else:
                 values = _decompress_skeleton(
                     payload, shape, ebs, int(meta["radius"]), predictor, edges,

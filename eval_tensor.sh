@@ -15,7 +15,8 @@ module purge
 module load pytorch-gpu
 
 export PYTHONUNBUFFERED=1   # flush progress to the SLURM .out live
-export DEEPSZ_M_TILE=$((16**4))   # M-tiling off (chunk-batch 1 fits without it)
+# export DEEPSZ_M_TILE=$((16**4))   # M-tiling off (chunk-batch 1 fits without it)
+unset DEEPSZ_M_TILE
 export DEEPSZ_COMPILE_MODE=${DEEPSZ_COMPILE_MODE:-reduce-overhead}
 
 # D128 checkpoint
@@ -47,7 +48,7 @@ python scripts/eval_tensor.py "$DATA" \
     --chunk-size 32 \
     --anchor-block 1 \
     --agg-level 2 \
-    --chunk-batch 1 \
+    --chunk-batch 3 \
     --tune "$TUNE" \
     --tune-size-slack "$TUNE_SIZE_SLACK" \
     --normalize \

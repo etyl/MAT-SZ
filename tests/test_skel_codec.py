@@ -156,6 +156,7 @@ def test_skel_interfaces_roundtrip(v5_ckpt, shape, chunk_size, order):
     assert _maxerr(y, x) <= 0.02
     meta, _ = _read_stream(bytes(stream))
     assert meta.get("interfaces") is True
+    assert meta.get("interface_layout") == "batched-v1"
 
 
 def test_skel_interfaces_deterministic(v5_ckpt):
