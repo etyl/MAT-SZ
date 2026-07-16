@@ -22,16 +22,17 @@ DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak}
 # D32 checkpoint
 CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260714-095239-e16d09/gnn_predictor.pt}
 
-TUNE=${TUNE:-rd}               # fast (1 encode) | size/rd (4 encodes)
+TUNE=${TUNE:-fast}               # fast (1 encode) | size/rd (4 encodes)
 TUNE_SIZE_SLACK=${TUNE_SIZE_SLACK:-1.05}
 
 python scripts/eval_predictors.py \
     --data "$DATA" \
     --gnn-checkpoint "$CKPT" \
-    --methods gnn interp sz3 \
-    --eb 0.01 0.04 0.08 0.14 0.2 \
-    --levels 6 \
-    --anchor-stride 64 \
+    --methods gnn sz3 \
+    --eb 0.001 0.004 0.008 0.014 0.02 \
+    --levels 5 \
+    --anchor-stride 32 \
+    --chunk-size 32 \
     --anchor-block 1 \
     --tune "$TUNE" \
     --tune-size-slack "$TUNE_SIZE_SLACK" \

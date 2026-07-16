@@ -206,14 +206,10 @@ def _quantize_pmf(weights: np.ndarray, total: int) -> np.ndarray:
             pmf[order[:rem]] += 1
     elif diff < 0:
         order = np.argsort(frac)
-        need = -diff
-        for idx in order:
-            take = min(need, int(pmf[idx] - 1))
-            if take:
-                pmf[idx] -= take
-                need -= take
-                if need == 0:
-                    break
-        if need:
+        avail = pmf[order] - 1
+        cum = np.cumsum(avail)
+        take = np.clip(-diff - (cum - avail), 0, avail)
+        pmf[order] -= take
+        if take.sum() < -diff:
             raise ValueError("could not normalize PMF at requested precision")
     return pmf.astype(np.uint32)

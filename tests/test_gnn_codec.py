@@ -44,9 +44,9 @@ def test_defaults_match_eval_tensor(tiny_checkpoint):
     assert codec.anchor_stride == 32
     assert codec.anchor_block == 1
     assert codec.agg_level == 2
-    assert codec.chunk_size == 32
-    assert codec.chunk_batch == 1
-    assert codec.fp16 is True
+    assert codec.chunk_size is None
+    assert codec.chunk_batch is None
+    assert codec.fp16 is False
     assert codec.compile is True
 
 

@@ -162,9 +162,11 @@ def test_fp16_flag_roundtrips_and_persists(v5_ckpt):
     assert _maxerr(codec.uncompress(stream), x) <= 0.02
 
 
-def test_compile_flag_roundtrips_and_persists(v5_ckpt):
+def test_compile_flag_roundtrips_and_persists(v5_ckpt, monkeypatch):
     """compile=True round-trips within the bound and the flag rides in the stream
-    so decode replays the same compiled float path."""
+    so decode replays the same compiled float path. Small workloads skip compile
+    (dynamo warmup never amortizes) and record compiled=False."""
+    import deepsz.gnn_codec as gc
     from deepsz.gnn_codec import _read_stream
 
     rng = np.random.RandomState(11)
@@ -174,6 +176,11 @@ def test_compile_flag_roundtrips_and_persists(v5_ckpt):
         anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=False,
         compile=True)
 
+    stream = codec.compress(x)
+    meta, _ = _read_stream(bytes(stream))
+    assert meta.get("compiled") is False        # 4 chunks: below the gate
+
+    monkeypatch.setattr(gc, "_COMPILE_MIN_CHUNKS", 1)
     stream = codec.compress(x)
     meta, _ = _read_stream(bytes(stream))
     assert meta.get("compiled") is True

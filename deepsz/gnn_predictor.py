@@ -101,6 +101,26 @@ def _nearest_steps(pat: np.ndarray, dvec, P: int, res=None) -> np.ndarray:
     return t0
 
 
+_NEAREST_TILE_CACHE: dict = {}
+
+
+def _nearest_steps_at(pat: np.ndarray, dvec, P: int, res) -> np.ndarray:
+    """`_nearest_steps` evaluated at the query residues ``res``, via a cached
+    full period tile when that is cheaper: the tile costs O(P^(ndim+1)) once
+    per (pat, dvec) and O(M) per lookup, vs O(P*M) per call for the direct
+    path. ponytail: tile capped at 2^20 cells (4-D at stride 32); beyond that
+    fall back to the direct path rather than build a giant tile."""
+    M = len(res[0])
+    if pat.size > 1 << 20 or pat.size > P * M:
+        return _nearest_steps(pat, dvec, P, res)
+    key = (pat.tobytes(), pat.shape, tuple(int(c) for c in dvec), P)
+    tile = _NEAREST_TILE_CACHE.get(key)
+    if tile is None:
+        tile = _nearest_steps(pat, dvec, P)
+        _NEAREST_TILE_CACHE[key] = tile
+    return tile[tuple(res)]
+
+
 def _shift(arr: np.ndarray, offset, fill):
     """result[p] = arr[p + offset], out-of-bounds filled with `fill`."""
     out = np.full_like(arr, fill)
@@ -178,7 +198,7 @@ class _StageGeom:
                     ln["d" + side] = t(np.zeros(0, np.float32))
                     ln["v" + side] = t(np.zeros(0, bool))
                     continue
-                step = _nearest_steps(pat, sd, P, res)          # (M,) at query residues
+                step = _nearest_steps_at(pat, sd, P, res)       # (M,) at query residues
                 nb = Q + step[:, None] * sd                     # neighbour coords
                 inb = np.all((nb >= 0) & (nb < shp), axis=1)
                 valid = (step >= 1) & (step <= limit) & inb     # legacy: in-bounds & <=limit
@@ -889,11 +909,20 @@ def build_chunk_geoms(chunk_shape, levels, stride, block, torch, device=None,
     return hit
 
 
-def _build_remap(present, torch, device):
+def _build_remap(present, n_padded, torch, device):
     """Map padded-flat index -> compact field row. ``present`` lists the padded
     cells the field holds (interior first, then usable halo); cell ``present[i]``
     lives at row ``i + 1`` (row 0 is the dummy that invalid / not-yet-decoded
-    neighbour lines point at). Returns a closure over torch index tensors."""
+    neighbour lines point at). A dense table over the padded frame makes each
+    remap one gather instead of a sort + searchsorted + compare chain.
+    ponytail: table capped at 2^24 cells (~128MB, covers 4-D chunks at stride
+    32); bigger frames take the searchsorted path."""
+    if n_padded <= 1 << 24:
+        table = np.zeros(n_padded, np.int64)
+        table[present] = np.arange(1, len(present) + 1)
+        tt = torch.from_numpy(table).to(device)
+        return lambda flat: tt[flat]
+
     order = np.argsort(present, kind="stable")
     spres = torch.from_numpy(np.ascontiguousarray(present[order])).to(device)
     comp = torch.from_numpy((order + 1).astype(np.int64)).to(device)
@@ -941,7 +970,7 @@ class _CompactFrame:
         self.n_interior = int(len(cg.interior_flat))
         present = np.concatenate([cg.interior_flat, halo_present])
         self.n_compact = 1 + len(present)
-        remap = _build_remap(present, torch, device)
+        remap = _build_remap(present, cg.n_padded, torch, device)
         self.geoms = [None if g is None else _CompactGeom(g, remap)
                       for g in cg.geoms]
         # halo cells are laid out right after interior, so their rows are a
@@ -1215,15 +1244,14 @@ class ChunkedGNNPredictor:
                               self.coded, torch, self.device)
         E = torch.zeros(B, frame.n_compact, ndim, self.d, device=self.device)
         self._wave_fill_halo(E, frame, origins, recon)
-        # per-chunk global flat indices per stage, for finalize reads from recon
-        self._wave_gidx = []
-        for c in cg.coords:
-            if c is None:
-                self._wave_gidx.append(None)
-                continue
-            g = (c[None, :, :] + origins[:, None, :])          # (B, M, ndim)
-            self._wave_gidx.append(np.ravel_multi_index(
-                [g[:, :, k] for k in range(ndim)], self.shape))   # (B, M)
+        # per-chunk global flat indices per stage, for finalize reads from recon.
+        # ravel(c + o) = c @ strides + o @ strides for in-bounds coords, so one
+        # dot per stage replaces the (B, M, ndim) ravel_multi_index.
+        strides = np.cumprod((1,) + self.shape[:0:-1])[::-1].astype(np.int64)
+        obase = origins @ strides                              # (B,)
+        self._wave_gidx = [None if c is None else
+                           (c @ strides)[None, :] + obase[:, None]   # (B, M)
+                           for c in cg.coords]
         self._cg = cg
         self._wave_ids = list(chunk_ids)
         self._E = E

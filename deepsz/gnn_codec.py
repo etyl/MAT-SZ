@@ -33,6 +33,10 @@ _PREFIX_SIZE = struct.calcsize(_PREFIX)
 # memory is ~30*L*K*d bytes/point in transients — ~2^21 points is a few GB)
 _AUTO_CHUNK_THRESHOLD = 1 << 21
 _AUTO_CHUNK_POINTS = 1 << 18  # target points per chunk
+# torch.compile only pays past this many chunks (dynamo warmup is seconds; the
+# fused embed saves ~ms per wave). ponytail: rough amortization cutoff, tune if
+# compile cost or per-wave savings change materially.
+_COMPILE_MIN_CHUNKS = 64
 
 
 def _log(msg):
@@ -358,18 +362,23 @@ def _compress_chunked(
             parts.append(pack_stage(codes, outliers, rans_levels=levels,
                                     rans_tables=tables))
 
+    stage_tables = [build_laplace_tables(e, radius) for e in ebs]
+    mask_cache: dict = {}    # cshape -> (stage masks, per-stage counts)
     bar = _progress_bar("encode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
             cshape = tuple(sl.stop - sl.start
                            for sl in predictor.chunk_slices(ids[0]))
-            cmasks = stage_masks(cshape, predictor.levels, stride, block)
+            if cshape not in mask_cache:
+                cm = stage_masks(cshape, predictor.levels, stride, block)
+                mask_cache[cshape] = (cm, [int(p.sum()) for p in cm])
+            cmasks, counts = mask_cache[cshape]
             predictor.start_wave(ids, recon)
             for s in range(1, len(cmasks)):
                 pos = cmasks[s]
-                n = int(pos.sum())
-                tables = build_laplace_tables(ebs[s], radius)
+                n = counts[s]
+                tables = stage_tables[s]
                 if n == 0:
                     for _ in ids:
                         emit(np.zeros(0, np.uint32), np.zeros(0, np.float32),
@@ -424,18 +433,23 @@ def _decompress_chunked(
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
     _log(f"decode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
          f"{n_sub} model-waves")
+    stage_tables = [build_laplace_tables(e, radius) for e in ebs]
+    mask_cache: dict = {}    # cshape -> (stage masks, per-stage counts)
     bar = _progress_bar("decode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i:i + B_cap]
             cshape = tuple(sl.stop - sl.start
                            for sl in predictor.chunk_slices(ids[0]))
-            cmasks = stage_masks(cshape, predictor.levels, stride, block)
+            if cshape not in mask_cache:
+                cm = stage_masks(cshape, predictor.levels, stride, block)
+                mask_cache[cshape] = (cm, [int(p.sum()) for p in cm])
+            cmasks, counts = mask_cache[cshape]
             predictor.start_wave(ids, recon)
             for s in range(1, len(cmasks)):
                 pos = cmasks[s]
-                n = int(pos.sum())
-                tables = build_laplace_tables(ebs[s], radius)
+                n = counts[s]
+                tables = stage_tables[s]
                 if n == 0:
                     for _ in ids:
                         _c, _o, off = unpack_stage(
@@ -488,8 +502,8 @@ class GNNCompressorCodec:
         eb_ratio: float | None = None,  # None = auto: fast -> 0.8, size -> sweep
         tune: str = "fast",
         strict_checkpoint: bool = True,
-        chunk_size: int | tuple[int, ...] | None = 32,
-        chunk_batch: int | None = 1,
+        chunk_size: int | tuple[int, ...] | None = None,
+        chunk_batch: int | None = None,
         fp16: bool = False,
         compile: bool = True,
         overlap: bool = False,
@@ -589,6 +603,11 @@ class GNNCompressorCodec:
             else ([1.0, 0.9, 0.8, 0.7] if self.tune == "size" else [0.8])
         )
         edges = self._chunk_edges(shape)
+        # torch.compile costs seconds of dynamo warmup per process; only worth
+        # it when there are enough chunk waves to amortize. Frozen into the
+        # stream meta so decode replays the same float path.
+        use_compile = self.compile and edges is not None and int(np.prod(
+            [-(-n // e) for n, e in zip(shape, edges)])) >= _COMPILE_MIN_CHUNKS
         candidates: list[tuple[int, bytes]] = []
         for ratio in ratio_candidates:
             chunk_batch = None
@@ -597,7 +616,7 @@ class GNNCompressorCodec:
                                                  ratio)
             else:
                 payload, chunk_batch = self._compress_chunked_payload(
-                    values, dtype, eb, vmin, vmax, ratio, edges)
+                    values, dtype, eb, vmin, vmax, ratio, edges, use_compile)
             meta = {
                 "codec": "deepsz.gnn",
                 "shape": list(original_shape),
@@ -621,7 +640,7 @@ class GNNCompressorCodec:
                 meta["chunk_batch"] = int(chunk_batch)
                 meta["m_tile"] = int(_gp._M_TILE)   # replay the exact float path
                 meta["fp16"] = bool(self.fp16)
-                meta["compiled"] = bool(self.compile)
+                meta["compiled"] = bool(use_compile)
             stream = _write_stream(meta, payload, self.zstd_level,
                                    _VERSION if edges is None
                                    else _VERSION_CHUNKED)
@@ -708,8 +727,10 @@ class GNNCompressorCodec:
         vmax: float,
         eb_ratio: float,
         edges: tuple[int, ...],
+        use_compile: bool,
     ) -> bytes:
         predictor = self._chunked_predictor(vmin, vmax)
+        predictor.compile = bool(use_compile)
         ebs = _chunk_stage_ebs(values.shape, self.levels, self.anchor_stride,
                                self.anchor_block, eb, eb_ratio)
         payload = _compress_chunked(values[None, ...], ebs, self.radius,

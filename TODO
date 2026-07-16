@@ -8,3 +8,5 @@ clean code
 [done] chose number of neighbors for agregation (agg_level: caps L1 line length;
        --agg-level flag; ~5.7x infer speedup at level 1 on a 4-D tensor, bit-exact)
 use tqdm for tensor eval
+check that there is some overlap over the anchors (coarse embeddings should not be that important)
+still a lot of chunking overhead

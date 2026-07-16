@@ -93,7 +93,36 @@ def _quality(img: np.ndarray, rec: np.ndarray, n_bytes: int, eb: float) -> dict:
                 bound_ok=bound_ok)
 
 
+def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
+    """gnn via the chunked codec (GNNCompressorCodec), so Kodak can exercise
+    the coarse-halo path that big tensors are forced onto. tune=rd is not
+    supported there; it degrades to fast (run both arms with --tune fast for
+    a fair chunked-vs-unchunked comparison)."""
+    from deepsz.gnn_codec import GNNCompressorCodec
+    codec = GNNCompressorCodec(
+        args.gnn_checkpoint, error_bound=eb, levels=args.levels,
+        anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
+        radius=args.radius, zstd_level=args.zstd_level,
+        eb_ratio=args.eb_ratio,
+        tune=args.tune if args.tune in ("fast", "size") else "fast",
+        agg_level=None,  # match the unchunked arm's full neighbourhood
+        device=args.device, chunk_size=args.chunk_size,
+        fp16=args.fp16, compile=args.compile)
+    t0 = time.time()
+    stream = codec.compress(img)
+    t_comp = time.time() - t0
+    t0 = time.time()
+    rec = codec.uncompress(stream).numpy()
+    t_dec = time.time() - t0
+    r = _quality(img, rec, len(stream), eb)
+    r.update(t_comp=t_comp, t_dec=t_dec, t_encode_setup=0.0, t_decode_setup=0.0,
+             tune_candidates=1, t_predict=0.0, t_quantize=0.0, t_entropy=0.0)
+    return r
+
+
 def eval_deepsz(img: np.ndarray, eb: float, method: str, args) -> dict:
+    if method in ("gnn", "gnn-rans") and args.chunk_size is not None:
+        return eval_gnn_chunked(img, eb, args)
     t0 = time.time()
     pred = make_predictor(method, img, args)
     t_encode_setup = time.time() - t0
@@ -274,6 +303,10 @@ def main():
     ap.add_argument("--tune-size-slack", type=float, default=1.05,
                     help="for --tune rd, choose the lowest-SSE candidate within "
                          "this factor of the smallest stream")
+    ap.add_argument("--chunk-size", type=int, default=None,
+                    help="gnn: route through the chunked codec with this chunk "
+                         "edge (multiple of anchor-stride; 0 = whole-tensor via "
+                         "the chunked codec). Omit = original unchunked path")
     ap.add_argument("--gnn-tile", type=int, default=64,
                     help="tile size for the GNN predictor")
     ap.add_argument("--interp-tile", type=int, default=512,
