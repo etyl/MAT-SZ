@@ -15,18 +15,19 @@ module purge
 module load pytorch-gpu
 
 export PYTHONUNBUFFERED=1   # flush progress to the SLURM .out live
-export DEEPSZ_M_TILE=$((16**4))   # M-tiling off (chunk-batch 1 fits without it)
+export DEEPSZ_M_TILE=$((32**4))   # M-tiling off (chunk-batch 1 fits without it)
 
 # D128 checkpoint
 # CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
 # D32 checkpoint
 # CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260714-095239-e16d09/gnn_predictor.pt}
-CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260714-182442-d79742/gnn_predictor.pt}
+# CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260714-182442-d79742/gnn_predictor.pt}
+CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260716-190203-07b676/gnn_predictor.pt}
 
-# DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
-DATA=${DATA:-./data/rti_rough.npy}
+DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
+# DATA=${DATA:-./data/rti_rough.npy}
 
-EB=${EB:-0.01}
+EB=${EB:-0.0001}
 TUNE=${TUNE:-fast}               # MAT: fast (1 encode) | size/rd (4 encodes)
 # SZ3 independently uses its tuned INTERP_LORENZO hybrid at every error bound.
 TUNE_SIZE_SLACK=${TUNE_SIZE_SLACK:-1.05}
@@ -39,7 +40,7 @@ python scripts/eval_tensor.py "$DATA" \
     --anchor-stride 32 \
     --chunk-size 32 \
     --anchor-block 1 \
-    --agg-level 2 \
+    --agg-level 1 \
     --chunk-batch 1 \
     --tune "$TUNE" \
     --tune-size-slack "$TUNE_SIZE_SLACK" \
