@@ -454,7 +454,14 @@ def build_model(d: int = 32):
             cond = log_eb.view(B, 1, 1).expand(B, M, 1)
             out = self.net(torch.cat([e, cond], dim=-1))
             mu = torch.sigmoid(out[..., 0])
-            log_b = out[..., 1].clamp(-8.0, 0.0)
+            # Laplace scale is eb-relative: `delta` spans the deployed rANS scale
+            # grid [eb/16, 64*eb] (log2 offsets -4..6, see rans.scale_to_level), so
+            # the head can express sub-eb confidence at ANY eb. The old
+            # span-relative clamp(-8,0) reached the grid floor only near eb~=0.05
+            # (top of the training range) and pinned every point to the broadest
+            # grid levels at low eb, charging ~5 bits even for perfect predictions.
+            delta = out[..., 1].clamp(-4.0, 6.0)
+            log_b = log_eb.view(B, 1) + delta
             return mu, log_b
 
     class MixEmbed(nn.Module):
