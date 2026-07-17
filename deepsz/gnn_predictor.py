@@ -712,7 +712,11 @@ class GNNPredictor:
         # (rope/where/dir/bidir), the ~40% of GPU time not in the GEMMs.
         # dynamic=True: one graph for every stage/chunk M, no recompile storm.
         # enc and dec both compile (flag replayed) so their float paths match.
-        if self.compile and not getattr(self, "_compiled", False):
+        # Inference models are shared by `_load_inference_model`.  Keep the
+        # marker on that shared object: a fresh decoder predictor must reuse the
+        # encoder's wrapper instead of compiling an already-compiled `embed`
+        # method a second time (and retaining another Inductor/CUDA-graph pool).
+        if self.compile and not getattr(self.model, "_embed_compiled", False):
             # DEEPSZ_COMPILE_MODE=reduce-overhead -> CUDA graphs, kills per-kernel
             # launch latency on the ~30 tiny message-pass kernels (launch-bound).
             # ponytail: CUDA graphs want static shapes; with varying stage M they
@@ -720,7 +724,7 @@ class GNNPredictor:
             mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
             self.model.embed = self._torch.compile(
                 self.model.embed, dynamic=True, mode=mode)
-            self._compiled = True
+            self.model._embed_compiled = True
 
     def _amp(self):
         self._maybe_compile()
@@ -1094,7 +1098,10 @@ class ChunkedGNNPredictor:
         # Wrap the embed pass once (fuses the elementwise message-pass ops that
         # aren't in the GEMMs). dynamic=True keeps one graph across all M sizes;
         # enc and dec both compile (flag replayed) so their float paths match.
-        if self.compile and not getattr(self, "_compiled", False):
+        # The checkpoint model is cached and shared by encode/decode predictors.
+        # Mark the shared model, not this short-lived predictor, or decode wraps
+        # the encoder's compiled method again and creates a second graph pool.
+        if self.compile and not getattr(self.model, "_embed_compiled", False):
             # DEEPSZ_COMPILE_MODE=reduce-overhead -> CUDA graphs, kills per-kernel
             # launch latency on the ~30 tiny message-pass kernels (launch-bound).
             # ponytail: CUDA graphs want static shapes; with varying stage M they
@@ -1102,7 +1109,7 @@ class ChunkedGNNPredictor:
             mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
             self.model.embed = self._torch.compile(
                 self.model.embed, dynamic=True, mode=mode)
-            self._compiled = True
+            self.model._embed_compiled = True
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
                  device: str = "cpu", levels: int = 4, anchor_stride: int = 16,
@@ -1160,8 +1167,15 @@ class ChunkedGNNPredictor:
         n_band = int(len(cg.ref_halo_flat))          # upper bound (all referenced)
         field_bytes = channels * (1 + n_interior + n_band) * ndim * self.d * 4
         M = max((g.M for g in cg.geoms if g is not None), default=0)
+        m = min(M, _M_TILE)
         L = len(half_directions(ndim, self.agg_level))
-        act_bytes = 4 * channels * L * M * ndim * self.d * 4  # ~4 live copies
+        # The persistent compact field stays fp32, while autocast halves the
+        # dominant message/MLP buffers.  `embed` also streams the query axis in
+        # `_M_TILE` blocks, so budget the largest live block rather than the
+        # full stage.  The old guard ignored both and rejected decodes which had
+        # just encoded successfully.
+        act_itemsize = 2 if self.fp16 and self.device.type == "cuda" else 4
+        act_bytes = 4 * channels * L * m * ndim * self.d * act_itemsize
         need = field_bytes + act_bytes
         if self.device.type == "cuda":
             budget = int(0.8 * torch.cuda.mem_get_info(self.device)[0])
@@ -1171,7 +1185,8 @@ class ChunkedGNNPredictor:
             raise MemoryError(
                 f"chunked GNN needs up to {need/1e9:.0f} GB per chunk "
                 f"(field {field_bytes/1e9:.1f} + stage activation "
-                f"{act_bytes/1e9:.0f} GB for M={M:,} queries x L={L} lines, "
+                f"{act_bytes/1e9:.0f} GB for m={m:,}/{M:,} queries x L={L} "
+                f"lines, "
                 f"budget {budget/1e9:.0f} GB). Reduce --anchor-stride: the chunk "
                 f"edge (>= anchor_stride) sets M, and the {ndim}-D activation "
                 f"grows as edge^{ndim}. anchor-stride 16 keeps M small.")

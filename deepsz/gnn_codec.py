@@ -678,6 +678,13 @@ class GNNCompressorCodec:
 
         if "chunks" in meta:
             edges = tuple(int(e) for e in meta["chunks"])
+            # `compress()` may have just released large chunk transients.  They
+            # remain reserved in PyTorch's allocator, while `begin()` sizes its
+            # fail-fast budget from CUDA's externally free memory.  Release idle
+            # blocks before that preflight so a same-process roundtrip is judged
+            # against the device's real available capacity.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             predictor = self._chunked_predictor(vmin, vmax, meta)
             ebs = _chunk_stage_ebs(shape, int(meta["levels"]),
                                    int(meta["anchor_stride"]),

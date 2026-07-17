@@ -11,3 +11,5 @@ use tqdm for tensor eval
 check that there is some overlap over the anchors (coarse embeddings should not be that important)
 still a lot of chunking overhead
 optimize geometry neighbours caching
+bpp lost because of coarse chunking?
+benchmark 1agg

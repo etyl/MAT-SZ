@@ -254,7 +254,13 @@ class _SubsetStageGeom:
 
 _SUB_GEOM_CACHE: dict = {}
 _SUB_FRAME_CACHE: dict = {}
-_SUB_FRAME_CACHE_MAX = 8  # compact remaps are large for 32^4; bound GPU residency
+# A 32^4 interface layout contains several million GPU indices.  Unlike the
+# halo-free skeleton path, interface layouts vary with the chunk's low-face
+# signature; retaining all 2**ndim variants can therefore consume an entire
+# GPU before the first model forward.  Groups are processed consecutively, so
+# retaining more than the current layout buys no reuse in the normal driver.
+_SUB_GEOM_CACHE_MAX = 1
+_SUB_FRAME_CACHE_MAX = 1
 
 
 class _SubGeoms:
@@ -323,6 +329,8 @@ def _build_sub_geoms(cshape, levels, stride, block, qmask, torch, device,
                                  agg_level)
         hit = _SubGeoms(base, qmask, torch, device, key)
         _SUB_GEOM_CACHE[key] = hit
+        if len(_SUB_GEOM_CACHE) > _SUB_GEOM_CACHE_MAX:
+            _SUB_GEOM_CACHE.pop(next(iter(_SUB_GEOM_CACHE)))
     return hit
 
 
@@ -834,6 +842,10 @@ def _skel_iface_passes_batched(values, recon, ebs, radius, round_output,
                                predictor, shape, stride, block, batch,
                                *, decode=False, payload=None, off0=0):
     """Two-phase interface driver batched by equal subset/boundary geometry."""
+    # These module caches contain CUDA tensors.  A fresh pass must not inherit
+    # layouts retained by a previous encode/decode in the same Python process.
+    _SUB_GEOM_CACHE.clear()
+    _SUB_FRAME_CACHE.clear()
     edges = predictor.edges
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     c = 1 if decode else values.shape[0]
@@ -848,36 +860,19 @@ def _skel_iface_passes_batched(values, recon, ebs, radius, round_output,
                 | _on_internal_boundary(gci, edges))
 
     groups = _iface_groups(predictor)
-    sub_cache: dict = {}
     for phase, known_pred in (("iface", known_iface),
                               ("interior", known_interior)):
         direction = "decode" if decode else "encode"
 
         def get_sub(cshape, low):
-            key = (cshape, low, phase)
-            sub = sub_cache.get(key)
-            if sub is None:
-                origin = np.array([edge if flag else 0
-                                   for edge, flag in zip(edges, low)], np.int64)
-                iface, strict = _classify(cshape, origin, edges, stride)
-                qmask = iface if phase == "iface" else strict
-                sub = _build_sub_geoms(
-                    cshape, predictor.levels, stride, block, qmask,
-                    predictor._torch, predictor.device, predictor.agg_level,
-                    (phase, low))
-                sub_cache[key] = sub
-            return sub
-
-        # Geometry construction is intentionally outside the chunk progress bar:
-        # on a cold cache this makes setup cost visible instead of reporting it as
-        # a 20-80 second "chunk". Compact frames stay in a small bounded cache and
-        # are built on first use; retaining all 3**ndim boundary variants can use
-        # many GB for a 32^4 chunk.
-        gbar = _progress_bar(f"skel {phase} geometry", len(groups), unit="group")
-        for (cshape, low, _bsig), group in groups:
-            get_sub(cshape, low)
-            gbar.update(1)
-        gbar.close()
+            origin = np.array([edge if flag else 0
+                               for edge, flag in zip(edges, low)], np.int64)
+            iface, strict = _classify(cshape, origin, edges, stride)
+            qmask = iface if phase == "iface" else strict
+            return _build_sub_geoms(
+                cshape, predictor.levels, stride, block, qmask,
+                predictor._torch, predictor.device, predictor.agg_level,
+                (phase, low))
 
         bar = _progress_bar(f"skel {phase} {direction}", predictor.n_chunks,
                             unit="chunk")
@@ -923,6 +918,12 @@ def _skel_iface_passes_batched(values, recon, ebs, radius, round_output,
                                 rans_tables=stage_tables[s]))
                 predictor.finish_sub_wave()
                 bar.update(len(ids))
+            # Each group is visited once, so retaining its (potentially multi-GB)
+            # remap/geometry only raises the next group's peak.  Drop it before
+            # constructing the next boundary signature.
+            del sub
+            _SUB_FRAME_CACHE.clear()
+            _SUB_GEOM_CACHE.clear()
         bar.close()
     return off if decode else parts
 
@@ -1026,8 +1027,14 @@ class SkeletonGNNCodec(GNNCompressorCodec):
             [float(self.eb_ratio)] if self.eb_ratio is not None
             else ([1.0, 0.9, 0.8, 0.7] if self.tune == "size" else [0.8]))
         edges = self._skel_edges(shape)
-        use_compile = self.compile and int(np.prod(
-            [-(-n // e) for n, e in zip(shape, edges)])) >= 64
+        # The interface pass has one dynamically-shaped subset per boundary
+        # signature.  Inductor captures a CUDA graph/pool for each of them,
+        # which defeats chunking on 16 GB GPUs.  The halo-free skeleton path has
+        # one stable layout and can still benefit from compilation.
+        use_compile = (self.compile and not self.interfaces and int(np.prod(
+            [-(-n // e) for n, e in zip(shape, edges)])) >= 64)
+        if self.compile and self.interfaces:
+            _log("skel(iface): disabling torch.compile for dynamic subset layouts")
         candidates: list[tuple[int, bytes]] = []
         for ratio in ratio_candidates:
             predictor = self._chunked_predictor(vmin, vmax)
@@ -1079,6 +1086,12 @@ class SkeletonGNNCodec(GNNCompressorCodec):
         if vmax <= vmin:
             vmax = vmin + 1.0
         edges = tuple(int(e) for e in meta["chunks"])
+        if meta.get("interfaces") and torch.cuda.is_available():
+            # The encoder has just released large transient subset layouts, but
+            # PyTorch still reserves their blocks.  The generic chunk predictor
+            # sizes its decode preflight from CUDA's *free* memory, so return
+            # those idle blocks before constructing it.
+            torch.cuda.empty_cache()
         predictor = self._chunked_predictor(vmin, vmax, meta)
         ebs = _chunk_stage_ebs(shape, int(meta["levels"]),
                                int(meta["anchor_stride"]),

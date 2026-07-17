@@ -30,7 +30,7 @@ CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260715-
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
 # DATA=${DATA:-./data/rti_rough.npy}
 
-EB=${EB:-0.01}
+EB=${EB:-0.0001}
 TUNE=${TUNE:-fast}               # MAT: fast (1 encode) | size/rd (4 encodes)
 CODEC=${CODEC:-gnn}             # gnn | skel
 LINE_ORDER=${LINE_ORDER:-cubic}   # skel: cubic | linear
@@ -48,7 +48,7 @@ python scripts/eval_tensor.py "$DATA" \
     --chunk-size 32 \
     --anchor-block 1 \
     --agg-level 2 \
-    --chunk-batch 3 \
+    --chunk-batch 1 \
     --tune "$TUNE" \
     --tune-size-slack "$TUNE_SIZE_SLACK" \
     --normalize \

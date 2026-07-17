@@ -1,5 +1,7 @@
 """Tests for the dimension-agnostic GNN predictor (untrained-net smoke tests)."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -9,6 +11,7 @@ from deepsz.gnn_predictor import (CKPT_VERSION, GNNPredictor, build_model,
                                   build_stage_geoms, half_directions,
                                   stage_forward)
 from deepsz.gnn_predictor import _LegacyGeom
+import deepsz.gnn_predictor as gp
 from deepsz.levels import stage_masks
 
 
@@ -162,6 +165,58 @@ def test_gnn_predictors_share_loaded_inference_model(tmp_path):
         path, 0.0, 2.0, levels=2, anchor_stride=4, anchor_block=1)
 
     assert first.model is second.model
+
+
+def test_shared_inference_model_is_compiled_only_once(monkeypatch):
+    """Encode/decode predictors share a model and must also share its wrapper."""
+    model = build_model(d=8).eval()
+    calls = []
+
+    def fake_compile(fn, **kwargs):
+        calls.append((fn, kwargs))
+        return lambda *args, **kw: fn(*args, **kw)
+
+    fake_torch = SimpleNamespace(compile=fake_compile)
+    first = GNNPredictor.__new__(GNNPredictor)
+    second = GNNPredictor.__new__(GNNPredictor)
+    for predictor in (first, second):
+        predictor.model = model
+        predictor._torch = fake_torch
+        predictor.compile = True
+
+    first._maybe_compile()
+    second._maybe_compile()
+
+    assert len(calls) == 1
+    assert model._embed_compiled is True
+
+
+def test_chunk_budget_accounts_for_fp16_and_query_tiling(monkeypatch):
+    geom = SimpleNamespace(M=100)
+    cg = SimpleNamespace(
+        interior_flat=np.empty(10, np.int64),
+        ref_halo_flat=np.empty(0, np.int64),
+        geoms=[geom],
+    )
+    monkeypatch.setattr(gp, "build_chunk_geoms", lambda *args, **kwargs: cg)
+    monkeypatch.setattr(gp, "_M_TILE", 25)
+
+    fake_cuda = SimpleNamespace(mem_get_info=lambda device: (12_500, 12_500))
+    predictor = gp.ChunkedGNNPredictor.__new__(gp.ChunkedGNNPredictor)
+    predictor._torch = SimpleNamespace(cuda=fake_cuda)
+    predictor.device = torch.device("cuda")
+    predictor.shape = (32, 32)
+    predictor.edges = (32, 32)
+    predictor.levels = 2
+    predictor.anchor_stride = 4
+    predictor.anchor_block = 1
+    predictor.agg_level = 1
+    predictor.d = 10
+    predictor.fp16 = True
+
+    # 0.8 * 12,500 = 10,000 bytes.  The fp16, 25-query working block plus
+    # fp32 field needs 8,880 bytes; the old full-M/fp32 estimate was 64,880.
+    predictor._check_field_budget(ndim=2, channels=1)
 
 
 def test_finalize_ctx_reuse_equivalence():
