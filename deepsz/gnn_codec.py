@@ -58,11 +58,16 @@ def _cuda_peak(predictor):
     return peak
 
 
-def _progress_bar(tag, n):
+def _progress_bar(tag, n, unit="wave"):
     # env-gated (DEEPSZ_PROGRESS) so tests/CLI stay quiet; disabled bar is a no-op.
     from tqdm import tqdm
-    return tqdm(total=n, desc=tag, unit="wave", file=sys.stderr,
+    return tqdm(total=n, desc=tag, unit=unit, file=sys.stderr,
                 disable=not os.environ.get("DEEPSZ_PROGRESS"))
+
+
+def _geometry_stages(ndim: int, levels: int) -> int:
+    """Number of masks/geometries in the dimension-generic stage schedule."""
+    return 1 + levels * ((1 << ndim) - 1)
 
 
 def _as_numpy(x: Any) -> np.ndarray:
@@ -308,10 +313,21 @@ def _compress_chunked(
     axes = _anchor_axes(shape, stride, block)
     _log(f"encode: shape={shape} edges={edges} device={predictor.device} "
          f"coding anchors...")
+    anchor_bar = _progress_bar("encode anchors", 1, unit="stage")
     parts = [_code_anchor_stage(values, recon, axes, ebs[0], radius,
                                 round_output)]
-    predictor.begin(shape, edges, channels=c)
-    predictor.anchor_coarse(recon)
+    anchor_bar.update(1)
+    anchor_bar.close()
+    geom_bar = _progress_bar("encode geometry",
+                             _geometry_stages(len(shape), predictor.levels),
+                             unit="stage")
+    predictor.begin(shape, edges, channels=c,
+                    geometry_progress=geom_bar.update)
+    geom_bar.close()
+    coarse_bar = _progress_bar("encode anchor embeddings", predictor.n_chunks,
+                               unit="chunk")
+    predictor.anchor_coarse(recon, progress=coarse_bar.update)
+    coarse_bar.close()
     B_cap = predictor.max_batch(tuple(min(e, n) for e, n in zip(edges, shape)))
     if batch_cap is not None:                        # user cap (never above safe)
         B_cap = max(1, min(B_cap, int(batch_cap)))
@@ -425,9 +441,20 @@ def _decompress_chunked(
     recon = np.zeros((c, *shape), np.float32)
     axes = _anchor_axes(shape, stride, block)
     _log(f"decode: shape={shape} edges={edges} decoding anchors...")
+    anchor_bar = _progress_bar("decode anchors", 1, unit="stage")
     off = _decode_anchor_stage(payload, 0, recon, axes, ebs[0], radius)
-    predictor.begin(shape, edges, channels=c)
-    predictor.anchor_coarse(recon)
+    anchor_bar.update(1)
+    anchor_bar.close()
+    geom_bar = _progress_bar("decode geometry",
+                             _geometry_stages(len(shape), predictor.levels),
+                             unit="stage")
+    predictor.begin(shape, edges, channels=c,
+                    geometry_progress=geom_bar.update)
+    geom_bar.close()
+    coarse_bar = _progress_bar("decode anchor embeddings", predictor.n_chunks,
+                               unit="chunk")
+    predictor.anchor_coarse(recon, progress=coarse_bar.update)
+    coarse_bar.close()
     B_cap = max(1, int(batch))
     waves = _chunk_waves(predictor.grid)
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
