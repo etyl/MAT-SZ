@@ -66,7 +66,7 @@ def test_real_predictor_stream_requires_factory():
     img = smooth_image(64, 64, 3)
     stream, _ = compress(img, 2.0, MockPredictor(64))
     # corrupt the mock flag to simulate a real-predictor stream
-    from deepsz.bitstream import Header, read_stream, write_stream
+    from deepsz.bitstream import read_stream, write_stream
     hdr, payloads = read_stream(stream)
     hdr.flags &= ~1
     with pytest.raises(ValueError, match="checkpoint"):

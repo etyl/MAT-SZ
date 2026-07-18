@@ -22,7 +22,7 @@ dependencies = [
 image = ["pillow"]
 gnn = ["torch"]
 eval = ["pysz"]
-test = ["pytest", "pillow", "torch"]
+test = ["pytest", "pillow", "torch", "ruff"]
 all = ["pillow", "torch", "pysz"]
 
 [project.scripts]
@@ -30,3 +30,13 @@ deepsz = "deepsz.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["deepsz*"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402"]
+"tests/*.py" = ["E402"]

@@ -13,7 +13,7 @@ sets FLAG_RANS use scale-conditioned context coding over the same code array.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import zstandard

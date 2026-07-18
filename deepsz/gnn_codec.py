@@ -260,7 +260,6 @@ def _chunk_waves(grid: tuple[int, ...]) -> list[list[int]]:
     in the model's B dim. Ordered by color so a wave's cross-color neighbours in
     earlier colors are already coded. Correctness (the error bound) holds for any
     order; only which context is available, hence the ratio, shifts."""
-    ndim = len(grid)
     groups: dict = {}
     for ci in range(int(np.prod(grid))):
         cidx = np.unravel_index(ci, grid)

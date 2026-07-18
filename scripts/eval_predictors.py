@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from deepsz.baselines import sz3_roundtrip
-from deepsz.bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_INTERP, FLAG_MOCK, Header
+from deepsz.bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_MOCK, Header
 from deepsz.codec import compress, decompress
 from deepsz.predictor import InterpPredictor, MockPredictor
 

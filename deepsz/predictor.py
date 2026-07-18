@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .bitstream import FLAG_CUBIC, FLAG_INTERP, FLAG_MOCK, FLAG_NOTILE
+from .bitstream import FLAG_CUBIC, FLAG_INTERP, FLAG_MOCK
 from .levels import stage_plan
 
 

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_INTERP, FLAG_MOCK, Header, read_stream
+from .bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_INTERP, FLAG_MOCK, Header
 from .codec import compress, decompress
 from .predictor import InterpPredictor, MockPredictor
 
