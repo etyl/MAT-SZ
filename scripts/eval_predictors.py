@@ -24,9 +24,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from deepsz.baselines import sz3_roundtrip
-from deepsz.bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_MOCK, Header
+from deepsz.bitstream import (FLAG_COMPILED, FLAG_CUBIC, FLAG_FP16, FLAG_GNN,
+                              Header)
 from deepsz.codec import compress, decompress
-from deepsz.predictor import InterpPredictor, MockPredictor
+from deepsz.predictor import InterpPredictor
 
 METHODS = ("gnn-rans", "gnn", "interp", "interp-linear", "sz3")
 
@@ -48,7 +49,7 @@ def make_predictor(method: str, img: np.ndarray, args):
     if method in ("gnn", "gnn-rans"):
         from deepsz.gnn_predictor import GNNPredictor
         p = GNNPredictor(args.gnn_checkpoint, float(img.min()), float(img.max()),
-                         tile_size=args.gnn_tile, max_radius=args.max_radius,
+                         max_radius=args.max_radius,
                          device=args.device, levels=args.levels,
                          anchor_stride=args.anchor_stride,
                          anchor_block=args.anchor_block)
@@ -56,7 +57,7 @@ def make_predictor(method: str, img: np.ndarray, args):
         p.compile = args.compile
         return p
     order = "linear" if method == "interp-linear" else "cubic"
-    return InterpPredictor(args.interp_tile, order, args.levels,
+    return InterpPredictor(order, args.levels,
                            args.anchor_stride, args.anchor_block)
 
 
@@ -65,16 +66,15 @@ def build_predictor_for_decompress(method: str, hdr: Header, args):
     if hdr.flags & FLAG_GNN:
         from deepsz.gnn_predictor import GNNPredictor
         p = GNNPredictor(args.gnn_checkpoint, hdr.vmin, hdr.vmax,
-                         tile_size=hdr.tile_size, max_radius=args.max_radius,
+                         max_radius=hdr.max_radius,
                          device=args.device, levels=hdr.levels,
                          anchor_stride=hdr.anchor_stride,
-                         anchor_block=hdr.anchor_block)
-        p.fp16 = args.fp16   # eval runs enc+dec in-process, so both match
-        p.compile = args.compile
+                         anchor_block=hdr.anchor_block,
+                         agg_level=(None if hdr.agg_level < 0 else hdr.agg_level))
+        p.fp16 = bool(hdr.flags & FLAG_FP16)
+        p.compile = bool(hdr.flags & FLAG_COMPILED)
         return p
-    if hdr.flags & FLAG_MOCK:
-        return MockPredictor(hdr.tile_size)
-    return InterpPredictor(hdr.tile_size, "cubic" if hdr.flags & FLAG_CUBIC else "linear",
+    return InterpPredictor("cubic" if hdr.flags & FLAG_CUBIC else "linear",
                            hdr.levels, hdr.anchor_stride, hdr.anchor_block)
 
 
@@ -130,7 +130,7 @@ def eval_deepsz(img: np.ndarray, eb: float, method: str, args) -> dict:
     stream, stats = compress(img, eb, pred, levels=args.levels,
                              anchor_stride=args.anchor_stride,
                              anchor_block=args.anchor_block, radius=args.radius,
-                             seed=args.seed, zstd_level=args.zstd_level,
+                             zstd_level=args.zstd_level,
                              eb_ratio=args.eb_ratio,
                              tune=args.tune,
                              tune_size_slack=args.tune_size_slack)
@@ -292,7 +292,6 @@ def main():
     ap.add_argument("--anchor-stride", type=int, default=16)
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
-    ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--zstd-level", type=int, default=9)
     ap.add_argument("--eb-ratio", type=float, default=None,
                     help="per-level eb decay (coarse tighter); default: interp "
@@ -307,10 +306,6 @@ def main():
                     help="gnn: route through the chunked codec with this chunk "
                          "edge (multiple of anchor-stride; 0 = whole-tensor via "
                          "the chunked codec). Omit = original unchunked path")
-    ap.add_argument("--gnn-tile", type=int, default=64,
-                    help="tile size for the GNN predictor")
-    ap.add_argument("--interp-tile", type=int, default=512,
-                    help="region/tile size for the interp predictor")
     ap.add_argument("--max-radius", type=int, default=64,
                     help="GNN neighbour search radius")
     ap.add_argument("--device", default="cpu", help="torch device for the GNN")
@@ -358,8 +353,8 @@ def main():
     print(f"Error bounds: {args.eb}  |  levels={args.levels} "
           f"anchor_stride={args.anchor_stride} anchor_block={args.anchor_block}")
     if uses_gnn:
-        print(f"GNN checkpoint: {args.gnn_checkpoint}  (tile={args.gnn_tile}, "
-              f"device={args.device}, fp16={'ON' if args.fp16 else 'off'})")
+        print(f"GNN checkpoint: {args.gnn_checkpoint}  "
+              f"(device={args.device}, fp16={'ON' if args.fp16 else 'off'})")
         if args.fp16 and not str(args.device).startswith("cuda"):
             print("  NOTE: fp16 autocast only engages on cuda; device is "
                   f"{args.device!r} -> running fp32")

@@ -16,7 +16,7 @@ module load pytorch-gpu
 
 export PYTHONUNBUFFERED=1   # flush the table to the SLURM .out live
 
-CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
+: "${CKPT:?Set CKPT to a GNN checkpoint before running this launcher}"
 
 python scripts/profile_gnn.py \
     --gnn-checkpoint "$CKPT" \

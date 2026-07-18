@@ -694,7 +694,6 @@ class GNNPredictor:
 
     from .bitstream import FLAG_GNN as _FLAG
     stream_flag = _FLAG
-    tile_free = True  # runs on the whole tensor as one region, no tiling
     tunable = True    # encoder sweeps eb_ratio (no centre mode; see codec.encode)
     fast_eb_ratio = 0.8  # single-encode (tune=fast) default; tighter coarse
                          # levels help the learned fine-level prediction
@@ -725,7 +724,7 @@ class GNNPredictor:
         return contextlib.nullcontext()
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
-                 tile_size: int = 64, max_radius: int = 64, device: str = "cpu",
+                 max_radius: int = 64, device: str = "cpu",
                  levels: int = 4, anchor_stride: int = 16, anchor_block: int = 1,
                  agg_level: int | None = None):
         import torch
@@ -734,7 +733,6 @@ class GNNPredictor:
         self.device = torch.device(device)
         self.vmin = float(vmin)
         self.vmax = float(vmax)
-        self.tile_size = int(tile_size)
         self.max_radius = int(max_radius)
         self.levels = int(levels)
         self.anchor_stride = int(anchor_stride)

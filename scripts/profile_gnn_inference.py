@@ -94,7 +94,7 @@ def predictor_values(arr: np.ndarray) -> tuple[np.ndarray, tuple[int, ...]]:
 
 def make_predictor(args, vmin: float, vmax: float) -> GNNPredictor:
     return GNNPredictor(
-        args.checkpoint, vmin, vmax, tile_size=0,
+        args.checkpoint, vmin, vmax,
         max_radius=args.max_radius, device=args.device,
         levels=args.levels, anchor_stride=args.anchor_stride,
         anchor_block=args.anchor_block, agg_level=args.agg_level)

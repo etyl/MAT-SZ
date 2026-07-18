@@ -16,7 +16,7 @@ module load pytorch-gpu
 
 export PYTHONUNBUFFERED=1
 
-CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
+: "${CKPT:?Set CKPT to a GNN checkpoint before running this launcher}"
 
 # Operator-level trace of one worst-case chunk's GNN forward: shows which ops
 # (matmul/gelu/softmax/index/copy...) dominate CUDA time -> what to optimize.

@@ -1,10 +1,14 @@
-"""Full-pipeline integration tests with the torch-free MockPredictor."""
+"""Full-pipeline integration tests with a private test predictor."""
 
 import numpy as np
 import pytest
 
 from deepsz.codec import compress, decompress
-from deepsz.predictor import MockPredictor
+from tests.helpers import NearestPredictor
+
+
+def _decode(stream):
+    return decompress(stream, lambda _header: NearestPredictor())
 
 
 def smooth_image(h, w, c, seed=0):
@@ -29,8 +33,8 @@ def test_roundtrip_bound(shape, eb):
     img = smooth_image(h, w, c)
     if c == 1:
         img = img[..., 0]
-    stream, stats = compress(img, eb, MockPredictor(64))
-    rec = decompress(stream)
+    stream, stats = compress(img, eb, NearestPredictor())
+    rec = _decode(stream)
     assert rec.shape == img.shape and rec.dtype == img.dtype
     assert np.abs(img.astype(np.int64) - rec.astype(np.int64)).max() <= eb
     assert stats["ratio"] > 1.0
@@ -38,36 +42,32 @@ def test_roundtrip_bound(shape, eb):
 
 def test_deterministic_streams_and_output():
     img = smooth_image(100, 130, 3)
-    s1, _ = compress(img, 2.0, MockPredictor(64))
-    s2, _ = compress(img, 2.0, MockPredictor(64))
+    s1, _ = compress(img, 2.0, NearestPredictor())
+    s2, _ = compress(img, 2.0, NearestPredictor())
     assert s1 == s2
-    r1 = decompress(s1)
-    r2 = decompress(s1)
+    r1 = _decode(s1)
+    r2 = _decode(s1)
     assert np.array_equal(r1, r2)
 
 
 def test_encoder_recon_matches_decoder_output():
     img = smooth_image(64, 64, 3, seed=5)
-    stream, stats = compress(img, 1.0, MockPredictor(64))
-    rec = decompress(stream)
+    stream, stats = compress(img, 1.0, NearestPredictor())
+    rec = _decode(stream)
     assert np.array_equal(stats["recon"], rec)
 
 
 def test_float_input():
     rng = np.random.RandomState(7)
     img = (rng.rand(70, 90).astype(np.float32) * 4).round(2)
-    stream, _ = compress(img, 0.01, MockPredictor(64))
-    rec = decompress(stream)
+    stream, _ = compress(img, 0.01, NearestPredictor())
+    rec = _decode(stream)
     assert rec.dtype == np.float32
     assert np.abs(img - rec).max() <= 0.01
 
 
-def test_real_predictor_stream_requires_factory():
+def test_unidentified_predictor_stream_requires_factory():
     img = smooth_image(64, 64, 3)
-    stream, _ = compress(img, 2.0, MockPredictor(64))
-    # corrupt the mock flag to simulate a real-predictor stream
-    from deepsz.bitstream import read_stream, write_stream
-    hdr, payloads = read_stream(stream)
-    hdr.flags &= ~1
+    stream, _ = compress(img, 2.0, NearestPredictor())
     with pytest.raises(ValueError, match="checkpoint"):
-        decompress(write_stream(hdr, payloads))
+        decompress(stream)

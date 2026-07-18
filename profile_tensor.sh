@@ -30,8 +30,7 @@ export DEEPSZ_M_TILE=$((16 ** 4))
 # self-CUDA-total. Set empty to compare the default (uncompiled-mode) path.
 # export DEEPSZ_COMPILE_MODE=${DEEPSZ_COMPILE_MODE:-reduce-overhead}
 
-# D32 checkpoint
-CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
+: "${CKPT:?Set CKPT to a GNN checkpoint before running this launcher}"
 
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
 # DATA=${DATA:-./data/rti_normal.npy}

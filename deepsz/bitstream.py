@@ -1,9 +1,8 @@
 """DeepSZ container format.
 
-File = fixed struct-packed little-endian header, then a u32 per-tile payload
-size table, then one zstd frame holding the concatenated tile payloads.
+File = a fixed little-endian header, the spatial shape, and one zstd frame.
 
-Tile payload (produced by codec, opaque here) = per stage:
+The stage payload (produced by the codec, opaque here) contains, per stage:
   [n_codes u32][entropy blob len u64][entropy blob][n_outliers u32][outliers f32...]
 
 For legacy streams the entropy blob is canonical Huffman. Streams whose header
@@ -18,18 +17,17 @@ from dataclasses import dataclass
 import numpy as np
 import zstandard
 
-MAGIC = b"MATSZ01\0"
-VERSION = 5
+MAGIC = b"DEEPSZ01"
+VERSION = 1
 
-FLAG_MOCK = 1 << 0
-FLAG_GRAY = 1 << 1
-FLAG_GNN = 1 << 2
-FLAG_INTERP = 1 << 3       # SZ-style interpolation baseline (torch-free)
-FLAG_CUBIC = 1 << 4        # interp order: set = cubic, clear = linear
-FLAG_NOTILE = 1 << 5       # whole image is one tile (no padding, no seam)
-FLAG_RANS = 1 << 6         # per-symbol scale-conditioned coder for stage bins
+FLAG_GNN = 1 << 0
+FLAG_INTERP = 1 << 1       # SZ-style interpolation baseline (torch-free)
+FLAG_CUBIC = 1 << 2        # interp order: set = cubic, clear = linear
+FLAG_RANS = 1 << 3         # per-symbol scale-conditioned coder for stage bins
+FLAG_FP16 = 1 << 4         # GNN message pass uses fp16 autocast
+FLAG_COMPILED = 1 << 5     # GNN embedding pass uses torch.compile
 
-_HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHHd"
+_HEADER_FMT = "<8sHHBBBBBBIHbddd16sd"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 
 DTYPE_CODES = {0: np.uint8, 1: np.float32}
@@ -38,94 +36,69 @@ DTYPE_IDS = {np.dtype(np.uint8): 0, np.dtype(np.float32): 1}
 
 @dataclass
 class Header:
-    orig_h: int
-    orig_w: int
     channels: int
     src_dtype: int  # key into DTYPE_CODES
+    spatial: tuple[int, ...]
     eb: float  # absolute error bound, original data units
     levels: int
     anchor_stride: int
     anchor_block: int
-    tile_size: int
     radius: int
-    seed: int
+    max_radius: int
+    agg_level: int  # -1 means the full GNN neighbourhood
     vmin: float
     vmax: float
-    ckpt_hash: bytes = b"\0" * 16  # sha256 prefix; zeros for mock predictor
-    n_tiles_y: int = 1
-    n_tiles_x: int = 1
+    ckpt_hash: bytes = b"\0" * 16  # sha256 prefix; zeros for interpolation
     flags: int = 0
     interp_center: int = 0  # interp multi-axis mode: 0=avg both, 1=axis0, 2=axis1
     eb_ratio: float = 1.0   # per-level error-bound decay (coarse tighter); 1=flat
     version: int = VERSION
-    # Original (unpadded) spatial shape, any rank. Written as a variable-length
-    # block by write_stream (the fixed struct only has room for 2 axes). Empty
-    # falls back to (orig_h, orig_w) for legacy 2-D callers.
-    spatial: tuple[int, ...] = ()
 
     def pack(self) -> bytes:
-        return struct.pack(
+        fixed = struct.pack(
             _HEADER_FMT, MAGIC, self.version, self.flags,
-            self.orig_h, self.orig_w, self.channels, self.src_dtype,
-            self.eb, self.levels, self.anchor_stride, self.anchor_block,
-            self.interp_center,
-            self.tile_size, self.radius, self.seed, self.vmin, self.vmax,
-            self.ckpt_hash, self.n_tiles_y, self.n_tiles_x, self.eb_ratio,
+            self.channels, self.src_dtype, self.levels, self.anchor_stride,
+            self.anchor_block, self.interp_center, self.radius, self.max_radius,
+            self.agg_level, self.eb, self.vmin, self.vmax, self.ckpt_hash,
+            self.eb_ratio,
         )
+        if not self.spatial or len(self.spatial) > 255:
+            raise ValueError("spatial shape must contain 1..255 dimensions")
+        return fixed + struct.pack(
+            f"<B{len(self.spatial)}I", len(self.spatial), *self.spatial)
 
     @classmethod
     def unpack(cls, buf: bytes) -> "Header":
-        (magic, version, flags, orig_h, orig_w, channels, src_dtype, eb,
-         levels, anchor_stride, anchor_block, interp_center, tile_size, radius,
-         seed, vmin, vmax, ckpt_hash, n_tiles_y, n_tiles_x, eb_ratio
-         ) = struct.unpack_from(_HEADER_FMT, buf, 0)
+        (magic, version, flags, channels, src_dtype, levels, anchor_stride,
+         anchor_block, interp_center, radius, max_radius, agg_level, eb, vmin,
+         vmax, ckpt_hash, eb_ratio) = struct.unpack_from(_HEADER_FMT, buf, 0)
         if magic != MAGIC:
             raise ValueError(f"not a DeepSZ stream (bad magic {magic!r})")
         if version != VERSION:
             raise ValueError(f"unsupported version {version}")
-        return cls(orig_h=orig_h, orig_w=orig_w, channels=channels,
-                   src_dtype=src_dtype, eb=eb, levels=levels,
+        (ndim,) = struct.unpack_from("<B", buf, _HEADER_SIZE)
+        if not ndim:
+            raise ValueError("stream spatial shape is empty")
+        spatial = struct.unpack_from(f"<{ndim}I", buf, _HEADER_SIZE + 1)
+        return cls(channels=channels, src_dtype=src_dtype, spatial=spatial,
+                   eb=eb, levels=levels,
                    anchor_stride=anchor_stride, anchor_block=anchor_block,
-                   tile_size=tile_size, radius=radius, seed=seed,
-                   vmin=vmin, vmax=vmax, ckpt_hash=ckpt_hash,
-                   n_tiles_y=n_tiles_y, n_tiles_x=n_tiles_x,
-                   flags=flags, interp_center=interp_center,
+                   radius=radius, max_radius=max_radius, agg_level=agg_level,
+                   vmin=vmin, vmax=vmax,
+                   ckpt_hash=ckpt_hash, flags=flags, interp_center=interp_center,
                    eb_ratio=eb_ratio, version=version)
 
 
-def _pack_spatial(header: Header) -> bytes:
-    spatial = header.spatial or (header.orig_h, header.orig_w)
-    return struct.pack(f"<B{len(spatial)}I", len(spatial), *spatial)
+def write_stream(header: Header, payload: bytes, zstd_level: int = 9) -> bytes:
+    body = zstandard.ZstdCompressor(level=zstd_level).compress(payload)
+    return header.pack() + body
 
 
-def write_stream(header: Header, tile_payloads: list[bytes], zstd_level: int = 9) -> bytes:
-    n = header.n_tiles_y * header.n_tiles_x
-    if len(tile_payloads) != n:
-        raise ValueError(f"expected {n} tile payloads, got {len(tile_payloads)}")
-    sizes = struct.pack(f"<{n}Q", *(len(p) for p in tile_payloads))
-    body = zstandard.ZstdCompressor(level=zstd_level).compress(b"".join(tile_payloads))
-    return header.pack() + _pack_spatial(header) + sizes + body
-
-
-def read_stream(data: bytes) -> tuple[Header, list[bytes]]:
+def read_stream(data: bytes) -> tuple[Header, bytes]:
     header = Header.unpack(data)
-    off = _HEADER_SIZE
-    (nd,) = struct.unpack_from("<B", data, off)
-    off += 1
-    header.spatial = struct.unpack_from(f"<{nd}I", data, off)
-    off += 4 * nd
-    n = header.n_tiles_y * header.n_tiles_x
-    sizes = struct.unpack_from(f"<{n}Q", data, off)
-    off += 8 * n
-    body = zstandard.ZstdDecompressor().decompress(data[off:])
-    payloads = []
-    pos = 0
-    for s in sizes:
-        payloads.append(body[pos:pos + s])
-        pos += s
-    if pos != len(body):
-        raise ValueError("tile payload sizes do not match body length")
-    return header, payloads
+    off = _HEADER_SIZE + 1 + 4 * len(header.spatial)
+    payload = zstandard.ZstdDecompressor().decompress(data[off:])
+    return header, payload
 
 
 # ---- stage-record helpers used by codec ----

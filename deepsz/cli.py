@@ -4,7 +4,6 @@ Examples:
     deepsz compress photo.png photo.msz --eb 2
     deepsz decompress photo.msz rec.png
     deepsz eval photo.png --eb 2 --levels 3
-Use --mock for the torch-free nearest-neighbor predictor (fast, for testing).
 """
 
 from __future__ import annotations
@@ -16,9 +15,10 @@ from pathlib import Path
 
 import numpy as np
 
-from .bitstream import FLAG_CUBIC, FLAG_GNN, FLAG_INTERP, FLAG_MOCK, Header
+from .bitstream import (FLAG_COMPILED, FLAG_CUBIC, FLAG_FP16, FLAG_GNN,
+                        FLAG_INTERP, Header)
 from .codec import compress, decompress
-from .predictor import InterpPredictor, MockPredictor
+from .predictor import InterpPredictor
 
 DEFAULT_GNN = Path(__file__).resolve().parent.parent / "data" / "gnn_predictor.pt"
 
@@ -44,19 +44,22 @@ def save_image(path: str, arr: np.ndarray) -> None:
 
 def build_predictor(args, header: Header):
     """Decompress-side predictor; all parameters come from the stream header."""
-    if header.flags & FLAG_MOCK:
-        return MockPredictor(header.tile_size)
     if header.flags & FLAG_INTERP:
         return InterpPredictor(
-            header.tile_size, "cubic" if header.flags & FLAG_CUBIC else "linear",
+            "cubic" if header.flags & FLAG_CUBIC else "linear",
             header.levels, header.anchor_stride, header.anchor_block)
     if not header.flags & FLAG_GNN:
         raise ValueError("stream needs a predictor factory the CLI can't build")
     from .gnn_predictor import GNNPredictor
     pred = GNNPredictor(args.gnn_checkpoint, header.vmin, header.vmax,
-                        tile_size=header.tile_size, levels=header.levels,
+                        max_radius=header.max_radius,
+                        levels=header.levels,
                         anchor_stride=header.anchor_stride,
-                        anchor_block=header.anchor_block)
+                        anchor_block=header.anchor_block,
+                        agg_level=(None if header.agg_level < 0
+                                   else header.agg_level))
+    pred.fp16 = bool(header.flags & FLAG_FP16)
+    pred.compile = bool(header.flags & FLAG_COMPILED)
     if pred.checkpoint_hash != header.ckpt_hash:
         print("warning: checkpoint hash differs from the one used to compress; "
               "decoded output may violate the error bound", file=sys.stderr)
@@ -79,7 +82,6 @@ def add_common(ap):
                          "line count is (3^ndim-1)/2 at full). Frozen into the "
                          "stream so decode matches")
     ap.add_argument("--radius", type=int, default=1 << 15)
-    ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--zstd-level", type=int, default=9)
     ap.add_argument("--eb-ratio", type=float, default=None,
                     help="per-level eb decay; omit to use --tune")
@@ -89,14 +91,11 @@ def add_common(ap):
                     help="for --tune rd, may spend up to this size factor for "
                          "lower reconstruction SSE")
     ap.add_argument("--predictor",
-                    choices=("mock", "gnn", "interp", "interp-linear"),
+                    choices=("gnn", "interp", "interp-linear"),
                     default="interp",
                     help="interp = SZ-style cubic interpolation (default); "
                          "interp-linear = its linear variant; gnn = trained GNN")
     ap.add_argument("--gnn-checkpoint", default=str(DEFAULT_GNN))
-    ap.add_argument("--mock", action="store_true",
-                    help="alias for --predictor mock (torch-free NN predictor)")
-    ap.add_argument("--tile", type=int, default=512)
     ap.add_argument("-v", "--verbose", action="store_true")
 
 
@@ -105,27 +104,23 @@ def run_compress(img: np.ndarray, args) -> tuple[bytes, dict]:
     if args.rel:
         span = float(img.max()) - float(img.min())
         eb = args.eb * (span if span > 0 else 1.0)
-    kind = "mock" if args.mock else args.predictor
-    tile = args.tile
-    if kind == "gnn" and tile == 512:
-        tile = 64  # gnn default tile size
+    kind = args.predictor
     if kind in ("interp", "interp-linear"):
         order = "linear" if kind == "interp-linear" else "cubic"
-        predictor = InterpPredictor(tile, order, args.levels,
+        predictor = InterpPredictor(order, args.levels,
                                     args.anchor_stride, args.anchor_block)
-    elif kind == "mock":
-        predictor = MockPredictor(tile)
     else:  # gnn
         from .gnn_predictor import GNNPredictor
         predictor = GNNPredictor(args.gnn_checkpoint, float(img.min()),
-                                 float(img.max()), tile_size=tile,
+                                 float(img.max()),
                                  levels=args.levels,
                                  anchor_stride=args.anchor_stride,
-                                 anchor_block=args.anchor_block)
+                                 anchor_block=args.anchor_block,
+                                 agg_level=args.agg_level)
     return compress(img, eb, predictor, levels=args.levels,
                     anchor_stride=args.anchor_stride,
                     anchor_block=args.anchor_block, radius=args.radius,
-                    seed=args.seed, zstd_level=args.zstd_level,
+                    zstd_level=args.zstd_level,
                     eb_ratio=args.eb_ratio,
                     tune=args.tune,
                     tune_size_slack=args.tune_size_slack,
