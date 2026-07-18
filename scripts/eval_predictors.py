@@ -288,8 +288,8 @@ def main():
                     default=default_error_bounds(),
                     help="absolute error bounds to sweep in the normalized "
                          "[0,1] image units (defaults: 1, 2, 4 gray levels)")
-    ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
+    ap.add_argument("--levels", type=int, default=4,
+                    help="dyadic levels; anchor stride is 2**levels")
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--zstd-level", type=int, default=9)
@@ -323,6 +323,7 @@ def main():
                     help="RD-curve PNG filename (bare name -> run dir)")
     ap.add_argument("--no-plot", action="store_true", help="disable the RD plot")
     args = ap.parse_args()
+    args.anchor_stride = 1 << args.levels  # stride is 2**levels, not a knob
 
     # per-run dir: outputs/eval/<date>-<config-hash>/ holds the CSV, RD plot,
     # and a config.json snapshot, mirroring train_gnn's runs/ layout.

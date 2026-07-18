@@ -23,7 +23,7 @@ needs anyway.
 
     python scripts/profile_chunked_tensor.py data/rti_normal.npy \
         --gnn-checkpoint checkpoints/d32.pt --eb 0.01 --levels 4 \
-        --anchor-stride 16 --chunk-size 16 --anchor-block 1 --agg-level 2 \
+        --chunk-size 16 --anchor-block 1 --agg-level 2 \
         --chunk-batch 1 --fp16 --compile
 
 Same knobs the codec takes (--fp16, --compile, --overlap, --chunk-size, ...).
@@ -61,8 +61,8 @@ def main(argv=None):
     ap.add_argument("--eb", type=float, default=0.01)
     ap.add_argument("--rel", action="store_true",
                     help="scale eb by the value range (max-min)")
-    ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
+    ap.add_argument("--levels", type=int, default=4,
+                    help="dyadic levels; anchor stride is 2**levels")
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--agg-level", type=int, default=None)
     ap.add_argument("--chunk-size", type=int, default=None,
@@ -84,6 +84,7 @@ def main(argv=None):
                     help="disable with_stack (lower overhead, no source attribution)")
     ap.add_argument("--device", default=None)
     args = ap.parse_args(argv)
+    args.anchor_stride = 1 << args.levels  # stride is 2**levels, not a knob
 
     # M-tiling off by default so the profile matches eval_tensor.sh; caller may
     # override in the environment before launching.

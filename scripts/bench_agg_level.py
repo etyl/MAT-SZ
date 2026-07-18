@@ -110,8 +110,8 @@ def parse_args(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--shape", type=int, nargs="+", default=(32, 32, 32, 32))
     ap.add_argument("--eb", type=float, default=1e-2)
-    ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
+    ap.add_argument("--levels", type=int, default=4,
+                    help="dyadic levels; anchor stride is 2**levels")
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--d", type=int, default=32, help="model width (random ckpt)")
@@ -133,6 +133,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    args.anchor_stride = 1 << args.levels  # stride is 2**levels, not a knob
     # _M_TILE is read from the environment at import time; set it first so the
     # whole-tensor path tiles the (B, L, M, K, d) message buffers into RAM.
     os.environ["DEEPSZ_M_TILE"] = str(args.m_tile)

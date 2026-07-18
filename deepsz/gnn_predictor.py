@@ -1146,9 +1146,9 @@ class ChunkedGNNPredictor:
                 f"chunked GNN needs up to {need/1e9:.0f} GB per chunk "
                 f"(field {field_bytes/1e9:.1f} + stage activation "
                 f"{act_bytes/1e9:.0f} GB for M={M:,} queries x L={L} lines, "
-                f"budget {budget/1e9:.0f} GB). Reduce --anchor-stride: the chunk "
-                f"edge (>= anchor_stride) sets M, and the {ndim}-D activation "
-                f"grows as edge^{ndim}. anchor-stride 16 keeps M small.")
+                f"budget {budget/1e9:.0f} GB). Reduce --levels: the chunk "
+                f"edge (>= 2**levels) sets M, and the {ndim}-D activation "
+                f"grows as edge^{ndim}. levels 4 (stride 16) keeps M small.")
 
     def chunk_slices(self, ci: int):
         cidx = np.unravel_index(ci, self.grid)

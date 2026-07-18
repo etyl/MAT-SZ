@@ -41,8 +41,8 @@ def parse_args(argv=None):
                     help="profile staged prediction or the complete image codec")
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--repeats", type=int, default=5)
-    ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
+    ap.add_argument("--levels", type=int, default=4,
+                    help="dyadic levels; anchor stride is 2**levels")
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--max-radius", type=int, default=64,
                     help="maximum GNN neighbour radius")
@@ -270,6 +270,7 @@ def run_codec(args, arr):
 
 def main(argv=None):
     args = parse_args(argv)
+    args.anchor_stride = 1 << args.levels  # stride is 2**levels, not a knob
     if args.eb <= 0 or args.warmup < 0 or args.repeats < 1:
         raise SystemExit("--eb must be positive, --warmup non-negative, and --repeats >= 1")
 

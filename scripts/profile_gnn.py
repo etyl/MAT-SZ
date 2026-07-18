@@ -8,7 +8,7 @@ ms/chunk vs B is the whole answer: flat => the GPU is already saturated at B=1 a
 batching won't help; dropping => raise the batch.
 
     python scripts/profile_gnn.py --gnn-checkpoint CKPT \
-        --levels 4 --anchor-stride 16 \
+        --levels 4 \
         --batches 1,2,4,8,16 --target-shape 119,128,128,128
 
 Send the printed table back and I'll tell you which knob to turn.
@@ -115,8 +115,8 @@ def main(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gnn-checkpoint", required=True)
     ap.add_argument("--ndim", type=int, default=4)
-    ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
+    ap.add_argument("--levels", type=int, default=4,
+                    help="dyadic levels; anchor stride (= chunk edge) is 2**levels")
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--model-frac", type=float, default=0.92,
@@ -138,6 +138,7 @@ def main(argv=None):
                     help="torch.compile the embed pass (fuses the elementwise "
                          "ops; warmup absorbs the one-off compile cost)")
     args = ap.parse_args(argv)
+    args.anchor_stride = 1 << args.levels  # stride is 2**levels, not a knob
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     edge = args.anchor_stride

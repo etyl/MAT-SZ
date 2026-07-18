@@ -54,12 +54,13 @@ def main():
                     help="chunk edge (default: codec auto)")
     ap.add_argument("--eb", type=float, default=1e-2)
     ap.add_argument("--d", type=int, default=32, help="model width")
-    ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
+    ap.add_argument("--levels", type=int, default=4,
+                    help="dyadic levels; anchor stride is 2**levels")
     ap.add_argument("--checkpoint", default=None,
                     help="real checkpoint (default: random weights)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    args.anchor_stride = 1 << args.levels  # stride is 2**levels, not a knob
 
     backend = _ensure_rans_backend()
     import torch

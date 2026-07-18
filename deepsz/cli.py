@@ -71,8 +71,9 @@ def add_common(ap):
                     help="error bound in original data units (e.g. 0-255 for uint8)")
     ap.add_argument("--rel", action="store_true",
                     help="interpret --eb as relative to the data range")
-    ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
+    ap.add_argument("--levels", type=int, default=4,
+                    help="number of dyadic refinement levels; the anchor grid "
+                         "stride is 2**levels (so it is not a separate knob)")
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--agg-level", type=int, default=None,
                     help="gnn only: neighbourhood aggregation level -- cap on the "
@@ -100,6 +101,10 @@ def add_common(ap):
 
 
 def run_compress(img: np.ndarray, args) -> tuple[bytes, dict]:
+    # The anchor stride is fixed by the level count (stride = 2**levels), so the
+    # schedule densifies from the anchor grid down to stride 1. Only --levels is
+    # exposed; derive the stride the rest of the pipeline still takes explicitly.
+    args.anchor_stride = 1 << args.levels
     eb = args.eb
     if args.rel:
         span = float(img.max()) - float(img.min())

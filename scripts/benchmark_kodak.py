@@ -161,8 +161,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--eb", type=float, nargs="+", default=[1.0, 2.0, 4.0],
                     help="error bounds to sweep (default: 1 2 4)")
-    ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
+    ap.add_argument("--levels", type=int, default=4,
+                    help="dyadic levels; anchor stride is 2**levels")
     ap.add_argument("--anchor-block", type=int, default=4)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--zstd-level", type=int, default=9)
@@ -170,6 +170,7 @@ def main():
     ap.add_argument("--images", nargs="*", default=None,
                     help="specific image filenames to run (default: all 24)")
     args = ap.parse_args()
+    args.anchor_stride = 1 << args.levels  # stride is 2**levels, not a knob
 
     images = sorted(KODAK_DIR.glob("kodim*.png"))
     if args.images:
