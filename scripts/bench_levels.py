@@ -24,10 +24,11 @@ Env knobs (all optional):
   CKPT=checkpoints/d64.pt
 """
 import os, sys, time, gc, collections
+from pathlib import Path
 import numpy as np
 
-sys.path.insert(0, "/home/mind/hvernina/MAT-SZ")
-os.chdir("/home/mind/hvernina/MAT-SZ")
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 from deepsz.quantizer import _recon_from_codes
 
