@@ -507,6 +507,7 @@ class GNNCompressorCodec:
         compile: bool = True,
         overlap: bool = False,
         prune_invalid_lines: bool | None = None,
+        sparse_single_lines: bool | None = None,
     ):
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
@@ -534,6 +535,13 @@ class GNNCompressorCodec:
         self.prune_invalid_lines = (
             self.agg_level == 1 if prune_invalid_lines is None
             else bool(prune_invalid_lines)
+        )
+        # On large stages most level-1 points have neighbours on both sides.
+        # Pack the small one-sided subset before its MLP instead of evaluating
+        # that MLP for every point and discarding nearly all of its output.
+        self.sparse_single_lines = (
+            self.agg_level == 1 if sparse_single_lines is None
+            else bool(sparse_single_lines)
         )
         if device is None:
             import torch
@@ -638,6 +646,7 @@ class GNNCompressorCodec:
                 "max_radius": self.max_radius,
                 "agg_level": self.agg_level,
                 "prune_invalid_lines": self.prune_invalid_lines,
+                "sparse_single_lines": self.sparse_single_lines,
                 "vmin": vmin,
                 "vmax": vmax,
                 "eb_ratio": ratio,
@@ -763,6 +772,10 @@ class GNNCompressorCodec:
             self.prune_invalid_lines if meta is None
             else bool(meta.get("prune_invalid_lines", False))
         )
+        sparse_single_lines = (
+            self.sparse_single_lines if meta is None
+            else bool(meta.get("sparse_single_lines", False))
+        )
         predictor = ChunkedGNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -773,6 +786,7 @@ class GNNCompressorCodec:
             anchor_block=anchor_block,
             agg_level=agg_level,
             prune_invalid_lines=prune_invalid_lines,
+            sparse_single_lines=sparse_single_lines,
         )
         # encode: from the codec flag; decode: replay the stream's float path
         predictor.fp16 = (self.fp16 if meta is None
@@ -796,6 +810,10 @@ class GNNCompressorCodec:
             self.prune_invalid_lines if meta is None
             else bool(meta.get("prune_invalid_lines", False))
         )
+        sparse_single_lines = (
+            self.sparse_single_lines if meta is None
+            else bool(meta.get("sparse_single_lines", False))
+        )
         return GNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -808,6 +826,7 @@ class GNNCompressorCodec:
             anchor_block=anchor_block,
             agg_level=agg_level,
             prune_invalid_lines=prune_invalid_lines,
+            sparse_single_lines=sparse_single_lines,
         )
 
     def _checkpoint_hash(self) -> bytes:

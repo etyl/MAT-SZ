@@ -48,6 +48,7 @@ def test_defaults_match_eval_tensor(tiny_checkpoint):
     assert codec.anchor_block == 1
     assert codec.agg_level == 2
     assert codec.prune_invalid_lines is False
+    assert codec.sparse_single_lines is False
     assert codec.chunk_size is None
     assert codec.chunk_batch is None
     assert codec.fp16 is False
@@ -71,7 +72,10 @@ def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):
 
 @pytest.mark.parametrize("chunk_size", [0, 4])
 def test_level1_optimized_path_is_stored_and_roundtrips(
-        tiny_checkpoint, chunk_size):
+        tiny_checkpoint, chunk_size, monkeypatch):
+    # Exercise the packed-single-neighbour branch on this intentionally tiny
+    # tensor instead of allocating the production 65,536-query threshold.
+    monkeypatch.setattr("deepsz.gnn_predictor._SPARSE_SINGLE_MIN", 1)
     rng = np.random.RandomState(4)
     x = rng.rand(5, 6, 4).astype(np.float32)
     codec = GNNCompressorCodec(
@@ -92,6 +96,7 @@ def test_level1_optimized_path_is_stored_and_roundtrips(
 
     assert meta["agg_level"] == 1
     assert meta["prune_invalid_lines"] is True
+    assert meta["sparse_single_lines"] is True
     assert torch.max(torch.abs(y - torch.from_numpy(x))) <= 0.01
 
 
@@ -101,7 +106,7 @@ def test_level1_legacy_geometry_stream_overrides_decoder_default(tiny_checkpoint
     encoder = GNNCompressorCodec(
         tiny_checkpoint, error_bound=0.01, levels=2, anchor_stride=4,
         anchor_block=1, max_radius=4, agg_level=1, chunk_size=0,
-        compile=False, prune_invalid_lines=False)
+        compile=False, prune_invalid_lines=False, sparse_single_lines=False)
     decoder = GNNCompressorCodec(
         tiny_checkpoint, error_bound=0.01, levels=2, anchor_stride=4,
         anchor_block=1, max_radius=4, agg_level=1, chunk_size=0,
@@ -112,7 +117,9 @@ def test_level1_legacy_geometry_stream_overrides_decoder_default(tiny_checkpoint
     y = decoder.uncompress(stream)
 
     assert meta["prune_invalid_lines"] is False
+    assert meta["sparse_single_lines"] is False
     assert decoder.prune_invalid_lines is True
+    assert decoder.sparse_single_lines is True
     assert torch.max(torch.abs(y - torch.from_numpy(x))) <= 0.01
 
 
@@ -131,6 +138,7 @@ def test_generic_stream_stores_level1_execution_path(tiny_checkpoint):
 
     assert header.agg_level == 1
     assert header.gnn_prune_invalid is True
+    assert header.gnn_sparse_single is True
 
     def decoder(header):
         return GNNPredictor(
@@ -138,7 +146,8 @@ def test_generic_stream_stores_level1_execution_path(tiny_checkpoint):
             max_radius=4, levels=header.levels,
             anchor_stride=header.anchor_stride,
             anchor_block=header.anchor_block, agg_level=header.agg_level,
-            prune_invalid_lines=header.gnn_prune_invalid)
+            prune_invalid_lines=header.gnn_prune_invalid,
+            sparse_single_lines=header.gnn_sparse_single)
 
     y = decompress(stream, decoder)
     assert np.max(np.abs(y - x)) <= np.float32(0.01)

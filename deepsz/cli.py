@@ -58,7 +58,8 @@ def build_predictor(args, header: Header):
                         anchor_stride=header.anchor_stride,
                         anchor_block=header.anchor_block,
                         agg_level=header.agg_level,
-                        prune_invalid_lines=header.gnn_prune_invalid)
+                        prune_invalid_lines=header.gnn_prune_invalid,
+                        sparse_single_lines=header.gnn_sparse_single)
     if pred.checkpoint_hash != header.ckpt_hash:
         print("warning: checkpoint hash differs from the one used to compress; "
               "decoded output may violate the error bound", file=sys.stderr)
@@ -125,7 +126,8 @@ def run_compress(img: np.ndarray, args) -> tuple[bytes, dict]:
                                  anchor_stride=args.anchor_stride,
                                  anchor_block=args.anchor_block,
                                  agg_level=args.agg_level,
-                                 prune_invalid_lines=args.agg_level == 1)
+                                 prune_invalid_lines=args.agg_level == 1,
+                                 sparse_single_lines=args.agg_level == 1)
     return compress(img, eb, predictor, levels=args.levels,
                     anchor_stride=args.anchor_stride,
                     anchor_block=args.anchor_block, radius=args.radius,

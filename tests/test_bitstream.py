@@ -21,7 +21,8 @@ def test_header_roundtrip():
 
 
 def test_header_roundtrip_gnn_execution_metadata():
-    h = make_header(agg_level=1, gnn_prune_invalid=True)
+    h = make_header(agg_level=1, gnn_prune_invalid=True,
+                    gnn_sparse_single=True)
 
     h2 = Header.unpack(h.pack())
 

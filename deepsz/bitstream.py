@@ -36,7 +36,9 @@ FLAG_RANS = 1 << 6         # per-symbol scale-conditioned coder for stage bins
 _AGG_LEVEL_SHIFT = 7
 _AGG_LEVEL_MASK = 0xF << _AGG_LEVEL_SHIFT
 _FLAG_GNN_PRUNE_INVALID = 1 << 11
-_GNN_META_MASK = _AGG_LEVEL_MASK | _FLAG_GNN_PRUNE_INVALID
+_FLAG_GNN_SPARSE_SINGLE = 1 << 12
+_GNN_META_MASK = (_AGG_LEVEL_MASK | _FLAG_GNN_PRUNE_INVALID
+                  | _FLAG_GNN_SPARSE_SINGLE)
 
 _EMP_ANS = b"MATSANS1"
 
@@ -68,6 +70,7 @@ class Header:
     flags: int = 0
     agg_level: int | None = None
     gnn_prune_invalid: bool = False
+    gnn_sparse_single: bool = False
     interp_center: int = 0  # interp multi-axis mode: 0=avg both, 1=axis0, 2=axis1
     eb_ratio: float = 1.0   # per-level error-bound decay (coarse tighter); 1=flat
     version: int = VERSION
@@ -84,6 +87,8 @@ class Header:
         flags |= agg_level << _AGG_LEVEL_SHIFT
         if self.gnn_prune_invalid:
             flags |= _FLAG_GNN_PRUNE_INVALID
+        if self.gnn_sparse_single:
+            flags |= _FLAG_GNN_SPARSE_SINGLE
         return struct.pack(
             _HEADER_FMT, MAGIC, self.version, flags,
             self.orig_h, self.orig_w, self.channels, self.src_dtype,
@@ -105,6 +110,7 @@ class Header:
             raise ValueError(f"unsupported version {version}")
         agg_level = (flags & _AGG_LEVEL_MASK) >> _AGG_LEVEL_SHIFT
         gnn_prune_invalid = bool(flags & _FLAG_GNN_PRUNE_INVALID)
+        gnn_sparse_single = bool(flags & _FLAG_GNN_SPARSE_SINGLE)
         flags &= ~_GNN_META_MASK
         return cls(orig_h=orig_h, orig_w=orig_w, channels=channels,
                    src_dtype=src_dtype, eb=eb, levels=levels,
@@ -115,6 +121,7 @@ class Header:
                    flags=flags, interp_center=interp_center,
                    agg_level=agg_level or None,
                    gnn_prune_invalid=gnn_prune_invalid,
+                   gnn_sparse_single=gnn_sparse_single,
                    eb_ratio=eb_ratio, version=version)
 
 

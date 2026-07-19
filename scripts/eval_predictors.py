@@ -71,7 +71,8 @@ def build_predictor_for_decompress(method: str, hdr: Header, args):
                          anchor_stride=hdr.anchor_stride,
                          anchor_block=hdr.anchor_block,
                          agg_level=hdr.agg_level,
-                         prune_invalid_lines=hdr.gnn_prune_invalid)
+                         prune_invalid_lines=hdr.gnn_prune_invalid,
+                         sparse_single_lines=hdr.gnn_sparse_single)
         p.fp16 = args.fp16   # eval runs enc+dec in-process, so both match
         p.compile = args.compile
         return p

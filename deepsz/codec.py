@@ -158,6 +158,8 @@ def compress(
                       agg_level=getattr(predictor, "agg_level", None),
                       gnn_prune_invalid=bool(getattr(
                           predictor, "prune_invalid_lines", False)),
+                      gnn_sparse_single=bool(getattr(
+                          predictor, "sparse_single_lines", False)),
                       interp_center=center, eb_ratio=ratio)
 
     if tune not in ("fast", "size", "rd"):
