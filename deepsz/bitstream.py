@@ -19,7 +19,7 @@ import numpy as np
 import zstandard
 
 MAGIC = b"MATSZ01\0"
-VERSION = 5
+VERSION = 6  # v5 + widened rANS scale grid (rans.SCALE_HI_MULT 64 -> 4096)
 
 FLAG_MOCK = 1 << 0
 FLAG_GRAY = 1 << 1

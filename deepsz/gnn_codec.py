@@ -24,8 +24,8 @@ from .rans import build_laplace_tables, scale_to_level
 
 
 _MAGIC = b"MATSZGNN"
-_VERSION = 2          # whole-tensor streams
-_VERSION_CHUNKED = 3  # chunk-major streams (global anchors + per-chunk stages)
+_VERSION = 4          # whole-tensor streams (v2 + widened rANS scale grid)
+_VERSION_CHUNKED = 5  # chunk-major streams (v3 + widened rANS scale grid)
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
 

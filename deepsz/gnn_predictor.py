@@ -454,6 +454,12 @@ def build_model(d: int = 32):
         def __init__(self):
             super().__init__()
             self.net = _mlp(torch, [d + 1, h, 2])
+            # Start unconfident: delta ~= 8 (b ~= 256*eb), inside the clamp so
+            # gradients flow both ways. A zero init means b ~= eb, and with
+            # untrained predictions (|r| ~ 0.1) at eb=1e-6 the NLL tail then
+            # fires ~1/b gradient spikes from step 1.
+            with torch.no_grad():
+                self.net[-1].bias[1] = 8.0
 
         def forward(self, e, eb):
             B, M, _ = e.shape
@@ -467,12 +473,13 @@ def build_model(d: int = 32):
             out = self.net(torch.cat([e, cond], dim=-1))
             mu = torch.sigmoid(out[..., 0])
             # Laplace scale is eb-relative: `delta` spans the deployed rANS scale
-            # grid [eb/16, 64*eb] (log2 offsets -4..6, see rans.scale_to_level), so
-            # the head can express sub-eb confidence at ANY eb. The old
-            # span-relative clamp(-8,0) reached the grid floor only near eb~=0.05
-            # (top of the training range) and pinned every point to the broadest
-            # grid levels at low eb, charging ~5 bits even for perfect predictions.
-            delta = out[..., 1].clamp(-4.0, 6.0)
+            # grid [eb/16, 4096*eb] (log2 offsets -4..12, see rans.SCALE_LO_DIV/
+            # SCALE_HI_MULT), so the head can express sub-eb confidence at ANY eb.
+            # The old span-relative clamp(-8,0) pinned every point to the broadest
+            # grid levels at low eb; the earlier eb-relative ceiling of +6 pinned
+            # ~half the points at very low eb (<=1e-5), where prediction error
+            # stays orders of magnitude above eb (bench_levels sat+%).
+            delta = out[..., 1].clamp(-4.0, 12.0)
             log_b = log_eb.view(B, 1) + delta
             return mu, log_b
 
@@ -626,6 +633,11 @@ def _load_inference_model(checkpoint_path, torch, device):
     hit = _MODEL_CACHE.get(key)
     if hit is not None:
         return hit
+    # One live revision per (path, device): the trainer overwrites the eval
+    # checkpoint every eval, so keying on mtime alone leaks a model (and its
+    # compiled embed) per revision until OOM.
+    for k in [k for k in _MODEL_CACHE if k[0] == key[0] and k[3] == key[3]]:
+        del _MODEL_CACHE[k]
 
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     version = int(ckpt.get("version", 1))

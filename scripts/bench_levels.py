@@ -8,6 +8,12 @@ For every interpolation level we report:
                  it is NOT bounded by eb.
   - rec-RMSE   : RMSE of the reconstruction (x - recon) AFTER coding. Bounded:
                  |x - recon| <= eb at every point, so rec-RMSE <= eb.
+  - sat+/sat-% : fraction of coded points whose Laplace scale sits at the top
+                 / bottom edge of the rANS scale grid (rans.SCALE_LO_DIV /
+                 SCALE_HI_MULT = the head's delta clamp). High sat+ at low eb
+                 means the required scale exceeds the grid ceiling (prediction
+                 error stuck above it): widening the grid, not the head, is
+                 the fix. Codecs that don't code a scale show "—".
 
 Levels are tagged by the per-stage error bound (each interpolation level has a
 distinct eb under the default schedule; the anchor pass = coarsest level).
@@ -89,6 +95,21 @@ class LevelStats:
         self.sse_pred = collections.defaultdict(float)   # sum (x-pred)^2
         self.sse_rec = collections.defaultdict(float)    # sum (x-recon)^2
         self.npt = collections.defaultdict(int)
+        # Laplace-scale saturation at the rANS grid edges (rans.SCALE_LO_DIV /
+        # SCALE_HI_MULT = the head's delta clamp). sat_hi ~100% means the true
+        # residual scale exceeds the grid ceiling: the eb-relative head can't
+        # help those points, the window itself is too narrow.
+        self.nsc = collections.defaultdict(int)
+        self.sat_hi = collections.defaultdict(int)
+        self.sat_lo = collections.defaultdict(int)
+
+    def add_scale(self, eb, scale):
+        e = round(float(eb), 15)
+        s = np.asarray(scale, dtype=np.float64).ravel()
+        self.nsc[e] += s.size
+        from deepsz.rans import SCALE_HI_MULT, SCALE_LO_DIV
+        self.sat_hi[e] += int((s >= SCALE_HI_MULT * float(eb) * 0.999).sum())
+        self.sat_lo[e] += int((s <= float(eb) / SCALE_LO_DIV * 1.001).sum())
 
     def add(self, eb, x, pred, codes, radius):
         e = round(float(eb), 15)
@@ -124,9 +145,12 @@ class LevelStats:
             bpp = (ent + 32.0 * self.nout[e]) / tot
             pred_rmse = (self.sse_pred[e] / self.npt[e]) ** 0.5
             rec_rmse = (self.sse_rec[e] / self.npt[e]) ** 0.5
+            nsc = self.nsc[e]
             out[lv] = dict(bpp=bpp, ent_bpp=ent / tot, tot=int(tot),
                            nout=self.nout[e], pred_rmse=pred_rmse,
-                           rec_rmse=rec_rmse, eb=e)
+                           rec_rmse=rec_rmse, eb=e,
+                           sat_hi=100 * self.sat_hi[e] / nsc if nsc else None,
+                           sat_lo=100 * self.sat_lo[e] / nsc if nsc else None)
         return out
 
 
@@ -141,24 +165,33 @@ def hook_all(stats):
             pass
     saved = []
     for m in mods:
-        if not hasattr(m, "quantize"):
-            continue
-        orig = m.quantize
-        saved.append((m, orig))
+        if hasattr(m, "quantize"):
+            orig = m.quantize
+            saved.append((m, "quantize", orig))
 
-        def make(orig):
-            def q(x, pred, eb, radius=1 << 15, *a, **k):
-                codes, outliers = orig(x, pred, eb, radius, *a, **k)
-                stats.add(eb, x, pred, codes, radius)
-                return codes, outliers
-            return q
-        m.quantize = make(orig)
+            def make(orig):
+                def q(x, pred, eb, radius=1 << 15, *a, **k):
+                    codes, outliers = orig(x, pred, eb, radius, *a, **k)
+                    stats.add(eb, x, pred, codes, radius)
+                    return codes, outliers
+                return q
+            m.quantize = make(orig)
+        if hasattr(m, "scale_to_level"):
+            orig = m.scale_to_level
+            saved.append((m, "scale_to_level", orig))
+
+            def make_s(orig):
+                def s(scale, eb, *a, **k):
+                    stats.add_scale(eb, scale)
+                    return orig(scale, eb, *a, **k)
+                return s
+            m.scale_to_level = make_s(orig)
     return saved
 
 
 def unhook(saved):
-    for m, orig in saved:
-        m.quantize = orig
+    for m, name, orig in saved:
+        setattr(m, name, orig)
 
 
 def run_interp(field, stats):
@@ -204,7 +237,7 @@ def report(tag, total, dt, stats, pts):
           f"bpv {8*total/npts:.4f}   ratio(f32) {npts*4/total:.2f}   {dt:.1f}s")
     print(f"  {'lvl':>3}{'stride':>7}{'pts':>13}{'pt%':>7}"
           f"{'bpp':>9}{'pred-RMSE':>12}{'rec-RMSE':>11}{'out%':>7}"
-          f"{'lvl-bits':>13}{'bit%':>7}")
+          f"{'sat+%':>7}{'sat-%':>7}{'lvl-bits':>13}{'bit%':>7}")
     lvl_bits = {lv: pl[lv]["bpp"] * pts[lv] for lv in pl}
     tb = sum(lvl_bits.values())
     for lv in range(LEVELS + 1):
@@ -213,9 +246,12 @@ def report(tag, total, dt, stats, pts):
         d = pl[lv]
         stride = STRIDE >> lv if lv else STRIDE
         bits = lvl_bits[lv]
+        sat = "".join("      —" if d[k] is None else f"{d[k]:>6.2f}%"
+                      for k in ("sat_hi", "sat_lo"))
         print(f"  {lv:>3}{stride:>7}{pts[lv]:>13,}{100*pts[lv]/npts:>6.2f}%"
               f"{d['bpp']:>9.3f}{d['pred_rmse']:>12.2e}{d['rec_rmse']:>11.2e}"
-              f"{100*d['nout']/d['tot']:>6.2f}%{int(bits):>13,}{100*bits/tb:>6.2f}%")
+              f"{100*d['nout']/d['tot']:>6.2f}%{sat}"
+              f"{int(bits):>13,}{100*bits/tb:>6.2f}%")
     print(f"      ideal-entropy total {tb/8/1e3:.1f} KB ({tb/npts:.4f} bpv)  "
           f"vs real stream {total/1e3:.1f} KB")
     return pl
@@ -252,8 +288,10 @@ if __name__ == "__main__":
     if len(results) > 1:
         fin = LEVELS
         print(f"\n===== finest level L{fin} (stride 1) head-to-head =====")
-        print(f"  {'codec':>8}{'bpp':>9}{'pred-RMSE':>12}{'rec-RMSE':>11}")
+        print(f"  {'codec':>8}{'bpp':>9}{'pred-RMSE':>12}{'rec-RMSE':>11}{'sat+%':>8}")
         for c in CODECS:
             if c in results and fin in results[c]:
                 d = results[c][fin]
-                print(f"  {c:>8}{d['bpp']:>9.3f}{d['pred_rmse']:>12.2e}{d['rec_rmse']:>11.2e}")
+                sat = "       —" if d["sat_hi"] is None else f"{d['sat_hi']:>7.2f}%"
+                print(f"  {c:>8}{d['bpp']:>9.3f}{d['pred_rmse']:>12.2e}"
+                      f"{d['rec_rmse']:>11.2e}{sat}")
