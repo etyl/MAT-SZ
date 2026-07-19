@@ -20,6 +20,20 @@ def test_header_roundtrip():
     assert h == h2
 
 
+def test_header_roundtrip_gnn_execution_metadata():
+    h = make_header(agg_level=1, gnn_prune_invalid=True)
+
+    h2 = Header.unpack(h.pack())
+
+    assert h2 == h
+
+
+@pytest.mark.parametrize("agg_level", [0, 16])
+def test_header_rejects_unrepresentable_agg_level(agg_level):
+    with pytest.raises(ValueError, match="agg_level"):
+        make_header(agg_level=agg_level).pack()
+
+
 def test_stream_roundtrip():
     h = make_header()
     payloads = [bytes([i]) * (i * 100 + 1) for i in range(6)]

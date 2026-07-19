@@ -506,6 +506,7 @@ class GNNCompressorCodec:
         fp16: bool = False,
         compile: bool = True,
         overlap: bool = False,
+        prune_invalid_lines: bool | None = None,
     ):
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
@@ -526,6 +527,14 @@ class GNNCompressorCodec:
         # per point = faster inference, most impactful in high dimensions. Frozen
         # into the stream so decode reproduces the encoder's prediction bitwise.
         self.agg_level = None if agg_level is None else int(agg_level)
+        # Level 1 contains many stage/direction pairs with no reachable known
+        # neighbour.  The optimized geometry drops those fully masked lines.
+        # The choice is serialized because changing GEMM shapes can change the
+        # last bits of predictions and therefore residual bins.
+        self.prune_invalid_lines = (
+            self.agg_level == 1 if prune_invalid_lines is None
+            else bool(prune_invalid_lines)
+        )
         if device is None:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -628,6 +637,7 @@ class GNNCompressorCodec:
                 "radius": self.radius,
                 "max_radius": self.max_radius,
                 "agg_level": self.agg_level,
+                "prune_invalid_lines": self.prune_invalid_lines,
                 "vmin": vmin,
                 "vmax": vmax,
                 "eb_ratio": ratio,
@@ -749,6 +759,10 @@ class GNNCompressorCodec:
         anchor_block = (self.anchor_block if meta is None
                         else int(meta["anchor_block"]))
         agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
+        prune_invalid_lines = (
+            self.prune_invalid_lines if meta is None
+            else bool(meta.get("prune_invalid_lines", False))
+        )
         predictor = ChunkedGNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -758,6 +772,7 @@ class GNNCompressorCodec:
             anchor_stride=anchor_stride,
             anchor_block=anchor_block,
             agg_level=agg_level,
+            prune_invalid_lines=prune_invalid_lines,
         )
         # encode: from the codec flag; decode: replay the stream's float path
         predictor.fp16 = (self.fp16 if meta is None
@@ -777,6 +792,10 @@ class GNNCompressorCodec:
         anchor_block = self.anchor_block if meta is None else int(meta["anchor_block"])
         max_radius = self.max_radius if meta is None else int(meta["max_radius"])
         agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
+        prune_invalid_lines = (
+            self.prune_invalid_lines if meta is None
+            else bool(meta.get("prune_invalid_lines", False))
+        )
         return GNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -788,6 +807,7 @@ class GNNCompressorCodec:
             anchor_stride=anchor_stride,
             anchor_block=anchor_block,
             agg_level=agg_level,
+            prune_invalid_lines=prune_invalid_lines,
         )
 
     def _checkpoint_hash(self) -> bytes:

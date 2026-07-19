@@ -155,6 +155,9 @@ def compress(
                       seed=seed, vmin=vmin, vmax=vmax,
                       ckpt_hash=getattr(predictor, "checkpoint_hash", b"\0" * 16),
                       n_tiles_y=ty, n_tiles_x=tx, flags=flags,
+                      agg_level=getattr(predictor, "agg_level", None),
+                      gnn_prune_invalid=bool(getattr(
+                          predictor, "prune_invalid_lines", False)),
                       interp_center=center, eb_ratio=ratio)
 
     if tune not in ("fast", "size", "rd"):

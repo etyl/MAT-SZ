@@ -171,7 +171,7 @@ class _StageGeom:
                  "query_idx", "idx_np", "M", "ndim")
 
     def __init__(self, pat, query_coords, shape, max_radius, torch, device,
-                 agg_level=None):
+                 agg_level=None, prune_invalid_lines=False):
         ndim = len(shape)
         self.ndim = ndim
         P = pat.shape[0]
@@ -222,6 +222,18 @@ class _StageGeom:
             setattr(self, name, torch.stack(values, dim=0))
         self.cos = torch.stack(cos, dim=0)
         self.lognnz = torch.stack(lognnz, dim=0).unsqueeze(1)
+        if prune_invalid_lines and self.M:
+            # A scheduled sub-stage often has no reachable known neighbour at
+            # all along some level-1 axes.  Those lines are masked to -inf by
+            # AttnPool, but the eager path still runs both message MLPs over
+            # them.  Remove only lines that are invalid for every query.  This
+            # changes GEMM shapes (and therefore floating-point rounding), so
+            # codecs must record and replay this execution mode in the stream.
+            keep = (self.vp | self.vn).any(dim=1)
+            if bool(keep.any()) and not bool(keep.all()):
+                for name in ("ip", "in_", "dp", "dn", "vp", "vn", "cos",
+                             "lognnz"):
+                    setattr(self, name, getattr(self, name)[keep])
 
 
 class _LegacyGeom:
@@ -289,12 +301,13 @@ _MODEL_CACHE: dict = {}
 
 
 def build_stage_geoms(shape, levels, stride, block, max_radius, torch, device=None,
-                      agg_level=None):
+                      agg_level=None, prune_invalid_lines=False):
     """Per-stage `_StageGeom` list (empty stages dropped) plus a
     ``|known|-before-stage -> list index`` map, for the whole schedule of one
     region shape. Closed-form lattice geometry, computed at the query points
     only; cached per (shape, levels, stride, block, max_radius, agg_level,
-    device) and shared by encoder tuning sweeps, decoder, and the trainer.
+    prune_invalid_lines, device) and shared by encoder tuning sweeps, decoder,
+    and the trainer.
 
     ``agg_level`` caps the neighbourhood aggregation level (see
     `half_directions`); ``None`` keeps the full neighbourhood.
@@ -302,7 +315,7 @@ def build_stage_geoms(shape, levels, stride, block, max_radius, torch, device=No
     ponytail: unbounded cache, bounded in practice (a handful of shapes/configs);
     add an LRU cap only if a caller feeds unboundedly many distinct configs."""
     key = (tuple(int(n) for n in shape), levels, stride, block, max_radius,
-           agg_level, str(device))
+           agg_level, bool(prune_invalid_lines), str(device))
     hit = _GEOM_CACHE.get(key)
     if hit is not None:
         return hit
@@ -316,7 +329,7 @@ def build_stage_geoms(shape, levels, stride, block, max_radius, torch, device=No
             Q = np.stack(np.nonzero(mask), axis=1)
             count_to_i[cum] = len(geoms)
             geoms.append(_StageGeom(pats[s], Q, shape, max_radius, torch, device,
-                                    agg_level))
+                                    agg_level, prune_invalid_lines))
         cum += n
     out = (geoms, count_to_i)
     _GEOM_CACHE[key] = out
@@ -727,7 +740,8 @@ class GNNPredictor:
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
                  tile_size: int = 64, max_radius: int = 64, device: str = "cpu",
                  levels: int = 4, anchor_stride: int = 16, anchor_block: int = 1,
-                 agg_level: int | None = None):
+                 agg_level: int | None = None,
+                 prune_invalid_lines: bool | None = None):
         import torch
 
         self._torch = torch
@@ -743,6 +757,10 @@ class GNNPredictor:
         # lines (see `half_directions`). None = full neighbourhood. Encoder and
         # decoder must agree, so the codec stores it in the stream meta.
         self.agg_level = None if agg_level is None else int(agg_level)
+        self.prune_invalid_lines = (
+            self.agg_level == 1 if prune_invalid_lines is None
+            else bool(prune_invalid_lines)
+        )
 
         self.d, self.model, self.checkpoint_hash = _load_inference_model(
             checkpoint_path, torch, self.device)
@@ -760,7 +778,8 @@ class GNNPredictor:
         if g is None:
             g = build_stage_geoms(key, self.levels, self.anchor_stride,
                                   self.anchor_block, self.max_radius,
-                                  self._torch, self.device, self.agg_level)
+                                  self._torch, self.device, self.agg_level,
+                                  self.prune_invalid_lines)
             self._sched[key] = g
         return g
 
@@ -832,7 +851,7 @@ class _ChunkGeoms:
     shares this object (cached in ``build_chunk_geoms``)."""
 
     def __init__(self, chunk_shape, levels, stride, block, torch, device,
-                 agg_level=None):
+                 agg_level=None, prune_invalid_lines=False):
         self.chunk_shape = tuple(int(n) for n in chunk_shape)
         self.levels, self.stride, self.block = levels, stride, block
         self.agg_level = agg_level
@@ -852,7 +871,8 @@ class _ChunkGeoms:
                 self.coords.append(None)
                 continue
             self.geoms.append(_StageGeom(pats[s], Q + stride, self.padded_shape,
-                                         stride, torch, device, agg_level))
+                                         stride, torch, device, agg_level,
+                                         prune_invalid_lines))
             self.coords.append(Q)
         # prediction chain: stage 0 is always the base (anchors, possibly empty
         # in a ragged tail chunk -> None geom, nothing to finalize), followed by
@@ -892,19 +912,20 @@ _CHUNK_GEOM_CACHE: dict = {}
 
 
 def build_chunk_geoms(chunk_shape, levels, stride, block, torch, device=None,
-                      agg_level=None):
-    """Cached `_ChunkGeoms` per (chunk shape, schedule, agg_level, device).
+                      agg_level=None, prune_invalid_lines=False):
+    """Cached `_ChunkGeoms` per (chunk shape, schedule, agg_level,
+    prune_invalid_lines, device).
     Interior chunks all share one entry; ragged edge chunks add at most a few
     shape variants (ponytail: unbounded like _GEOM_CACHE, bounded in practice).
 
     ``agg_level`` caps the neighbourhood aggregation level (see
     `half_directions`); ``None`` keeps the full neighbourhood."""
     key = (tuple(int(n) for n in chunk_shape), levels, stride, block, agg_level,
-           str(device))
+           bool(prune_invalid_lines), str(device))
     hit = _CHUNK_GEOM_CACHE.get(key)
     if hit is None:
         hit = _ChunkGeoms(chunk_shape, levels, stride, block, torch, device,
-                          agg_level)
+                          agg_level, prune_invalid_lines)
         _CHUNK_GEOM_CACHE[key] = hit
     return hit
 
@@ -1082,7 +1103,8 @@ class ChunkedGNNPredictor:
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
                  device: str = "cpu", levels: int = 4, anchor_stride: int = 16,
-                 anchor_block: int = 1, agg_level: int | None = None):
+                 anchor_block: int = 1, agg_level: int | None = None,
+                 prune_invalid_lines: bool | None = None):
         import torch
 
         self._torch = torch
@@ -1096,6 +1118,10 @@ class ChunkedGNNPredictor:
         self.anchor_block = int(anchor_block)
         # Neighbourhood aggregation level (see GNNPredictor / half_directions).
         self.agg_level = None if agg_level is None else int(agg_level)
+        self.prune_invalid_lines = (
+            self.agg_level == 1 if prune_invalid_lines is None
+            else bool(prune_invalid_lines)
+        )
         self.d, self.model, self.checkpoint_hash = _load_inference_model(
             checkpoint_path, torch, self.device)
 
@@ -1131,7 +1157,7 @@ class ChunkedGNNPredictor:
         cshape = tuple(min(e, n) for e, n in zip(self.edges, self.shape))
         cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
                                self.anchor_block, torch, self.device,
-                               self.agg_level)
+                               self.agg_level, self.prune_invalid_lines)
         n_interior = int(len(cg.interior_flat))
         n_band = int(len(cg.ref_halo_flat))          # upper bound (all referenced)
         field_bytes = channels * (1 + n_interior + n_band) * ndim * self.d * 4
@@ -1207,7 +1233,7 @@ class ChunkedGNNPredictor:
         torch = self._torch
         cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
                                self.anchor_block, torch, self.device,
-                               self.agg_level)
+                               self.agg_level, self.prune_invalid_lines)
         ndim = len(cshape)
         n_field = 1 + int(len(cg.interior_flat)) + int(len(cg.ref_halo_flat))
         M = max((g.M for g in cg.geoms if g is not None), default=1)
@@ -1239,7 +1265,7 @@ class ChunkedGNNPredictor:
                        for sl in self.chunk_slices(chunk_ids[0]))
         cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
                                self.anchor_block, torch, self.device,
-                               self.agg_level)
+                               self.agg_level, self.prune_invalid_lines)
         frame = _CompactFrame(cg, origins[0], self.shape, self.edges, self.grid,
                               self.coded, torch, self.device)
         E = torch.zeros(B, frame.n_compact, ndim, self.d, device=self.device)
@@ -1338,7 +1364,7 @@ class ChunkedGNNPredictor:
         cshape = tuple(sl.stop - sl.start for sl in sls)
         cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
                                self.anchor_block, torch, self.device,
-                               self.agg_level)
+                               self.agg_level, self.prune_invalid_lines)
 
         # compact field: 1 dummy + interior + usable-referenced halo band only —
         # the dead rest of the padded shell is never allocated.

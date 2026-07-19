@@ -30,6 +30,14 @@ FLAG_CUBIC = 1 << 4        # interp order: set = cubic, clear = linear
 FLAG_NOTILE = 1 << 5       # whole image is one tile (no padding, no seam)
 FLAG_RANS = 1 << 6         # per-symbol scale-conditioned coder for stage bins
 
+# GNN execution metadata packed into otherwise-unused flag bits.  Keeping it in
+# the existing flags word preserves the v5 fixed-header layout and lets new
+# readers decode old streams (zero means the historical full neighbourhood).
+_AGG_LEVEL_SHIFT = 7
+_AGG_LEVEL_MASK = 0xF << _AGG_LEVEL_SHIFT
+_FLAG_GNN_PRUNE_INVALID = 1 << 11
+_GNN_META_MASK = _AGG_LEVEL_MASK | _FLAG_GNN_PRUNE_INVALID
+
 _EMP_ANS = b"MATSANS1"
 
 _HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHHd"
@@ -58,6 +66,8 @@ class Header:
     n_tiles_y: int = 1
     n_tiles_x: int = 1
     flags: int = 0
+    agg_level: int | None = None
+    gnn_prune_invalid: bool = False
     interp_center: int = 0  # interp multi-axis mode: 0=avg both, 1=axis0, 2=axis1
     eb_ratio: float = 1.0   # per-level error-bound decay (coarse tighter); 1=flat
     version: int = VERSION
@@ -67,8 +77,15 @@ class Header:
     spatial: tuple[int, ...] = ()
 
     def pack(self) -> bytes:
+        agg_level = 0 if self.agg_level is None else int(self.agg_level)
+        if self.agg_level is not None and not 1 <= agg_level <= 15:
+            raise ValueError("agg_level must be in [1, 15] or None")
+        flags = self.flags & ~_GNN_META_MASK
+        flags |= agg_level << _AGG_LEVEL_SHIFT
+        if self.gnn_prune_invalid:
+            flags |= _FLAG_GNN_PRUNE_INVALID
         return struct.pack(
-            _HEADER_FMT, MAGIC, self.version, self.flags,
+            _HEADER_FMT, MAGIC, self.version, flags,
             self.orig_h, self.orig_w, self.channels, self.src_dtype,
             self.eb, self.levels, self.anchor_stride, self.anchor_block,
             self.interp_center,
@@ -86,6 +103,9 @@ class Header:
             raise ValueError(f"not a DeepSZ stream (bad magic {magic!r})")
         if version != VERSION:
             raise ValueError(f"unsupported version {version}")
+        agg_level = (flags & _AGG_LEVEL_MASK) >> _AGG_LEVEL_SHIFT
+        gnn_prune_invalid = bool(flags & _FLAG_GNN_PRUNE_INVALID)
+        flags &= ~_GNN_META_MASK
         return cls(orig_h=orig_h, orig_w=orig_w, channels=channels,
                    src_dtype=src_dtype, eb=eb, levels=levels,
                    anchor_stride=anchor_stride, anchor_block=anchor_block,
@@ -93,6 +113,8 @@ class Header:
                    vmin=vmin, vmax=vmax, ckpt_hash=ckpt_hash,
                    n_tiles_y=n_tiles_y, n_tiles_x=n_tiles_x,
                    flags=flags, interp_center=interp_center,
+                   agg_level=agg_level or None,
+                   gnn_prune_invalid=gnn_prune_invalid,
                    eb_ratio=eb_ratio, version=version)
 
 

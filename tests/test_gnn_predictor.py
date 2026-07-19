@@ -164,6 +164,21 @@ def test_gnn_predictors_share_loaded_inference_model(tmp_path):
     assert first.model is second.model
 
 
+def test_level1_prunes_stage_wide_invalid_lines():
+    args = ((16, 16, 16), 2, 4, 1, 16, torch)
+    baseline, _ = build_stage_geoms(*args, agg_level=1,
+                                    prune_invalid_lines=False)
+    optimized, _ = build_stage_geoms(*args, agg_level=1,
+                                     prune_invalid_lines=True)
+
+    assert len(optimized) == len(baseline)
+    assert all(a.M == b.M for a, b in zip(baseline, optimized))
+    assert all(a.ip.shape[0] <= b.ip.shape[0]
+               for a, b in zip(optimized, baseline))
+    assert any(a.ip.shape[0] < b.ip.shape[0]
+               for a, b in zip(optimized, baseline))
+
+
 def test_finalize_ctx_reuse_equivalence():
     torch.manual_seed(0)
     model = build_model(d=8).eval()

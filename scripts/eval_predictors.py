@@ -51,7 +51,8 @@ def make_predictor(method: str, img: np.ndarray, args):
                          tile_size=args.gnn_tile, max_radius=args.max_radius,
                          device=args.device, levels=args.levels,
                          anchor_stride=args.anchor_stride,
-                         anchor_block=args.anchor_block)
+                         anchor_block=args.anchor_block,
+                         agg_level=args.agg_level)
         p.fp16 = args.fp16
         p.compile = args.compile
         return p
@@ -68,7 +69,9 @@ def build_predictor_for_decompress(method: str, hdr: Header, args):
                          tile_size=hdr.tile_size, max_radius=args.max_radius,
                          device=args.device, levels=hdr.levels,
                          anchor_stride=hdr.anchor_stride,
-                         anchor_block=hdr.anchor_block)
+                         anchor_block=hdr.anchor_block,
+                         agg_level=hdr.agg_level,
+                         prune_invalid_lines=hdr.gnn_prune_invalid)
         p.fp16 = args.fp16   # eval runs enc+dec in-process, so both match
         p.compile = args.compile
         return p
@@ -105,7 +108,7 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
         radius=args.radius, zstd_level=args.zstd_level,
         eb_ratio=args.eb_ratio,
         tune=args.tune if args.tune in ("fast", "size") else "fast",
-        agg_level=None,  # match the unchunked arm's full neighbourhood
+        agg_level=args.agg_level,
         device=args.device, chunk_size=args.chunk_size,
         fp16=args.fp16, compile=args.compile)
     t0 = time.time()
@@ -313,6 +316,9 @@ def main():
                     help="region/tile size for the interp predictor")
     ap.add_argument("--max-radius", type=int, default=64,
                     help="GNN neighbour search radius")
+    ap.add_argument("--agg-level", type=int, default=None,
+                    help="GNN neighbourhood aggregation level; 1 enables the "
+                         "all-invalid direction pruning fast path")
     ap.add_argument("--device", default="cpu", help="torch device for the GNN")
     ap.add_argument("--fp16", action="store_true",
                     help="fp16 autocast on the GNN message pass (cuda; readout "
