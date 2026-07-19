@@ -34,6 +34,12 @@ unset DEEPSZ_M_TILE
 # smoothness in [MIN/2, MAX], a random per-axis spread (-> isotropic..
 # anisotropic), and a random value-marginal warp (unimodal..bimodal), so the
 # prior spans diverse scientific fields, not one texture a wide model overfits.
+# --noise-range reaches 1e-6: the old floor of 1e-4 meant the model never saw a
+# context cleaner than 1e-4 and had no gradient incentive to predict below it,
+# leaving a ~1e-5 bulk-error floor that costs ~3 bits/pt at eb=1e-6 (interp,
+# being analytic, has no such floor). Pairs with the widened rANS scale grid
+# (rans.SCALE_HI_MULT 64->4096) + head clamp (-4..12): sub-1e-4 ebs need scale
+# levels the old grid couldn't express. Tensor eval at 1e-5 watches this regime.
 python scripts/train_gnn.py \
     --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
     --out data/gnn_predictor.pt \
@@ -50,7 +56,7 @@ python scripts/train_gnn.py \
     --agg-level 1 \
     --d 64 \
     --lr 0.0005 \
-    --noise-range 0.0001 0.05 \
+    --noise-range 0.000001 0.01 \
     --eval-image /lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak/17.png \
     --eval-eb 0.001 \
     --eval-every 500 \

@@ -30,11 +30,20 @@ class RansTables:
         return 2 * self.radius
 
 
+# Shared eb-relative scale-grid span [eb/SCALE_LO_DIV, eb*SCALE_HI_MULT].
+# HI was 64 until bitstream v6 / gnn-stream v4-v5: at eb<=1e-5 the prediction
+# error stays orders of magnitude above eb, so ~half the points needed a scale
+# above 64*eb and pinned at the grid ceiling (bench_levels sat+%). 64 levels
+# over 16 octaves is still 0.25 octave/level -> negligible mismatch cost.
+SCALE_LO_DIV = 16.0
+SCALE_HI_MULT = 4096.0
+
+
 def scale_to_level(scale: np.ndarray, eb: float, n_levels: int = 64) -> np.ndarray:
     """Quantize Laplacian scale values to the shared 64-level log grid."""
     scale = np.asarray(scale, np.float32)
-    lo = float(eb) / 16.0
-    hi = float(eb) * 64.0
+    lo = float(eb) / SCALE_LO_DIV
+    hi = float(eb) * SCALE_HI_MULT
     if eb <= 0:
         raise ValueError("eb must be > 0")
     t = (np.log(np.clip(scale, lo, hi)) - np.log(lo)) / (np.log(hi) - np.log(lo))
@@ -56,8 +65,8 @@ def build_laplace_tables(
     if eb <= 0:
         raise ValueError("eb must be > 0")
     cdfs = _build_laplace_cdfs_cached(radius, n_levels, precision)
-    lo = eb / 16.0
-    hi = eb * 64.0
+    lo = eb / SCALE_LO_DIV
+    hi = eb * SCALE_HI_MULT
     grid = np.exp(np.linspace(np.log(lo), np.log(hi), n_levels)).astype(np.float32)
     return RansTables(cdfs=cdfs, precision=precision, eb=eb, radius=radius,
                       scale_grid=grid)
@@ -76,8 +85,8 @@ def _build_laplace_cdfs_cached(
         raise ValueError("precision is too small for the quantizer alphabet")
 
     eb = 1.0
-    lo = eb / 16.0
-    hi = eb * 64.0
+    lo = eb / SCALE_LO_DIV
+    hi = eb * SCALE_HI_MULT
     grid = np.exp(np.linspace(np.log(lo), np.log(hi), n_levels)).astype(np.float64)
     q = np.arange(alphabet, dtype=np.float64) - float(radius)
     left = q * (2.0 * eb) - eb

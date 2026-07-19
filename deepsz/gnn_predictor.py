@@ -98,19 +98,30 @@ def _nearest_steps(pat: np.ndarray, dvec, P: int, res=None) -> np.ndarray:
         r = tuple((res[k] + t * dvec[k]) % P for k in range(pat.ndim))
         take = (t0 == 0) & pat[r]
         t0[take] = t
+        if np.all(t0):
+            break
     return t0
 
 
 _NEAREST_TILE_CACHE: dict = {}
 
 
-def _nearest_steps_at(pat: np.ndarray, dvec, P: int, res) -> np.ndarray:
+def _nearest_steps_at(pat: np.ndarray, dvec, P: int, res, *,
+                      query_only: bool = False) -> np.ndarray:
     """`_nearest_steps` evaluated at the query residues ``res``, via a cached
     full period tile when that is cheaper: the tile costs O(P^(ndim+1)) once
     per (pat, dvec) and O(M) per lookup, vs O(P*M) per call for the direct
     path. ponytail: tile capped at 2^20 cells (4-D at stride 32); beyond that
     fall back to the direct path rather than build a giant tile."""
     M = len(res[0])
+    # A chunk schedule partitions one period tile across many stages. Building
+    # a full P**ndim lookup independently for every (stage, direction) looks
+    # cheaper for a single large stage, but is catastrophically expensive over
+    # the whole schedule (76 stages for levels=5 in 4-D). Across all stages the
+    # query counts sum to only P**ndim, so evaluating at query residues is the
+    # linear-work strategy for chunk geometry.
+    if query_only:
+        return _nearest_steps(pat, dvec, P, res)
     if pat.size > 1 << 20 or pat.size > P * M:
         return _nearest_steps(pat, dvec, P, res)
     key = (pat.tobytes(), pat.shape, tuple(int(c) for c in dvec), P)
@@ -171,7 +182,7 @@ class _StageGeom:
                  "query_idx", "idx_np", "M", "ndim")
 
     def __init__(self, pat, query_coords, shape, max_radius, torch, device,
-                 agg_level=None):
+                 agg_level=None, query_only=False):
         ndim = len(shape)
         self.ndim = ndim
         P = pat.shape[0]
@@ -198,7 +209,8 @@ class _StageGeom:
                     ln["d" + side] = t(np.zeros(0, np.float32))
                     ln["v" + side] = t(np.zeros(0, bool))
                     continue
-                step = _nearest_steps_at(pat, sd, P, res)       # (M,) at query residues
+                step = _nearest_steps_at(
+                    pat, sd, P, res, query_only=query_only)     # (M,) at query residues
                 nb = Q + step[:, None] * sd                     # neighbour coords
                 inb = np.all((nb >= 0) & (nb < shp), axis=1)
                 valid = (step >= 1) & (step <= limit) & inb     # legacy: in-bounds & <=limit
@@ -442,6 +454,12 @@ def build_model(d: int = 32):
         def __init__(self):
             super().__init__()
             self.net = _mlp(torch, [d + 1, h, 2])
+            # Start unconfident: delta ~= 8 (b ~= 256*eb), inside the clamp so
+            # gradients flow both ways. A zero init means b ~= eb, and with
+            # untrained predictions (|r| ~ 0.1) at eb=1e-6 the NLL tail then
+            # fires ~1/b gradient spikes from step 1.
+            with torch.no_grad():
+                self.net[-1].bias[1] = 8.0
 
         def forward(self, e, eb):
             B, M, _ = e.shape
@@ -454,7 +472,15 @@ def build_model(d: int = 32):
             cond = log_eb.view(B, 1, 1).expand(B, M, 1)
             out = self.net(torch.cat([e, cond], dim=-1))
             mu = torch.sigmoid(out[..., 0])
-            log_b = out[..., 1].clamp(-8.0, 0.0)
+            # Laplace scale is eb-relative: `delta` spans the deployed rANS scale
+            # grid [eb/16, 4096*eb] (log2 offsets -4..12, see rans.SCALE_LO_DIV/
+            # SCALE_HI_MULT), so the head can express sub-eb confidence at ANY eb.
+            # The old span-relative clamp(-8,0) pinned every point to the broadest
+            # grid levels at low eb; the earlier eb-relative ceiling of +6 pinned
+            # ~half the points at very low eb (<=1e-5), where prediction error
+            # stays orders of magnitude above eb (bench_levels sat+%).
+            delta = out[..., 1].clamp(-4.0, 12.0)
+            log_b = log_eb.view(B, 1) + delta
             return mu, log_b
 
     class MixEmbed(nn.Module):
@@ -607,6 +633,11 @@ def _load_inference_model(checkpoint_path, torch, device):
     hit = _MODEL_CACHE.get(key)
     if hit is not None:
         return hit
+    # One live revision per (path, device): the trainer overwrites the eval
+    # checkpoint every eval, so keying on mtime alone leaks a model (and its
+    # compiled embed) per revision until OOM.
+    for k in [k for k in _MODEL_CACHE if k[0] == key[0] and k[3] == key[3]]:
+        del _MODEL_CACHE[k]
 
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     version = int(ckpt.get("version", 1))
@@ -832,7 +863,7 @@ class _ChunkGeoms:
     shares this object (cached in ``build_chunk_geoms``)."""
 
     def __init__(self, chunk_shape, levels, stride, block, torch, device,
-                 agg_level=None):
+                 agg_level=None, progress=None):
         self.chunk_shape = tuple(int(n) for n in chunk_shape)
         self.levels, self.stride, self.block = levels, stride, block
         self.agg_level = agg_level
@@ -850,10 +881,15 @@ class _ChunkGeoms:
             if not len(Q):
                 self.geoms.append(None)
                 self.coords.append(None)
+                if progress is not None:
+                    progress(1)
                 continue
             self.geoms.append(_StageGeom(pats[s], Q + stride, self.padded_shape,
-                                         stride, torch, device, agg_level))
+                                         stride, torch, device, agg_level,
+                                         query_only=True))
             self.coords.append(Q)
+            if progress is not None:
+                progress(1)
         # prediction chain: stage 0 is always the base (anchors, possibly empty
         # in a ragged tail chunk -> None geom, nothing to finalize), followed by
         # every non-empty refinement stage in order.
@@ -892,7 +928,7 @@ _CHUNK_GEOM_CACHE: dict = {}
 
 
 def build_chunk_geoms(chunk_shape, levels, stride, block, torch, device=None,
-                      agg_level=None):
+                      agg_level=None, progress=None):
     """Cached `_ChunkGeoms` per (chunk shape, schedule, agg_level, device).
     Interior chunks all share one entry; ragged edge chunks add at most a few
     shape variants (ponytail: unbounded like _GEOM_CACHE, bounded in practice).
@@ -904,8 +940,10 @@ def build_chunk_geoms(chunk_shape, levels, stride, block, torch, device=None,
     hit = _CHUNK_GEOM_CACHE.get(key)
     if hit is None:
         hit = _ChunkGeoms(chunk_shape, levels, stride, block, torch, device,
-                          agg_level)
+                          agg_level, progress)
         _CHUNK_GEOM_CACHE[key] = hit
+    elif progress is not None:
+        progress(len(hit.geoms))
     return hit
 
 
@@ -1100,7 +1138,8 @@ class ChunkedGNNPredictor:
             checkpoint_path, torch, self.device)
 
     # -- per-tensor lifecycle -------------------------------------------------
-    def begin(self, shape, chunk_edges, channels: int = 1):
+    def begin(self, shape, chunk_edges, channels: int = 1,
+              geometry_progress=None):
         torch = self._torch
         self.shape = tuple(int(n) for n in shape)
         self.edges = tuple(int(e) for e in chunk_edges)
@@ -1114,30 +1153,31 @@ class ChunkedGNNPredictor:
         self.n_chunks = int(np.prod(self.grid))
         self.C = int(channels)
         ndim = len(self.shape)
-        self._check_field_budget(ndim, channels)
+        self._check_field_budget(ndim, channels, geometry_progress)
         self.coarse = torch.zeros(self.C, self.n_chunks, self.levels + 1,
                                   ndim, self.d, device=self.device)
         self.coded = np.zeros(self.n_chunks, bool)
         self._cg = None
 
-    def _check_field_budget(self, ndim, channels):
+    def _check_field_budget(self, ndim, channels, geometry_progress=None):
         """Fail fast (with numbers + fix) before torch OOMs. Two terms scale with
         chunk size: the compact field (1 dummy + interior + referenced halo band)
         and, larger, one stage's message tensor (B, L, M, K, d) where L is the
         half-direction count ((3^ndim-1)/2, so 40 in 4-D) and M the stage's query
-        count. The activation dominates and only shrinks with the chunk, hence
-        with anchor_stride (chunk edge >= anchor_stride)."""
+        count. The embed pass tiles M by ``DEEPSZ_M_TILE``, so its activation
+        estimate must use the tile size rather than the full stage."""
         torch = self._torch
         cshape = tuple(min(e, n) for e, n in zip(self.edges, self.shape))
         cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
                                self.anchor_block, torch, self.device,
-                               self.agg_level)
+                               self.agg_level, geometry_progress)
         n_interior = int(len(cg.interior_flat))
         n_band = int(len(cg.ref_halo_flat))          # upper bound (all referenced)
         field_bytes = channels * (1 + n_interior + n_band) * ndim * self.d * 4
         M = max((g.M for g in cg.geoms if g is not None), default=0)
+        m = min(M, _M_TILE)
         L = len(half_directions(ndim, self.agg_level))
-        act_bytes = 4 * channels * L * M * ndim * self.d * 4  # ~4 live copies
+        act_bytes = 4 * channels * L * m * ndim * self.d * 4  # ~4 live copies
         need = field_bytes + act_bytes
         if self.device.type == "cuda":
             budget = int(0.8 * torch.cuda.mem_get_info(self.device)[0])
@@ -1147,10 +1187,10 @@ class ChunkedGNNPredictor:
             raise MemoryError(
                 f"chunked GNN needs up to {need/1e9:.0f} GB per chunk "
                 f"(field {field_bytes/1e9:.1f} + stage activation "
-                f"{act_bytes/1e9:.0f} GB for M={M:,} queries x L={L} lines, "
-                f"budget {budget/1e9:.0f} GB). Reduce --anchor-stride: the chunk "
-                f"edge (>= anchor_stride) sets M, and the {ndim}-D activation "
-                f"grows as edge^{ndim}. anchor-stride 16 keeps M small.")
+                f"{act_bytes/1e9:.1f} GB for tile={m:,} of M={M:,} queries "
+                f"x L={L} lines, budget {budget/1e9:.1f} GB). Lower "
+                f"DEEPSZ_M_TILE, or reduce both --chunk-size and "
+                f"--anchor-stride (for example 16 and 16).")
 
     def chunk_slices(self, ci: int):
         cidx = np.unravel_index(ci, self.grid)
@@ -1161,7 +1201,7 @@ class ChunkedGNNPredictor:
         v = (np.clip(vals, self.vmin, self.vmax) - self.vmin) / self.span
         return self._torch.from_numpy(v.astype(np.float32)).to(self.device)
 
-    def anchor_coarse(self, recon: np.ndarray):
+    def anchor_coarse(self, recon: np.ndarray, progress=None):
         """Level-0 coarse embeddings for every chunk, right after the global
         anchor pass — so every chunk has anchor context on all sides before any
         chunk is coded. Anchors finalize from the null context, so this is a
@@ -1171,17 +1211,21 @@ class ChunkedGNNPredictor:
         ndim = len(self.shape)
         log_s = math.log2(self.anchor_stride)
         groups: dict = {}                         # anchor-count -> list of (ci, vals)
+        empty_chunks = 0
         for ci in range(self.n_chunks):
             axes = []
             for sl in self.chunk_slices(ci):
                 c = np.arange(sl.start, sl.stop)
                 axes.append(c[(c % self.anchor_stride) < self.anchor_block])
             if any(len(a) == 0 for a in axes):
+                empty_chunks += 1
                 continue                          # ragged chunk with no anchors
             vals = recon[(slice(None), *np.ix_(*axes))].reshape(-1)   # C==1
             groups.setdefault(len(vals), ([], []))
             groups[len(vals)][0].append(ci)
             groups[len(vals)][1].append(vals)
+        if progress is not None and empty_chunks:
+            progress(empty_chunks)
         with torch.no_grad(), self._amp():
             for ids, vlist in groups.values():
                 v = np.stack(vlist)                             # (G, M_a)
@@ -1190,6 +1234,8 @@ class ChunkedGNNPredictor:
                 # its producer ran under autocast.
                 self.coarse[0, ids, 0] = self.model.coarse(
                     fin.mean(1), log_s).to(self.coarse.dtype)
+                if progress is not None:
+                    progress(len(ids))
 
     # ---- batched wave path (codec): many same-geometry chunks in the B dim ----
 

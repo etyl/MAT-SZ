@@ -15,6 +15,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("constriction")  # rANS backend; skip if unavailable
 
 from deepsz import GNNCompressorCodec
+import deepsz.gnn_predictor as gp
 from deepsz.gnn_codec import _chunk_waves
 from deepsz.gnn_predictor import (CKPT_VERSION, ChunkedGNNPredictor,
                                   _CompactFrame, build_chunk_geoms, build_model,
@@ -38,11 +39,36 @@ def _codec(path, *, eb=1e-2, chunk_size):
     return GNNCompressorCodec(
         path, error_bound=eb, levels=LEVELS, anchor_stride=STRIDE,
         anchor_block=1, max_radius=4, chunk_size=chunk_size,
-        fp16=False, compile=False)
+        fp16=False, compile=False, gate=False)
 
 
 def _maxerr(y, x):
     return float(torch.max(torch.abs(y.float() - torch.as_tensor(x).float())))
+
+
+def test_gate_roundtrip_and_header(v5_ckpt):
+    """Scale-gated interp fallback: the bound holds, decode is driven by the
+    header (not the codec flag), and an all-off gate leaves the stream
+    byte-identical to gate=False."""
+    from deepsz.gnn_codec import _read_stream
+    rng = np.random.RandomState(7)
+    gx, gy = np.meshgrid(np.linspace(0, 4, 16, dtype=np.float32),
+                         np.linspace(0, 4, 16, dtype=np.float32), indexing="ij")
+    f = np.sin(gx) * np.cos(gy) + rng.rand(16, 16).astype(np.float32) * 0.01
+    eb = 1e-6
+    on = GNNCompressorCodec(
+        v5_ckpt, error_bound=eb, levels=LEVELS, anchor_stride=STRIDE,
+        anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=False,
+        compile=False, gate=True)
+    off = _codec(v5_ckpt, eb=eb, chunk_size=STRIDE)
+    s_on, s_off = on.compress(f), off.compress(f)
+    gates = _read_stream(s_on)[0].get("gates")
+    if gates is None:
+        assert s_on == s_off
+    else:
+        assert any(g >> 4 for g in gates)
+    for s in (s_on, s_off):
+        assert _maxerr(off.uncompress(s), f) <= eb
 
 
 # --- roundtrip within the error bound --------------------------------------
@@ -141,6 +167,47 @@ def test_chunk_waves_are_mutually_independent():
             for j in range(i + 1, len(coords)):
                 diff = np.abs(np.array(coords[i]) - np.array(coords[j]))
                 assert diff.max() >= 2   # never adjacent (Chebyshev distance >= 2)
+
+
+def test_query_only_nearest_search_matches_period_tile_lookup():
+    rng = np.random.RandomState(17)
+    pat = rng.rand(4, 4, 4) > 0.7
+    q = np.stack(np.nonzero(rng.rand(4, 4, 4) > 0.4), axis=1)
+    res = tuple(q[:, k] for k in range(q.shape[1]))
+    direction = (1, -1, 0)
+
+    tiled = gp._nearest_steps_at(pat, direction, 4, res)
+    query_only = gp._nearest_steps_at(
+        pat, direction, 4, res, query_only=True)
+
+    np.testing.assert_array_equal(query_only, tiled)
+
+
+def test_chunk_geometry_uses_query_only_search_and_reports_progress(monkeypatch):
+    """Chunk schedules must not rebuild a full period tile for every stage and
+    direction.  That path effectively hangs for a 32^4 chunk (76 stages)."""
+    gp._CHUNK_GEOM_CACHE.clear()
+    seen = []
+    original = gp._nearest_steps_at
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("query_only", False))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(gp, "_nearest_steps_at", spy)
+    updates = []
+    geom = gp.build_chunk_geoms(
+        (8, 8), LEVELS, STRIDE, 1, torch, None, 2, updates.append)
+
+    assert seen and all(seen)
+    assert sum(updates) == len(geom.geoms)
+
+    # A cache hit still completes a caller's setup bar immediately.
+    cached_updates = []
+    assert gp.build_chunk_geoms(
+        (8, 8), LEVELS, STRIDE, 1, torch, None, 2,
+        cached_updates.append) is geom
+    assert sum(cached_updates) == len(geom.geoms)
 
 
 def test_fp16_flag_roundtrips_and_persists(v5_ckpt):

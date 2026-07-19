@@ -341,7 +341,15 @@ def discretized_laplace_nll(mu, log_b, target, eb):
     # |residual| >= eb: quantization cell is wholly on one side of zero.
     tail_mass = torch.log1p(-torch.exp((-2.0 * e).clamp_max(
         -torch.finfo(target.dtype).eps)))
-    logp_tail = log_half - (rho - e) + tail_mass
+    # Past ~32 bits (the codec stores such points as raw f32 outliers anyway)
+    # compress the linear tail logarithmically: keeps a scale-free ~1/|r|
+    # gradient instead of ~1/b, which hits 1e7 at eb=1e-6 (b init ~= eb) and
+    # poisons Adam's moments (flat loss) then NaNs. clamp_min guards the
+    # eagerly-evaluated where branch from log1p(<=-1).
+    t = rho - e
+    t_max = 32.0 * math.log(2.0)
+    t = torch.where(t > t_max, t_max + torch.log1p((t - t_max).clamp_min(0.0)), t)
+    logp_tail = log_half - t + tail_mass
 
     # |residual| < eb: quantization cell straddles zero. Clamp rho to this
     # branch's domain before evaluating so torch.where's eager branch execution
@@ -416,11 +424,16 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
 
     torch.save({"state_dict": model.state_dict(), "d": d,
                 "version": CKPT_VERSION}, ckpt_path)
+    # compile=False: each eval loads a fresh model instance, so compiling here
+    # recompiles from scratch every 500 steps and (under
+    # DEEPSZ_COMPILE_MODE=reduce-overhead) allocates CUDA-graph pools sized by
+    # the eval tensor each time — RAM, not speed. Eval timing is therefore
+    # eager-mode pessimistic; benchmark deployed speed with eval_tensor.py.
     codec = GNNCompressorCodec(
         ckpt_path, error_bound=eb, levels=(args.levels or 4),
         anchor_stride=(args.stride or 16), max_radius=args.max_radius,
         device=str(device), agg_level=args.agg_level,
-        fp16=args.fp16, compile=args.compile)
+        fp16=args.fp16, compile=False)
 
     base_gpu = 0
     if device.type == "cuda":
