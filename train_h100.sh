@@ -55,7 +55,7 @@ python scripts/train_gnn.py \
     --workers 4 \
     --agg-level 1 \
     --d 64 \
-    --lr 0.0005 \
+    --lr 0.0003 \
     --noise-range 0.000001 0.01 \
     --eval-image /lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak/17.png \
     --eval-eb 0.001 \
