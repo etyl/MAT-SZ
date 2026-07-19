@@ -24,12 +24,16 @@ def quantize(
     eb: float,
     radius: int = DEFAULT_RADIUS,
     round_output: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_recon: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Quantize values ``x`` against predictions ``pred``.
 
     Returns ``(codes, outlier_vals)`` where ``codes`` is uint32 with the same
     flattened length as ``x`` and ``outlier_vals`` holds the exact float32
     values for positions with code 0, in scan order.
+
+    With ``return_recon=True``, also returns the decoder-identical reconstructed
+    values, avoiding a duplicate dequantization pass in the encoder.
 
     ``round_output=True`` verifies the bound against the rounded-to-integer
     reconstruction — required for integer sources, where the final cast can
@@ -52,10 +56,15 @@ def quantize(
     # Verify with the decoder's own arithmetic; demote violators to outliers.
     recon = _recon_from_codes(pred, codes, eb, radius)
     if round_output:
-        recon = np.rint(recon)
-    ok = in_range & (np.abs(x - recon) <= np.float32(eb))
+        checked_recon = np.rint(recon)
+    else:
+        checked_recon = recon
+    ok = in_range & (np.abs(x - checked_recon) <= np.float32(eb))
     codes[~ok] = 0
     outlier_vals = x[codes == 0].copy()
+    if return_recon:
+        recon[~ok] = x[~ok]
+        return codes, outlier_vals, recon
     return codes, outlier_vals
 
 

@@ -48,12 +48,13 @@ def test_payload_count_check():
         write_stream(make_header(), [b"only-one"])
 
 
-def test_stage_roundtrip():
+@pytest.mark.parametrize("empirical_ans", [False, True])
+def test_stage_roundtrip(empirical_ans):
     rng = np.random.RandomState(0)
     codes = rng.randint(0, 1000, 500).astype(np.uint32)
     codes[::17] = 0
     outliers = rng.randn(int((codes == 0).sum())).astype(np.float32)
-    buf = pack_stage(codes, outliers) + pack_stage(
+    buf = pack_stage(codes, outliers, empirical_ans=empirical_ans) + pack_stage(
         np.zeros(0, np.uint32), np.zeros(0, np.float32))
     c2, o2, off = unpack_stage(buf, 0)
     assert np.array_equal(c2, codes)

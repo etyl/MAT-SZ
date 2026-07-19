@@ -35,6 +35,7 @@ def compress(
     tune: str = "fast",
     tune_size_slack: float = 1.05,
     verbose: bool = False,
+    diagnostics: bool = False,
 ) -> tuple[bytes, dict]:
     """Compress an image or an arbitrary-rank scalar field. Returns (stream, stats).
 
@@ -48,7 +49,8 @@ def compress(
     omitted, ``tune`` controls the search: ``fast`` runs one candidate, ``size``
     sweeps candidates and keeps the smallest stream, and ``rd`` keeps the
     lowest reconstruction SSE within ``tune_size_slack`` of the smallest stream.
-    1.0 reproduces flat-eb classic SZ."""
+    1.0 reproduces flat-eb classic SZ. ``diagnostics=True`` collects expensive
+    per-stage error metrics; lightweight counts and timings are always returned."""
     # Two input shapes. An "image" carries a trailing channel axis (2-D, or 3-D
     # with 1 or 3 channels) and keeps SZ's classic (H, W, C) semantics. Anything
     # else is a single-channel scalar field of arbitrary rank (scientific data):
@@ -103,6 +105,8 @@ def compress(
     # interp supplies its own sub-pass split; others use the plain dyadic schedule
     make_masks = getattr(predictor, "stage_masks", stage_masks)
     masks = make_masks(region_shape, levels, anchor_stride, anchor_block)
+    indices = (predictor.stage_indices(region_shape)
+               if hasattr(predictor, "stage_indices") else None)
     flags = getattr(predictor, "stream_flag", 0) | (FLAG_GRAY if c == 1 else 0)
     flags |= FLAG_NOTILE if notile else 0
     use_rans = getattr(predictor, "provides_scale", False)
@@ -125,15 +129,17 @@ def compress(
     def encode(ebs):
         st = new_stats()
         if notile:  # whole field, one region, any rank
-            payload, recon = _compress_tile(canvas, masks, ebs, predictor, radius,
-                                            round_output, st)
+            payload, recon = _compress_tile(
+                canvas, masks, ebs, predictor, radius, round_output, st,
+                diagnostics, indices)
             return [payload], recon, len(payload), st
         pays, rc = [], np.empty_like(canvas)
         for i in range(ty):
             for j in range(tx):
                 tile = canvas[:, i * step_h:(i + 1) * step_h, j * step_w:(j + 1) * step_w]
-                payload, recon = _compress_tile(tile, masks, ebs, predictor, radius,
-                                                round_output, st)
+                payload, recon = _compress_tile(
+                    tile, masks, ebs, predictor, radius, round_output, st,
+                    diagnostics, indices)
                 rc[:, i * step_h:(i + 1) * step_h, j * step_w:(j + 1) * step_w] = recon
                 pays.append(payload)
         return pays, rc, sum(len(p) for p in pays), st
@@ -186,7 +192,11 @@ def compress(
             st["entropy_s"] += time.time() - t0
             st["raw_payload_bytes"] = raw_bytes
             st["compressed_bytes"] = len(stream)
-            st["recon_sse"] = float(sum(st["stage_recon_sse"]))
+            if diagnostics:
+                st["recon_sse"] = float(sum(st["stage_recon_sse"]))
+            else:
+                delta = canvas.astype(np.float64) - rc.astype(np.float64)
+                st["recon_sse"] = float(np.square(delta).sum())
             candidates.append((len(stream), st["recon_sse"], ratio, center,
                                stream, rc, st))
 
@@ -245,9 +255,12 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
         region = spatial
         masks = make_masks(region, header.levels, header.anchor_stride,
                            header.anchor_block)
+        indices = (predictor.stage_indices(region)
+                   if hasattr(predictor, "stage_indices") else None)
         ebs = stage_ebs(region, header.levels, header.anchor_stride,
                         header.anchor_block, header.eb, header.eb_ratio)
-        canvas = _decompress_tile(payloads[0], masks, ebs, header, predictor)
+        canvas = _decompress_tile(
+            payloads[0], masks, ebs, header, predictor, indices)
         return _finalize(canvas, header)
 
     ty, tx = header.n_tiles_y, header.n_tiles_x
@@ -264,14 +277,20 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
     return _finalize(canvas, header)
 
 
-def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats):
+def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats,
+                   diagnostics=False, indices=None):
     c = tile.shape[0]
     recon = np.zeros_like(tile)
     known = np.zeros(tile.shape[1:], bool)
     parts = []
     use_rans = getattr(predictor, "provides_scale", False)
+    empirical_ans = isinstance(predictor, InterpPredictor)
+    tile_flat = tile.reshape(c, -1)
+    recon_flat = recon.reshape(c, -1)
+    known_flat = known.ravel()
     for stage_idx, pos in enumerate(masks):
-        n = int(pos.sum())
+        idx = indices[stage_idx] if indices is not None else None
+        n = len(idx) if idx is not None else int(pos.sum())
         if n == 0:
             if use_rans:
                 tables = build_laplace_tables(ebs[stage_idx], radius)
@@ -296,21 +315,30 @@ def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats):
                 pred = predictor.predict(recon, known, pos)
             stats["predict_s"] += time.time() - t0
         t0 = time.time()
-        codes, outliers = quantize(tile[:, pos], pred, eb, radius,
-                                   round_output=round_output)
-        recon[:, pos] = dequantize(pred, codes, outliers, eb, radius).reshape(c, n)
-        x_stage = tile[:, pos].astype(np.float64)
-        pred_err = x_stage - pred.astype(np.float64)
-        recon_err = x_stage - recon[:, pos].astype(np.float64)
-        stats["stage_pred_sae"][stage_idx] += float(np.abs(pred_err).sum())
-        stats["stage_pred_sse"][stage_idx] += float(np.square(pred_err).sum())
-        stats["stage_recon_sae"][stage_idx] += float(np.abs(recon_err).sum())
-        stats["stage_recon_sse"][stage_idx] += float(np.square(recon_err).sum())
-        stats["stage_recon_max"][stage_idx] = max(
-            stats["stage_recon_max"][stage_idx],
-            float(np.abs(recon_err).max()))
+        x_stage = tile_flat[:, idx] if idx is not None else tile[:, pos]
+        codes, outliers, recon_stage = quantize(
+            x_stage, pred, eb, radius, round_output=round_output,
+            return_recon=True)
+        if idx is not None:
+            recon_flat[:, idx] = recon_stage.reshape(c, n)
+        else:
+            recon[:, pos] = recon_stage.reshape(c, n)
+        if diagnostics:
+            x64 = x_stage.astype(np.float64)
+            pred_err = x64 - pred.astype(np.float64)
+            recon_err = x64 - recon_stage.reshape(c, n).astype(np.float64)
+            stats["stage_pred_sae"][stage_idx] += float(np.abs(pred_err).sum())
+            stats["stage_pred_sse"][stage_idx] += float(np.square(pred_err).sum())
+            stats["stage_recon_sae"][stage_idx] += float(np.abs(recon_err).sum())
+            stats["stage_recon_sse"][stage_idx] += float(np.square(recon_err).sum())
+            stats["stage_recon_max"][stage_idx] = max(
+                stats["stage_recon_max"][stage_idx],
+                float(np.abs(recon_err).max()))
         stats["quantize_s"] += time.time() - t0
-        known |= pos
+        if idx is not None:
+            known_flat[idx] = True
+        else:
+            known |= pos
         stats["outliers"] += len(outliers)
         stats["stage_outliers"][stage_idx] += len(outliers)
         stats["stage_codes"][stage_idx] += n * c
@@ -322,22 +350,25 @@ def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats):
             part = pack_stage(codes, outliers, rans_levels=levels64,
                               rans_tables=tables)
         else:
-            part = pack_stage(codes, outliers)
+            part = pack_stage(codes, outliers, empirical_ans=empirical_ans)
         stats["stage_payload_bytes"][stage_idx] += len(part)
         parts.append(part)
         stats["entropy_s"] += time.time() - t0
     return b"".join(parts), recon
 
 
-def _decompress_tile(payload, masks, ebs, header, predictor):
+def _decompress_tile(payload, masks, ebs, header, predictor, indices=None):
     c = header.channels
     region = masks[0].shape  # region dims (tile, or whole field of any rank)
     recon = np.zeros((c, *region), np.float32)
     known = np.zeros(region, bool)
     off = 0
     use_rans = bool(header.flags & FLAG_RANS)
+    recon_flat = recon.reshape(c, -1)
+    known_flat = known.ravel()
     for stage_idx, pos in enumerate(masks):
-        n = int(pos.sum())
+        idx = indices[stage_idx] if indices is not None else None
+        n = len(idx) if idx is not None else int(pos.sum())
         if n == 0:
             if use_rans:
                 tables = build_laplace_tables(ebs[stage_idx], header.radius)
@@ -368,9 +399,14 @@ def _decompress_tile(payload, masks, ebs, header, predictor):
                 payload, off, rans_levels=levels64, rans_tables=tables)
         else:
             codes, outliers, off = unpack_stage(payload, off)
-        recon[:, pos] = dequantize(pred, codes, outliers, ebs[stage_idx],
-                                   header.radius).reshape(c, n)
-        known |= pos
+        recon_stage = dequantize(
+            pred, codes, outliers, ebs[stage_idx], header.radius).reshape(c, n)
+        if idx is not None:
+            recon_flat[:, idx] = recon_stage
+            known_flat[idx] = True
+        else:
+            recon[:, pos] = recon_stage
+            known |= pos
     return recon
 
 

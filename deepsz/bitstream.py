@@ -6,8 +6,9 @@ size table, then one zstd frame holding the concatenated tile payloads.
 Tile payload (produced by codec, opaque here) = per stage:
   [n_codes u32][entropy blob len u64][entropy blob][n_outliers u32][outliers f32...]
 
-For legacy streams the entropy blob is canonical Huffman. Streams whose header
-sets FLAG_RANS use scale-conditioned context coding over the same code array.
+Interpolation streams use a compiled empirical ANS coder. Legacy and mock
+streams use canonical Huffman; streams whose header sets FLAG_RANS use
+scale-conditioned context coding over the same code array.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ FLAG_INTERP = 1 << 3       # SZ-style interpolation baseline (torch-free)
 FLAG_CUBIC = 1 << 4        # interp order: set = cubic, clear = linear
 FLAG_NOTILE = 1 << 5       # whole image is one tile (no padding, no seam)
 FLAG_RANS = 1 << 6         # per-symbol scale-conditioned coder for stage bins
+
+_EMP_ANS = b"MATSANS1"
 
 _HEADER_FMT = "<8sHHIIBBdBBBBHIQdd16sHHd"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
@@ -136,10 +139,13 @@ def pack_stage(
     *,
     rans_levels: np.ndarray | None = None,
     rans_tables=None,
+    empirical_ans: bool = False,
 ) -> bytes:
     blob_codes = np.asarray(codes, np.uint32)
     out = np.asarray(outliers, np.float32)
-    if rans_levels is None:
+    if empirical_ans:
+        hblob = _empirical_ans_encode(blob_codes)
+    elif rans_levels is None:
         from .huffman import huffman_encode
         hblob = huffman_encode(blob_codes)
     else:
@@ -160,9 +166,12 @@ def unpack_stage(
 ) -> tuple[np.ndarray, np.ndarray, int]:
     n_codes, hlen = struct.unpack_from("<IQ", buf, off)
     off += 12
-    if rans_levels is None:
+    hblob = buf[off:off + hlen]
+    if hblob.startswith(_EMP_ANS):
+        codes = _empirical_ans_decode(hblob)
+    elif rans_levels is None:
         from .huffman import huffman_decode
-        codes = huffman_decode(buf[off:off + hlen])
+        codes = huffman_decode(hblob)
     else:
         from .rans import rans_decode
         if rans_tables is None:
@@ -176,3 +185,63 @@ def unpack_stage(
     outliers = np.frombuffer(buf, np.float32, count=n_out, offset=off).copy()
     off += 4 * n_out
     return codes, outliers, off
+
+
+def _empirical_ans_encode(codes: np.ndarray) -> bytes:
+    """Encode bins with a compiled empirical ANS model.
+
+    Only symbols that occur are placed in the model, which avoids serializing
+    the quantizer's mostly empty 65k alphabet.  The outer zstd frame compresses
+    the small symbol/frequency table further.
+    """
+    import constriction
+
+    codes = np.asarray(codes, np.uint32).ravel()
+    if len(codes):
+        frequencies = np.bincount(codes)
+        symbols = np.flatnonzero(frequencies).astype(np.uint32)
+        counts = frequencies[symbols]
+        ranks = np.empty(len(frequencies), np.int32)
+        ranks[symbols] = np.arange(len(symbols), dtype=np.int32)
+        inverse = ranks[codes]
+    else:
+        symbols = np.zeros(0, np.uint32)
+        counts = np.zeros(0, np.int64)
+        inverse = np.zeros(0, np.int32)
+    head = _EMP_ANS + struct.pack("<QI", len(codes), len(symbols))
+    table = (symbols.astype("<u4", copy=False).tobytes()
+             + counts.astype("<u4", copy=False).tobytes())
+    if len(symbols) <= 1:
+        return head + table
+    model = constriction.stream.model.Categorical(
+        counts.astype(np.float32), perfect=False)
+    encoder = constriction.stream.stack.AnsCoder()
+    encoder.encode_reverse(inverse.astype(np.int32, copy=False), model)
+    words = encoder.get_compressed().astype("<u4", copy=False)
+    return head + table + words.tobytes()
+
+
+def _empirical_ans_decode(blob: bytes) -> np.ndarray:
+    import constriction
+
+    off = len(_EMP_ANS)
+    n_codes, alphabet = struct.unpack_from("<QI", blob, off)
+    off += 12
+    symbols = np.frombuffer(blob, "<u4", alphabet, off)
+    off += 4 * alphabet
+    counts = np.frombuffer(blob, "<u4", alphabet, off)
+    off += 4 * alphabet
+    if alphabet == 0:
+        if n_codes:
+            raise ValueError("empty ANS alphabet for non-empty stage")
+        return np.zeros(0, np.uint32)
+    if alphabet == 1:
+        return np.full(n_codes, symbols[0], np.uint32)
+    words = np.frombuffer(blob, "<u4", offset=off)
+    model = constriction.stream.model.Categorical(
+        counts.astype(np.float32), perfect=False)
+    decoder = constriction.stream.stack.AnsCoder(words)
+    ranks = decoder.decode(model, n_codes)
+    if not decoder.is_empty():
+        raise ValueError("trailing data in empirical ANS payload")
+    return symbols[ranks].astype(np.uint32, copy=False)

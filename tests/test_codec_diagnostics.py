@@ -21,7 +21,8 @@ def test_stage_diagnostics_account_for_total_float_distortion():
     eb = 2.0 / 255.0
     kw = dict(levels=4, anchor_stride=8, anchor_block=4)
 
-    stream, stats = compress(img, eb, InterpPredictor(64, "cubic", **kw), **kw)
+    stream, stats = compress(img, eb, InterpPredictor(64, "cubic", **kw),
+                             **kw, diagnostics=True)
     rec = decompress(stream)
 
     assert rec.dtype == np.float32

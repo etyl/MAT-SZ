@@ -65,6 +65,16 @@ def test_encoder_recon_matches_decoder():
     assert np.array_equal(r1.view(np.uint32), r2.view(np.uint32))
 
 
+def test_returned_encoder_recon_matches_decoder():
+    rng = np.random.RandomState(1)
+    x = rng.randn(1000).astype(np.float32)
+    pred = x + rng.randn(1000).astype(np.float32)
+    codes, outliers, encoder_recon = quantize(
+        x, pred, 0.01, return_recon=True)
+    decoder_recon = dequantize(pred, codes, outliers, 0.01)
+    assert np.array_equal(encoder_recon, decoder_recon)
+
+
 def test_invalid_eb():
     with pytest.raises(ValueError):
         quantize(np.zeros(1, np.float32), np.zeros(1, np.float32), 0.0)

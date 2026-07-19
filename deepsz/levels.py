@@ -21,6 +21,7 @@ decoder, and the GNN trainer all derive it from the header parameters alone.
 from __future__ import annotations
 
 import itertools
+from functools import lru_cache
 
 import numpy as np
 
@@ -32,6 +33,7 @@ def _axis_mask(mask1d: np.ndarray, axis: int, ndim: int) -> np.ndarray:
     return mask1d.reshape(shape)
 
 
+@lru_cache(maxsize=16)
 def stage_plan(
     shape: tuple[int, ...],
     levels: int,
