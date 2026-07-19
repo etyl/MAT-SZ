@@ -28,8 +28,8 @@ module purge
 module load pytorch-gpu
 
 # ---- benchmark knobs (see scripts/bench_levels.py) ----
-export CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260717-225540-c29fd5/gnn_predictor.pt}
-export EB=${EB:-1e-4}
+export CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260719-103902-456e19/gnn_predictor.pt}
+export EB=${EB:-1e-3}
 export N=${N:-64}
 export LEVELS=${LEVELS:-5}
 export STRIDE=${STRIDE:-32}
@@ -40,8 +40,10 @@ export TUNE=${TUNE:-fast}
 export FP16=${FP16:-0}                 # 1 = fp16 (no shim needed), 0 = fp32
 export CODECS=${CODECS:-interp,gnn}
 export DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
+export WHATIF=${WHATIF:-0}             # scale-gated interp fallback sim (gnn only)
+export GATE=${GATE:-1}                 # real in-codec scale gate (gnn only)
 export PYTHONUNBUFFERED=1
 
 
-echo "[bench_levels] FP16=$FP16 N=$N EB=$EB CHUNK=$CHUNK CODECS=$CODECS"
+echo "[bench_levels] FP16=$FP16 N=$N EB=$EB CHUNK=$CHUNK CODECS=$CODECS WHATIF=$WHATIF GATE=$GATE"
 python scripts/bench_levels.py "$@"

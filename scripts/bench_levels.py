@@ -28,6 +28,11 @@ Env knobs (all optional):
   N=64  EB=1e-4  LEVELS=5  STRIDE=32  BLOCK=1  CHUNK=32  AGG=2
   CODECS="interp,gnn,skel"   TUNE=fast   FP16=0   DATA=<path.npy>
   CKPT=checkpoints/d64.pt
+  WHATIF=1 : simulate a scale-gated interp fallback inside the GNN encode
+             (if delta=log2(b/eb) < T, swap the GNN prediction for chunk-local
+             cubic interp and code at scale b/2^shift), sweeping (T, shift)
+             offline on ideal discretized-Laplace cost. Answers "what would the
+             gate buy" before touching the codec.
 """
 import os, sys, time, gc, collections
 from pathlib import Path
@@ -50,6 +55,8 @@ TUNE   = os.environ.get("TUNE", "fast")
 FP16   = os.environ.get("FP16", "0") == "1"
 CODECS = [c.strip() for c in os.environ.get("CODECS", "interp,gnn,skel").split(",") if c.strip()]
 DATA   = os.environ.get("DATA", "").strip()
+WHATIF = os.environ.get("WHATIF", "0") == "1"
+GATE   = os.environ.get("GATE", "1") == "1"    # real in-codec scale gate (gnn)
 NDIM   = 4
 
 
@@ -194,6 +201,155 @@ def unhook(saved):
         setattr(m, name, orig)
 
 
+def _laplace_bits(absr, b, eb):
+    """Ideal discretized-Laplace cost/pt at coded scale b (clipped to the rANS
+    grid), capped at 32 bits = the codec's raw-f32 outlier escape.
+    ponytail: ignores the 64-level scale-grid rounding and rANS overhead; use
+    it to compare columns within the what-if, not against the real stream."""
+    from deepsz.rans import SCALE_HI_MULT, SCALE_LO_DIV
+    b = np.clip(b.astype(np.float64), eb / SCALE_LO_DIV, eb * SCALE_HI_MULT)
+    k = np.rint(np.abs(absr).astype(np.float64) / (2 * eb))
+    with np.errstate(over="ignore", under="ignore", divide="ignore"):
+        p = np.where(k == 0, -np.expm1(-eb / b),
+                     0.5 * np.exp(-((2 * k - 1) * eb / b))
+                     * -np.expm1(-2 * eb / b))
+        bits = -np.log2(p)
+    return np.minimum(bits, 32.0)
+
+
+class WhatIfGate:
+    """Scale-gated interp fallback, simulated during the real GNN encode.
+
+    Gate: if delta = log2(b/eb) < T, replace the GNN prediction with cubic
+    interp and code the interp residual at scale b/2^shift. Both sides of the
+    gate are decoder-reproducible: b comes from the model, interp is computed
+    chunk-locally from the same causal recon the wrapper sees here (the codec
+    codes sub-stages sequentially, so interp's +-stride neighbours are already
+    reconstructed, exactly like in the interp codec).
+
+    Captures per-point (|r_gnn|, |r_interp|, b) per stage-eb; the (T, shift)
+    sweep runs offline on bucketed sums, so memory stays O(levels * buckets)."""
+
+    T_GRID = [2, 3, 4, 5, 6, 7, 8]
+    SHIFTS = [0, 2, 4, 6]
+
+    def __init__(self, field):
+        self.field = np.ascontiguousarray(field)[None]   # (1, *shape)
+        self.agg = {}      # eb -> dict of bucketed sums
+        self._plans = {}
+
+    def grab(self, pr, s, recon, eb, pred, scale):
+        from deepsz.predictor import _interp_axis_at, default_interp_center
+        key = None
+        for bi, ci in enumerate(pr._wave_ids):
+            sls = tuple(pr.chunk_slices(ci))
+            cshape = tuple(sl.stop - sl.start for sl in sls)
+            if cshape not in self._plans:
+                from deepsz.levels import stage_plan
+                self._plans[cshape] = stage_plan(
+                    cshape, pr.levels, pr.anchor_stride, pr.anchor_block)
+            mask, stride, axes = self._plans[cshape][s]
+            coords = np.nonzero(mask)
+            W = recon[(slice(None), *sls)].astype(np.float64)
+            center = default_interp_center(len(cshape))
+            if center == 0 or len(axes) == 1:
+                ip = sum(_interp_axis_at(W, coords, a, stride, "cubic", cshape)
+                         for a in axes) / len(axes)
+            else:
+                a = axes[0] if center == 1 else axes[-1]
+                ip = _interp_axis_at(W, coords, a, stride, "cubic", cshape)
+            truth = self.field[(slice(None), *sls)][:, mask][0]
+            self._accum(float(eb), np.abs(truth - pred[bi]),
+                        np.abs(truth - ip[0].astype(np.float32)),
+                        np.asarray(scale[bi], np.float32))
+
+    def _accum(self, eb, r_g, r_i, b):
+        e = round(eb, 15)
+        nb = len(self.T_GRID) + 1
+        a = self.agg.setdefault(e, dict(
+            n=0, cnt=np.zeros(nb), base=np.zeros(nb), choice=0.0, oracle=0.0,
+            sse_g=0.0, sse_i=0.0,
+            i_bits={sh: np.zeros(nb) for sh in self.SHIFTS},
+            mis={sh: np.zeros(nb) for sh in self.SHIFTS}))
+        # rms(r_gnn) must reproduce the main table's pred-RMSE: it is the
+        # built-in check that truth/pred/mask stayed aligned in grab().
+        a["sse_g"] += float(np.square(r_g, dtype=np.float64).sum())
+        a["sse_i"] += float(np.square(r_i, dtype=np.float64).sum())
+        base = _laplace_bits(r_g, b, e)
+        # bucket k: e*2^T_GRID[k-1] <= b < e*2^T_GRID[k]; gate at T_GRID[j]
+        # captures buckets <= j, so every (T, shift) total is a prefix sum.
+        bucket = np.digitize(b, e * np.exp2(self.T_GRID))
+        a["n"] += b.size
+        a["cnt"] += np.bincount(bucket, minlength=nb)
+        a["base"] += np.bincount(bucket, weights=base, minlength=nb)
+        for sh in self.SHIFTS:
+            ib = _laplace_bits(r_i, b / 2.0 ** sh, e)
+            a["i_bits"][sh] += np.bincount(bucket, weights=ib, minlength=nb)
+            a["mis"][sh] += np.bincount(bucket, weights=(ib > base),
+                                        minlength=nb)
+        a["choice"] += float(np.minimum(base, _laplace_bits(r_i, b, e)).sum())
+        r_min = np.minimum(r_g, r_i)
+        a["oracle"] += float(_laplace_bits(r_min, r_min, e).sum())
+
+    def report(self):
+        npts = N ** NDIM
+        ebs = sorted(self.agg)
+        base_bpv = sum(a["base"].sum() for a in self.agg.values()) / npts
+        total = {}
+        for j, T in enumerate(self.T_GRID):
+            for sh in self.SHIFTS:
+                bits = 0.0
+                for a in self.agg.values():
+                    g = slice(0, j + 1)
+                    bits += (a["i_bits"][sh][g].sum()
+                             + a["base"].sum() - a["base"][g].sum())
+                total[(T, sh)] = bits / npts
+        print("\n===== what-if: scale-gated interp fallback "
+              "(model-cost bpv, whole tensor) =====")
+        print("  gate: delta=log2(b/eb) < T -> code interp residual at "
+              "scale b/2^shift")
+        print("  base (GNN, same cost model): "
+              f"{base_bpv:.4f} bpv   choice-oracle "
+              f"{sum(a['choice'] for a in self.agg.values())/npts:.4f}   "
+              "scale-oracle "
+              f"{sum(a['oracle'] for a in self.agg.values())/npts:.4f}")
+        print("  T\\shift" + "".join(f"{sh:>9}" for sh in self.SHIFTS))
+        for T in self.T_GRID:
+            print(f"  {T:>7}" + "".join(f"{total[(T, sh)]:>9.4f}"
+                                        for sh in self.SHIFTS))
+        (bT, bsh), bbpv = min(total.items(), key=lambda kv: kv[1])
+        print(f"  best: T={bT} shift={bsh} -> {bbpv:.4f} bpv "
+              f"(base {base_bpv:.4f})")
+        j = self.T_GRID.index(bT)
+        print(f"\n  per level at T={bT} shift={bsh}:")
+        print(f"  {'lvl':>3}{'pts':>13}{'base-bpp':>10}{'gated-bpp':>11}"
+              f"{'gated%':>8}{'misfire%':>10}{'rms(r_gnn)':>12}{'rms(r_int)':>12}")
+        for lv, e in enumerate(ebs):
+            a = self.agg[e]
+            g = slice(0, j + 1)
+            ng = a["cnt"][g].sum()
+            bits = a["i_bits"][bsh][g].sum() + a["base"].sum() - a["base"][g].sum()
+            mis = a["mis"][bsh][g].sum()
+            print(f"  {lv:>3}{a['n']:>13,}{a['base'].sum()/a['n']:>10.3f}"
+                  f"{bits/a['n']:>11.3f}{100*ng/a['n']:>7.1f}%"
+                  f"{100*mis/ng if ng else 0.0:>9.2f}%"
+                  f"{(a['sse_g']/a['n'])**0.5:>12.2e}"
+                  f"{(a['sse_i']/a['n'])**0.5:>12.2e}")
+
+
+def attach_whatif(wi):
+    from deepsz.gnn_predictor import ChunkedGNNPredictor as _P
+    orig = _P.predict_wave_stage
+
+    def wrapped(self, s, recon, eb):
+        pred, scale = orig(self, s, recon, eb)
+        wi.grab(self, s, recon, eb, pred, scale)
+        return pred, scale
+
+    _P.predict_wave_stage = wrapped
+    return [(_P, "predict_wave_stage", orig)]
+
+
 def run_interp(field, stats):
     import deepsz.codec as cc
     from deepsz.predictor import InterpPredictor
@@ -217,7 +373,7 @@ def run_gnn(field, stats, skel):
             codec = SkeletonGNNCodec(CKPT, line_order="cubic",
                                      interfaces=False, **kw)
         else:
-            codec = GNNCompressorCodec(CKPT, **kw)
+            codec = GNNCompressorCodec(CKPT, gate=GATE, **kw)
         t0 = time.time()
         stream = codec.compress(field)
         return len(stream), time.time() - t0
@@ -267,10 +423,13 @@ if __name__ == "__main__":
     pts = analytic_pts(N)
     print("  pts/level: " + " ".join(f"L{i}:{c:,}" for i, c in enumerate(pts)))
 
+    wi = WhatIfGate(field) if WHATIF and "gnn" in CODECS else None
     results = {}
     for codec in CODECS:
         st = LevelStats()
         saved = hook_all(st)
+        if wi is not None and codec == "gnn":
+            saved += attach_whatif(wi)
         try:
             if codec == "interp":
                 tot, dt = run_interp(field, st)
@@ -283,6 +442,9 @@ if __name__ == "__main__":
         finally:
             unhook(saved)
         results[codec] = report(codec.upper(), tot, dt, st, pts)
+
+    if wi is not None and wi.agg:
+        wi.report()
 
     # finest-level head-to-head (where ~90% of the bits live)
     if len(results) > 1:

@@ -39,11 +39,36 @@ def _codec(path, *, eb=1e-2, chunk_size):
     return GNNCompressorCodec(
         path, error_bound=eb, levels=LEVELS, anchor_stride=STRIDE,
         anchor_block=1, max_radius=4, chunk_size=chunk_size,
-        fp16=False, compile=False)
+        fp16=False, compile=False, gate=False)
 
 
 def _maxerr(y, x):
     return float(torch.max(torch.abs(y.float() - torch.as_tensor(x).float())))
+
+
+def test_gate_roundtrip_and_header(v5_ckpt):
+    """Scale-gated interp fallback: the bound holds, decode is driven by the
+    header (not the codec flag), and an all-off gate leaves the stream
+    byte-identical to gate=False."""
+    from deepsz.gnn_codec import _read_stream
+    rng = np.random.RandomState(7)
+    gx, gy = np.meshgrid(np.linspace(0, 4, 16, dtype=np.float32),
+                         np.linspace(0, 4, 16, dtype=np.float32), indexing="ij")
+    f = np.sin(gx) * np.cos(gy) + rng.rand(16, 16).astype(np.float32) * 0.01
+    eb = 1e-6
+    on = GNNCompressorCodec(
+        v5_ckpt, error_bound=eb, levels=LEVELS, anchor_stride=STRIDE,
+        anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=False,
+        compile=False, gate=True)
+    off = _codec(v5_ckpt, eb=eb, chunk_size=STRIDE)
+    s_on, s_off = on.compress(f), off.compress(f)
+    gates = _read_stream(s_on)[0].get("gates")
+    if gates is None:
+        assert s_on == s_off
+    else:
+        assert any(g >> 4 for g in gates)
+    for s in (s_on, s_off):
+        assert _maxerr(off.uncompress(s), f) <= eb
 
 
 # --- roundtrip within the error bound --------------------------------------
