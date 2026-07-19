@@ -1,4 +1,4 @@
-"""Closed-loop DeepSZ codec: tiling, progressive prediction, quantization.
+"""Closed-loop DeepSZ codec: progressive prediction and quantization.
 
 The encoder simulates the decoder: reconstructions fed back into the predictor
 are built exclusively from dequantize() outputs, never from the original data,
@@ -12,11 +12,11 @@ import time
 
 import numpy as np
 
-from .bitstream import (DTYPE_CODES, DTYPE_IDS, FLAG_CUBIC, FLAG_GRAY,
-                        FLAG_INTERP, FLAG_MOCK, FLAG_NOTILE, FLAG_RANS, Header,
+from .bitstream import (DTYPE_CODES, DTYPE_IDS, FLAG_COMPILED, FLAG_CUBIC,
+                        FLAG_FP16, FLAG_INTERP, FLAG_RANS, Header,
                         pack_stage, read_stream, unpack_stage, write_stream)
 from .levels import stage_ebs, stage_masks
-from .predictor import InterpPredictor, MockPredictor, default_interp_center
+from .predictor import InterpPredictor, default_interp_center
 from .quantizer import dequantize, quantize
 from .rans import build_laplace_tables, model_bits, scale_to_level
 
@@ -29,7 +29,6 @@ def compress(
     anchor_stride: int = 16,
     anchor_block: int = 1,
     radius: int = 1 << 15,
-    seed: int = 1234,
     zstd_level: int = 9,
     eb_ratio: float | None = None,
     tune: str = "fast",
@@ -40,8 +39,8 @@ def compress(
 
     An (H, W) or (H, W, C∈{1,3}) array is treated as an image (channel axis last,
     classic SZ semantics). Any other shape is a single-channel field of arbitrary
-    rank (scientific data) — compressed whole, no tiling, via a tile_free
-    predictor (interp/gnn); tiling predictors (MAT) only accept 2-D images.
+    rank (scientific data). Both interpolation and GNN predictors process the
+    complete spatial field without padding or prediction seams.
 
     ``eb_ratio`` scales the per-level error bound (coarse levels tighter, see
     ``levels.stage_ebs``): pass a value in (0, 1] to fix it. With ``eb_ratio``
@@ -53,7 +52,7 @@ def compress(
     # with 1 or 3 channels) and keeps SZ's classic (H, W, C) semantics. Anything
     # else is a single-channel scalar field of arbitrary rank (scientific data):
     # spatial = the whole shape, C = 1. Everything downstream (levels, interp/GNN
-    # predictors, quantizer) is already rank-generic; only tiling stays 2-D.
+    # predictors, quantizer) is rank-generic.
     is_image = img.ndim <= 2 or (img.ndim == 3 and img.shape[-1] in (1, 3))
     if is_image:
         if img.ndim == 2:
@@ -82,33 +81,16 @@ def compress(
 
     # channel axis to front: (C, *spatial). moveaxis generalizes transpose(2,0,1).
     field = np.moveaxis(fimg, -1, 0)
-    # Tile-free predictors (interp/GNN) compress the whole field as one region,
-    # any rank: no padding, no seam. Tiling predictors (MAT) need fixed square
-    # blocks and only handle 2-D images.
-    notile = getattr(predictor, "tile_free", False)
-    if notile:
-        th = tw = 0
-        ty = tx = 1
-        canvas = field  # (C, *spatial), no padding
-    else:
-        if len(spatial) != 2:
-            raise ValueError("tiling predictors support only 2-D images; use a "
-                             "tile_free predictor (interp/gnn) for n-D fields")
-        h, w = spatial
-        th = tw = predictor.tile_size
-        ty, tx = -(-h // th), -(-w // tw)
-        canvas = np.pad(field, ((0, 0), (0, ty * th - h), (0, tx * tw - w)), mode="edge")
-
-    region_shape = canvas.shape[1:] if notile else (th, tw)
+    region_shape = field.shape[1:]
     # interp supplies its own sub-pass split; others use the plain dyadic schedule
     make_masks = getattr(predictor, "stage_masks", stage_masks)
     masks = make_masks(region_shape, levels, anchor_stride, anchor_block)
-    flags = getattr(predictor, "stream_flag", 0) | (FLAG_GRAY if c == 1 else 0)
-    flags |= FLAG_NOTILE if notile else 0
+    flags = getattr(predictor, "stream_flag", 0)
     use_rans = getattr(predictor, "provides_scale", False)
     flags |= FLAG_RANS if use_rans else 0
+    flags |= FLAG_FP16 if getattr(predictor, "fp16", False) else 0
+    flags |= FLAG_COMPILED if getattr(predictor, "compile", False) else 0
     round_output = np.issubdtype(np.dtype(img.dtype), np.integer)
-    step_h, step_w = (canvas.shape[1] // ty, canvas.shape[2] // tx) if not notile else (0, 0)
 
     def new_stats():
         return {"predict_s": 0.0, "quantize_s": 0.0, "entropy_s": 0.0,
@@ -124,32 +106,23 @@ def compress(
 
     def encode(ebs):
         st = new_stats()
-        if notile:  # whole field, one region, any rank
-            payload, recon = _compress_tile(canvas, masks, ebs, predictor, radius,
-                                            round_output, st)
-            return [payload], recon, len(payload), st
-        pays, rc = [], np.empty_like(canvas)
-        for i in range(ty):
-            for j in range(tx):
-                tile = canvas[:, i * step_h:(i + 1) * step_h, j * step_w:(j + 1) * step_w]
-                payload, recon = _compress_tile(tile, masks, ebs, predictor, radius,
-                                                round_output, st)
-                rc[:, i * step_h:(i + 1) * step_h, j * step_w:(j + 1) * step_w] = recon
-                pays.append(payload)
-        return pays, rc, sum(len(p) for p in pays), st
+        payload, recon = _compress_region(
+            field, masks, ebs, predictor, radius, round_output, st)
+        return payload, recon, len(payload), st
 
     def ebs_for(ratio):
         return stage_ebs(region_shape, levels, anchor_stride, anchor_block, eb, ratio)
 
     def make_header(center, ratio):
-        return Header(orig_h=spatial[0], orig_w=spatial[1] if len(spatial) > 1 else 1,
-                      channels=c, src_dtype=src_dtype, spatial=tuple(spatial),
+        return Header(channels=c, src_dtype=src_dtype, spatial=tuple(spatial),
                       eb=float(eb), levels=levels, anchor_stride=anchor_stride,
-                      anchor_block=anchor_block, tile_size=th, radius=radius,
-                      seed=seed, vmin=vmin, vmax=vmax,
+                      anchor_block=anchor_block, radius=radius,
+                      max_radius=getattr(predictor, "max_radius", 0),
+                      agg_level=(-1 if getattr(predictor, "agg_level", None) is None
+                                 else int(predictor.agg_level)),
+                      vmin=vmin, vmax=vmax,
                       ckpt_hash=getattr(predictor, "checkpoint_hash", b"\0" * 16),
-                      n_tiles_y=ty, n_tiles_x=tx, flags=flags,
-                      interp_center=center, eb_ratio=ratio)
+                      flags=flags, interp_center=center, eb_ratio=ratio)
 
     if tune not in ("fast", "size", "rd"):
         raise ValueError("tune must be 'fast', 'size', or 'rd'")
@@ -179,10 +152,10 @@ def compress(
         for center in center_cands:
             if has_center:
                 predictor.center = center
-            pays, rc, raw_bytes, st = encode(ebs_for(ratio))
+            payload, rc, raw_bytes, st = encode(ebs_for(ratio))
             header = make_header(center, ratio)
             t0 = time.time()
-            stream = write_stream(header, pays, zstd_level)
+            stream = write_stream(header, payload, zstd_level)
             st["entropy_s"] += time.time() - t0
             st["raw_payload_bytes"] = raw_bytes
             st["compressed_bytes"] = len(stream)
@@ -223,16 +196,14 @@ def compress(
 
 def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
     """Decompress a DeepSZ stream. ``predictor_factory(header) -> predictor``;
-    defaults to the torch-free MockPredictor / InterpPredictor for their streams
-    (GNN streams need a factory that builds a GNNPredictor from the checkpoint)."""
-    header, payloads = read_stream(stream)
+    defaults to InterpPredictor for interpolation streams. GNN streams need a
+    factory that builds a GNNPredictor from the checkpoint."""
+    header, payload = read_stream(stream)
     if predictor_factory is None:
-        if header.flags & FLAG_MOCK:
-            predictor_factory = lambda hdr: MockPredictor(hdr.tile_size)
-        elif header.flags & FLAG_INTERP:
+        if header.flags & FLAG_INTERP:
             predictor_factory = lambda hdr: InterpPredictor(
-                hdr.tile_size, "cubic" if hdr.flags & FLAG_CUBIC else "linear",
-                hdr.levels, hdr.anchor_stride, hdr.anchor_block)
+                "cubic" if hdr.flags & FLAG_CUBIC else "linear", hdr.levels,
+                hdr.anchor_stride, hdr.anchor_block)
         else:
             raise ValueError("stream needs a predictor_factory (GNN checkpoint)")
     predictor = predictor_factory(header)
@@ -240,34 +211,19 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
         predictor.center = header.interp_center
 
     make_masks = getattr(predictor, "stage_masks", stage_masks)
-    spatial = tuple(header.spatial) or (header.orig_h, header.orig_w)
-    if header.flags & FLAG_NOTILE:  # whole field, one region, any rank
-        region = spatial
-        masks = make_masks(region, header.levels, header.anchor_stride,
-                           header.anchor_block)
-        ebs = stage_ebs(region, header.levels, header.anchor_stride,
-                        header.anchor_block, header.eb, header.eb_ratio)
-        canvas = _decompress_tile(payloads[0], masks, ebs, header, predictor)
-        return _finalize(canvas, header)
-
-    ty, tx = header.n_tiles_y, header.n_tiles_x
-    step_h = step_w = header.tile_size
-    masks = make_masks((step_h, step_w), header.levels, header.anchor_stride,
+    spatial = tuple(header.spatial)
+    masks = make_masks(spatial, header.levels, header.anchor_stride,
                        header.anchor_block)
-    ebs = stage_ebs((step_h, step_w), header.levels, header.anchor_stride,
+    ebs = stage_ebs(spatial, header.levels, header.anchor_stride,
                     header.anchor_block, header.eb, header.eb_ratio)
-    canvas = np.empty((header.channels, ty * step_h, tx * step_w), np.float32)
-    for idx, payload in enumerate(payloads):
-        i, j = divmod(idx, tx)
-        canvas[:, i * step_h:(i + 1) * step_h, j * step_w:(j + 1) * step_w] = \
-            _decompress_tile(payload, masks, ebs, header, predictor)
+    canvas = _decompress_region(payload, masks, ebs, header, predictor)
     return _finalize(canvas, header)
 
 
-def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats):
-    c = tile.shape[0]
-    recon = np.zeros_like(tile)
-    known = np.zeros(tile.shape[1:], bool)
+def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
+    c = field.shape[0]
+    recon = np.zeros_like(field)
+    known = np.zeros(field.shape[1:], bool)
     parts = []
     use_rans = getattr(predictor, "provides_scale", False)
     for stage_idx, pos in enumerate(masks):
@@ -296,10 +252,11 @@ def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats):
                 pred = predictor.predict(recon, known, pos)
             stats["predict_s"] += time.time() - t0
         t0 = time.time()
-        codes, outliers = quantize(tile[:, pos], pred, eb, radius,
+        values = field[:, pos]
+        codes, outliers = quantize(values, pred, eb, radius,
                                    round_output=round_output)
         recon[:, pos] = dequantize(pred, codes, outliers, eb, radius).reshape(c, n)
-        x_stage = tile[:, pos].astype(np.float64)
+        x_stage = values.astype(np.float64)
         pred_err = x_stage - pred.astype(np.float64)
         recon_err = x_stage - recon[:, pos].astype(np.float64)
         stats["stage_pred_sae"][stage_idx] += float(np.abs(pred_err).sum())
@@ -329,9 +286,9 @@ def _compress_tile(tile, masks, ebs, predictor, radius, round_output, stats):
     return b"".join(parts), recon
 
 
-def _decompress_tile(payload, masks, ebs, header, predictor):
+def _decompress_region(payload, masks, ebs, header, predictor):
     c = header.channels
-    region = masks[0].shape  # region dims (tile, or whole field of any rank)
+    region = masks[0].shape
     recon = np.zeros((c, *region), np.float32)
     known = np.zeros(region, bool)
     off = 0
@@ -375,9 +332,7 @@ def _decompress_tile(payload, masks, ebs, header, predictor):
 
 
 def _finalize(canvas: np.ndarray, header: Header) -> np.ndarray:
-    spatial = tuple(header.spatial) or (header.orig_h, header.orig_w)
     out = np.moveaxis(canvas, 0, -1)  # (C, *spatial) -> (*spatial, C)
-    out = out[tuple(slice(0, n) for n in spatial)]  # crop tiling padding
     dtype = DTYPE_CODES[header.src_dtype]
     if np.issubdtype(dtype, np.integer):
         info = np.iinfo(dtype)

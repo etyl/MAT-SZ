@@ -2,7 +2,6 @@
 
 Usage:
     python scripts/benchmark_kodak.py                          # default ebs 1 2 4
-    python scripts/benchmark_kodak.py --eb 2 4 --mock          # fast NN predictor
     python scripts/benchmark_kodak.py --csv results.csv
 """
 
@@ -19,8 +18,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from deepsz.codec import compress, decompress
-from deepsz.predictor import InterpPredictor, MockPredictor
-from deepsz.bitstream import FLAG_MOCK, Header
+from deepsz.predictor import InterpPredictor
+from deepsz.bitstream import Header
 from deepsz.baselines import sz3_roundtrip
 
 KODAK_DIR = ROOT / "data" / "kodak"
@@ -35,16 +34,12 @@ def load_image(path: Path) -> np.ndarray:
 
 
 def make_predictor(args, img: np.ndarray):
-    if args.mock:
-        return MockPredictor(args.tile)
-    return InterpPredictor(args.tile, "cubic", args.levels,
+    return InterpPredictor("cubic", args.levels,
                            args.anchor_stride, args.anchor_block)
 
 
 def build_predictor_for_decompress(args, hdr: Header):
-    if hdr.flags & FLAG_MOCK:
-        return MockPredictor(hdr.tile_size)
-    return InterpPredictor(hdr.tile_size, "cubic", hdr.levels,
+    return InterpPredictor("cubic", hdr.levels,
                            hdr.anchor_stride, hdr.anchor_block)
 
 
@@ -58,7 +53,6 @@ def eval_one(img: np.ndarray, eb: float, args) -> dict:
         anchor_stride=args.anchor_stride,
         anchor_block=args.anchor_block,
         radius=args.radius,
-        seed=args.seed,
         zstd_level=args.zstd_level,
     )
     t_comp = time.time() - t0
@@ -167,15 +161,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--eb", type=float, nargs="+", default=[1.0, 2.0, 4.0],
                     help="error bounds to sweep (default: 1 2 4)")
-    ap.add_argument("--mock", action="store_true",
-                    help="use the torch-free nearest-neighbor predictor")
     ap.add_argument("--levels", type=int, default=4)
     ap.add_argument("--anchor-stride", type=int, default=16)
     ap.add_argument("--anchor-block", type=int, default=4)
     ap.add_argument("--radius", type=int, default=1 << 15)
-    ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--zstd-level", type=int, default=9)
-    ap.add_argument("--tile", type=int, default=512)
     ap.add_argument("--csv", default=None, help="save per-image CSV to this path")
     ap.add_argument("--images", nargs="*", default=None,
                     help="specific image filenames to run (default: all 24)")
@@ -188,8 +178,7 @@ def main():
     if not images:
         sys.exit(f"No images found in {KODAK_DIR}")
 
-    predictor_name = "MockNN" if args.mock else "interp"
-    print(f"Benchmarking DeepSZ ({predictor_name}) on {len(images)} Kodak images")
+    print(f"Benchmarking DeepSZ (interp) on {len(images)} Kodak images")
     print(f"Error bounds: {args.eb}  |  levels={args.levels}")
     print(f"Images: {KODAK_DIR}\n")
 

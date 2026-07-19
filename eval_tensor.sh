@@ -28,7 +28,7 @@ DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-
 # DATA=${DATA:-./data/rti_rough.npy}
 
 EB=${EB:-0.0001}
-TUNE=${TUNE:-fast}               # MAT: fast (1 encode) | size/rd (4 encodes)
+TUNE=${TUNE:-fast}               # fast (1 encode) | size/rd (4 encodes)
 # SZ3 independently uses its tuned INTERP_LORENZO hybrid at every error bound.
 TUNE_SIZE_SLACK=${TUNE_SIZE_SLACK:-1.05}
 
@@ -37,7 +37,6 @@ python scripts/eval_tensor.py "$DATA" \
     --predictor gnn \
     --eb "$EB" \
     --levels 5 \
-    --anchor-stride 32 \
     --chunk-size 32 \
     --anchor-block 1 \
     --agg-level 1 \

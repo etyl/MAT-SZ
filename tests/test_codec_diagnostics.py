@@ -21,7 +21,7 @@ def test_stage_diagnostics_account_for_total_float_distortion():
     eb = 2.0 / 255.0
     kw = dict(levels=4, anchor_stride=8, anchor_block=4)
 
-    stream, stats = compress(img, eb, InterpPredictor(64, "cubic", **kw), **kw)
+    stream, stats = compress(img, eb, InterpPredictor("cubic", **kw), **kw)
     rec = decompress(stream)
 
     assert rec.dtype == np.float32
@@ -40,10 +40,10 @@ def test_uint8_style_eb_is_too_coarse_for_normalized_float_images():
     img = _normalized_smooth()
     kw = dict(levels=4, anchor_stride=8, anchor_block=4)
 
-    coarse_stream, _ = compress(img, 1.0, InterpPredictor(64, "cubic", **kw), **kw)
+    coarse_stream, _ = compress(img, 1.0, InterpPredictor("cubic", **kw), **kw)
     coarse = decompress(coarse_stream)
     fine_stream, _ = compress(img, 1.0 / 255.0,
-                              InterpPredictor(64, "cubic", **kw), **kw)
+                              InterpPredictor("cubic", **kw), **kw)
     fine = decompress(fine_stream)
 
     assert _psnr_unit(coarse, img) < 15.0
@@ -59,10 +59,10 @@ def test_tighter_coarse_level_eb_reduces_propagated_interp_distortion():
     eb = 4.0 / 255.0
     kw = dict(levels=4, anchor_stride=16, anchor_block=1)
 
-    flat_stream, _ = compress(img, eb, InterpPredictor(64, "cubic", **kw),
+    flat_stream, _ = compress(img, eb, InterpPredictor("cubic", **kw),
                               **kw, eb_ratio=1.0)
     flat = decompress(flat_stream)
-    tight_stream, _ = compress(img, eb, InterpPredictor(64, "cubic", **kw),
+    tight_stream, _ = compress(img, eb, InterpPredictor("cubic", **kw),
                                **kw, eb_ratio=0.7)
     tight = decompress(tight_stream)
 

@@ -174,7 +174,7 @@ def main(argv=None):
     for lvl in tested:
         n_lines = len(half_directions(ndim, lvl))
         predictor = GNNPredictor(
-            ckpt, vmin, vmax, tile_size=0, max_radius=64, device=device,
+            ckpt, vmin, vmax, max_radius=64, device=device,
             levels=args.levels, anchor_stride=args.anchor_stride,
             anchor_block=args.anchor_block, agg_level=lvl)
         for _ in range(args.warmup):
@@ -185,7 +185,7 @@ def main(argv=None):
 
     # Reference: the full neighbourhood (agg_level=None) is the current default.
     ref_predictor = GNNPredictor(
-        ckpt, vmin, vmax, tile_size=0, max_radius=64, device=device,
+        ckpt, vmin, vmax, max_radius=64, device=device,
         levels=args.levels, anchor_stride=args.anchor_stride,
         anchor_block=args.anchor_block, agg_level=None)
     for _ in range(args.warmup):

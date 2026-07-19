@@ -145,7 +145,7 @@ def main(argv=None):
 
     print(f"tensor {args.input} {arr.shape} {arr.dtype}, eb={eb} "
           f"(orig {orig_bytes} B)")
-    main_label = "mock" if args.mock else args.predictor
+    main_label = args.predictor
     bound_ok = report(main_label, arr, rec, len(stream), eb, t_comp, t_dec)
     print(f"  ({main_label}: outliers {stats['outliers']} "
           f"= {100*stats['outliers']/arr.size:.3f}%)")
@@ -174,7 +174,7 @@ def main(argv=None):
         sub = _cap_crop(arr, args.anchor_stride, cap) if cap else arr
         cropped = sub.shape != arr.shape
         bargs = copy.copy(args)
-        bargs.predictor, bargs.mock, bargs.tile = "interp", False, 512
+        bargs.predictor = "interp"
         t0 = time.time()
         b_stream, _ = run_compress(sub, bargs)
         b_tc = time.time() - t0

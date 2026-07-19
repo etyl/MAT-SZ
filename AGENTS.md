@@ -16,7 +16,7 @@ Agents must not submit large or long-running jobs on Jean Zay. They may inspect 
 - `pytest tests/test_quantizer.py -q` runs one focused module while iterating.
 - `pytest -m slow` runs checkpoint-backed end-to-end tests and may take minutes.
 - `python -m ruff check .` runs the configured import, syntax, and undefined-name checks.
-- `deepsz eval IMAGE --eb 2 --mock` performs a quick local round trip without a trained checkpoint.
+- `deepsz eval IMAGE --eb 2 --predictor interp` performs a quick local round trip without a trained checkpoint.
 - `python scripts/train_gnn.py --help` and `python scripts/eval_predictors.py --help` document experiment-specific options. Review cluster paths before submitting the shell launchers.
 
 ## Coding Style & Naming Conventions
@@ -25,4 +25,4 @@ Follow the existing PEP 8-like style: `snake_case` for functions and variables, 
 
 ## Testing Guidelines
 
-Name files `test_<component>.py` and tests `test_<behavior>()`. Add regression tests for error-bound guarantees, deterministic decoding, malformed streams, and rank/dtype edge cases when relevant. Prefer small seeded arrays and mock/interpolation predictors for fast tests; mark checkpoint- or hardware-dependent coverage as `slow`.
+Name files `test_<component>.py` and tests `test_<behavior>()`. Add regression tests for error-bound guarantees, deterministic decoding, malformed streams, and rank/dtype edge cases when relevant. Prefer small seeded arrays, private test doubles, and interpolation for fast tests; mark checkpoint- or hardware-dependent coverage as `slow`.

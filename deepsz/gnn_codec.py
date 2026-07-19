@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import zstandard
 
-from .codec import _compress_tile
+from .codec import _compress_region
 from . import gnn_predictor as _gp
 from .gnn_predictor import ChunkedGNNPredictor, GNNPredictor
 from .levels import stage_ebs, stage_masks, stage_plan
@@ -25,7 +25,7 @@ from .rans import (SCALE_HI_MULT, SCALE_LO_DIV, build_laplace_tables,
                    scale_to_level)
 
 
-_MAGIC = b"MATSZGNN"
+_MAGIC = b"DEEPSZGN"
 _VERSION = 4          # whole-tensor streams (v2 + widened rANS scale grid)
 _VERSION_CHUNKED = 5  # chunk-major streams (v3 + widened rANS scale grid)
 _VERSION_GATED = 6    # chunked + scale-gated interp fallback (meta["gates"])
@@ -861,8 +861,8 @@ class GNNCompressorCodec:
         ebs = stage_ebs(values.shape, self.levels, self.anchor_stride,
                         self.anchor_block, eb, eb_ratio)
         stats = _empty_stats(len(masks))
-        payload, _ = _compress_tile(values[None, ...], masks, ebs, predictor,
-                                    self.radius, dtype.kind in "bi", stats)
+        payload, _ = _compress_region(values[None, ...], masks, ebs, predictor,
+                                      self.radius, dtype.kind in "bi", stats)
         return payload
 
     def _compress_chunked_payload(
@@ -931,7 +931,6 @@ class GNNCompressorCodec:
             self.checkpoint_path,
             vmin,
             vmax,
-            tile_size=0,
             max_radius=max_radius,
             device=self.device,
             levels=levels,

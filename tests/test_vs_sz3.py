@@ -26,7 +26,7 @@ def test_matches_sz3(shape, eb):
         pytest.skip("no SZ3 implementation available")
     sz3_bytes, sz3_rec = sz3
 
-    predictor = InterpPredictor(512, "cubic", levels=4, anchor_stride=16, anchor_block=1)
+    predictor = InterpPredictor("cubic", levels=4, anchor_stride=16, anchor_block=1)
     stream, _ = compress(img, eb, predictor)
     rec = decompress(stream)
 

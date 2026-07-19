@@ -31,7 +31,6 @@ python scripts/eval_predictors.py \
     --methods gnn sz3 \
     --eb 0.001 0.004 0.008 0.014 0.02 \
     --levels 5 \
-    --anchor-stride 32 \
     --chunk-size 32 \
     --anchor-block 1 \
     --tune "$TUNE" \

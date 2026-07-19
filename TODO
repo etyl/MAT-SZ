@@ -1,7 +1,6 @@
 better metrics in training (peak ram, marg bpp?)
 improve synthetic data / train only on synthetic?
 clean code
-    * remove MAT mentions
     * simplify / clean code
 find optimizations (impact of agg level?), why is interp so slow?
 use tqdm for tensor eval
@@ -10,3 +9,9 @@ still a lot of chunking overhead
 optimize geometry neighbours caching
 bpp lost because of coarse chunking?
 benchmark 1agg -> optim 1agg: remove rope + optimize agg
+
+optimization candidates
+    * bound the geometry/model caches for long-lived multi-shape processes
+    * reduce repeated interpolation mask indexing and stage gathers
+    * measure chunk scheduling overhead independently of GNN inference
+    * cap background rANS buffering when overlap is enabled without starving it

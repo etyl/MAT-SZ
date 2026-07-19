@@ -14,33 +14,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .bitstream import FLAG_CUBIC, FLAG_INTERP, FLAG_MOCK
+from .bitstream import FLAG_CUBIC, FLAG_INTERP
 from .levels import stage_plan
-
-
-class MockPredictor:
-    """Nearest-known-pixel fill + box smoothing. Deterministic, torch-free,
-    any tile size. Used by fast tests and the --mock CLI flag."""
-
-    stream_flag = FLAG_MOCK
-
-    def __init__(self, tile_size: int = 64):
-        self.tile_size = tile_size
-        self.checkpoint_hash = b"\0" * 16
-
-    def predict(self, recon: np.ndarray, known: np.ndarray,
-               pos: np.ndarray | None = None) -> np.ndarray:
-        from scipy.ndimage import distance_transform_edt, uniform_filter
-
-        if not known.any():
-            out = np.zeros_like(recon)
-            return out if pos is None else out[:, pos]
-        _, (ii, jj) = distance_transform_edt(~known, return_indices=True)
-        filled = recon[:, ii, jj]
-        smooth = uniform_filter(filled, size=(1, 3, 3), mode="nearest")
-        # keep exact values at known pixels, smooth only the filled region
-        out = np.where(known[None], filled, smooth).astype(np.float32)
-        return out if pos is None else out[:, pos]
 
 
 def default_interp_center(ndim: int) -> int:
@@ -82,7 +57,7 @@ def _interp_axis_at(W, coords, axis, s, order, shape):
 
 class InterpPredictor:
     """SZ3-style interpolation baseline dropped into DeepSZ's closed loop, so
-    MAT/GNN vs. classical interpolation is isolated to the predictor (identical
+    GNN vs. classical interpolation is isolated to the predictor (identical
     quantizer + Huffman/zstd stage, matching SZ3's own pipeline). Torch- and
     checkpoint-free, so streams decode without a model.
 
@@ -97,17 +72,15 @@ class InterpPredictor:
     predictor supplies its own ``stage_masks``; the decoder rebuilds the
     identical schedule from the header dims alone.
 
-    Tile-free: SZ3's interpolation has no fixed input size (unlike MAT), so the
-    codec runs it over the whole image as a single region — no padding, no
-    prediction seam.
+    SZ3's interpolation has no fixed input size, so the codec runs it over the
+    whole field as a single region without padding or prediction seams.
     """
 
-    tile_free = True  # codec compresses the whole image as one region
     tunable = True    # encoder sweeps (eb_ratio, center) and keeps the smallest
     fast_eb_ratio = 0.9  # single-encode (tune=fast) default; see codec.encode
 
-    def __init__(self, tile_size: int = 512, order: str = "cubic",
-                 levels: int = 4, anchor_stride: int = 16, anchor_block: int = 4,
+    def __init__(self, order: str = "cubic", levels: int = 4,
+                 anchor_stride: int = 16, anchor_block: int = 4,
                  center: int | None = None):
         if order not in ("linear", "cubic"):
             raise ValueError("order must be 'linear' or 'cubic'")
@@ -178,4 +151,3 @@ class InterpPredictor:
             out = _interp_axis_at(W, coords, a, s, self.order, shape)
         out = out.astype(np.float32)                              # (C, M)
         return out if pos is not None else out.reshape(recon.shape)
-

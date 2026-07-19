@@ -6,10 +6,11 @@ from deepsz.bitstream import (Header, pack_stage, read_stream, unpack_stage,
 
 
 def make_header(**kw):
-    base = dict(orig_h=100, orig_w=130, channels=3, src_dtype=0, eb=2.0,
-                levels=3, anchor_stride=8, anchor_block=4, tile_size=64,
-                radius=1 << 15, seed=1234, vmin=0.0, vmax=255.0,
-                ckpt_hash=bytes(range(16)), n_tiles_y=2, n_tiles_x=3, flags=1)
+    base = dict(channels=3, src_dtype=0, spatial=(100, 130), eb=2.0,
+                levels=3, anchor_stride=8, anchor_block=4,
+                radius=1 << 15, max_radius=64, agg_level=2,
+                vmin=0.0, vmax=255.0,
+                ckpt_hash=bytes(range(16)), flags=1)
     base.update(kw)
     return Header(**base)
 
@@ -22,30 +23,29 @@ def test_header_roundtrip():
 
 def test_stream_roundtrip():
     h = make_header()
-    payloads = [bytes([i]) * (i * 100 + 1) for i in range(6)]
-    stream = write_stream(h, payloads)
+    payload = b"payload" * 100
+    stream = write_stream(h, payload)
     h2, p2 = read_stream(stream)
-    h.spatial = (h.orig_h, h.orig_w)  # write_stream records the spatial shape
     assert h2 == h
-    assert p2 == payloads
+    assert p2 == payload
 
 
 def test_stream_roundtrip_nd():
-    h = make_header(spatial=(12, 20, 24, 28), n_tiles_y=1, n_tiles_x=1)
-    stream = write_stream(h, [b"x" * 33])
+    h = make_header(spatial=(12, 20, 24, 28))
+    stream = write_stream(h, b"x" * 33)
     h2, p2 = read_stream(stream)
     assert h2.spatial == (12, 20, 24, 28)
-    assert p2 == [b"x" * 33]
+    assert p2 == b"x" * 33
 
 
 def test_bad_magic():
     with pytest.raises(ValueError):
-        Header.unpack(b"NOTMATSZ" + b"\0" * 100)
+        Header.unpack(b"NOTDEEP!" + b"\0" * 100)
 
 
-def test_payload_count_check():
-    with pytest.raises(ValueError):
-        write_stream(make_header(), [b"only-one"])
+def test_empty_spatial_shape_rejected():
+    with pytest.raises(ValueError, match="spatial shape"):
+        make_header(spatial=()).pack()
 
 
 def test_stage_roundtrip():
