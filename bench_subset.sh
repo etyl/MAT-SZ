@@ -13,11 +13,11 @@
 
 # Benchmark the GNN codec on a fixed 64^4 (default) centred subset of a large
 # tensor, reporting PSNR / bpp / time / max RAM / mean GPU utilisation so an
-# optimisation can be judged before-vs-after. Every run appends a JSON record
-# to $JSON_OUT, so re-run this on two commits and diff the two lines.
+# optimisation can be judged before-vs-after. Every run prints its report to
+# the SLURM .out, so re-run this on two commits and diff the two reports.
 #
 #   sbatch bench_subset.sh                       # defaults below
-#   LABEL=baseline sbatch bench_subset.sh        # tag the JSON record
+#   LABEL=baseline sbatch bench_subset.sh        # tag the report header
 #   EDGE=32 EB=1e-3 sbatch bench_subset.sh       # override any knob via env
 
 module purge
@@ -41,7 +41,6 @@ CHUNK=${CHUNK:-32}
 CHUNK_BATCH=${CHUNK_BATCH:-1}
 TUNE=${TUNE:-fast}
 LABEL=${LABEL:-}
-JSON_OUT=${JSON_OUT:-bench_results.jsonl}
 
 # V100 supports Triton, so --compile pays off here (unlike the local Titan Xp).
 # Set COMPILE=0 to disable; add extra flags (e.g. --fp16) via EXTRA=... or "$@".
@@ -60,7 +59,6 @@ python scripts/bench_gnn_subset.py "$DATA" \
     --chunk-batch "$CHUNK_BATCH" \
     --tune "$TUNE" \
     --normalize \
-    --json-out "$JSON_OUT" \
     --label "$LABEL" \
     $COMPILE_FLAG \
     ${EXTRA:-} \

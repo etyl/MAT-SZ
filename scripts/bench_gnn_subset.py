@@ -13,15 +13,13 @@ the 32^4 local ``rti_normal.npy`` and on the full-size Jean Zay tensor.
         --gnn-checkpoint checkpoints/d64.pt --eb 1e-4 --normalize \
         --levels 5 --anchor-stride 32 --chunk-size 32 --agg-level 1
 
-Each run appends one JSON record (config + git commit + every metric) to
-``--json-out`` (default ``bench_results.jsonl``) so before/after optimisation
-runs accumulate in one file and can be diffed directly.
+Each run prints one report (config + git commit + every metric) to stdout;
+tag it with ``--label`` and re-run before/after an optimisation to compare.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import resource
 import subprocess
@@ -193,10 +191,8 @@ def main(argv=None):
     ap.add_argument("--device", default=None)
     ap.add_argument("--poll-interval", type=float, default=0.1,
                     help="GPU sampling period in seconds")
-    ap.add_argument("--json-out", default="bench_results.jsonl",
-                    help="append one JSON metrics record per run here")
     ap.add_argument("--label", default="",
-                    help="free-text tag stored in the JSON record")
+                    help="free-text tag echoed in the report header")
     args = ap.parse_args(argv)
 
     os.environ.setdefault("DEEPSZ_PROGRESS", "0")
@@ -263,42 +259,10 @@ def main(argv=None):
                      if is_cuda else None)
     gpu_stats = gpu.summary()
 
-    record = {
-        "label": args.label,
-        "commit": git_commit(),
-        "device": device,
-        "input": args.input,
-        "shape": list(sub.shape),
-        "n_voxels": int(sub.size),
-        "eb": eb,
-        "config": {
-            "levels": args.levels, "anchor_stride": args.anchor_stride,
-            "anchor_block": args.anchor_block, "agg_level": args.agg_level,
-            "chunk_size": args.chunk_size, "chunk_batch": args.chunk_batch,
-            "tune": args.tune, "eb_ratio": args.eb_ratio, "fp16": args.fp16,
-            "compile": args.compile, "overlap": args.overlap,
-            "normalize": args.normalize, "rel": args.rel,
-        },
-        "psnr_db": round(psnr, 3),
-        "max_err": max_err,
-        "bound_ok": bool(max_err <= eb),
-        "bpv": round(bpv, 5),
-        "ratio": round(ratio, 3),
-        "bytes": nbytes,
-        "t_compress_s": round(t_comp, 4),
-        "t_decompress_s": round(t_dec, 4),
-        "mvox_per_s_compress": round(mvox_s, 3),
-        "max_host_ram_mib": round(max_rss_mib, 1),
-        "gpu_peak_alloc_mib": (round(gpu_peak_alloc, 1)
-                               if gpu_peak_alloc is not None else None),
-        "gpu_peak_reserved_mib": (round(gpu_peak_resv, 1)
-                                  if gpu_peak_resv is not None else None),
-        **gpu_stats,
-    }
-
     # Human report.
     w = 24
-    print(f"\n=== GNN subset benchmark ({record['commit']}) ===")
+    tag = f" [{args.label}]" if args.label else ""
+    print(f"\n=== GNN subset benchmark ({git_commit()}){tag} ===")
     print(f"{'input':<{w}} {args.input} {tuple(sub.shape)} "
           f"({sub.size} voxels, {orig_bytes} B)")
     print(f"{'eb':<{w}} {eb:g}   device {device}")
@@ -325,11 +289,6 @@ def main(argv=None):
               f"peak used {gpu_stats['gpu_mem_peak_mib']} MiB)")
     else:
         print(f"{'GPU util':<{w}} (no NVML / nvidia-smi samples)")
-
-    if args.json_out:
-        with open(args.json_out, "a") as f:
-            f.write(json.dumps(record) + "\n")
-        print(f"\nappended metrics -> {args.json_out}")
 
     if max_err > eb:
         raise SystemExit(1)
