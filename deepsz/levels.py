@@ -101,6 +101,35 @@ def stage_masks(
     return [mask for mask, _, _ in stage_plan(shape, levels, anchor_stride, anchor_block)]
 
 
+def stage_strides(ndim: int, levels: int, anchor_stride: int) -> list[int]:
+    """Per-stage lattice stride, aligned with ``stage_plan`` order, computed in
+    closed form from ``(ndim, levels, anchor_stride)`` alone — no masks.
+
+    The stride sequence is a pure function of the schedule shape: stage 0 (the
+    anchors) has stride ``anchor_stride``; each dyadic level ``k`` contributes
+    ``2^ndim - 1`` sub-stages all at stride ``max(anchor_stride >> k, 1)``. It is
+    independent of the grid extent, so this reproduces ``[stride for _, stride,
+    _ in stage_plan(shape, ...)]`` for any ``shape`` of rank ``ndim`` without
+    materialising a single stage mask (the mask build is O(levels * n_points),
+    catastrophic on the large representative grids ``stage_ebs`` is handed in
+    high dimensions)."""
+    if ndim < 1:
+        raise ValueError("shape must have at least one axis")
+    if levels < 1:
+        raise ValueError("levels must be >= 1")
+    if anchor_stride < 2 or anchor_stride & (anchor_stride - 1):
+        raise ValueError("anchor_stride must be a power of two >= 2")
+    if (1 << levels) < anchor_stride:
+        raise ValueError(f"levels={levels} too small for anchor_stride="
+                         f"{anchor_stride}: need levels >= log2(anchor_stride) = "
+                         f"{anchor_stride.bit_length() - 1} to densify to stride 1")
+    per_level = (1 << ndim) - 1
+    strides = [anchor_stride]
+    for k in range(1, levels + 1):
+        strides += [max(anchor_stride >> k, 1)] * per_level
+    return strides
+
+
 def known_counts(
     shape: tuple[int, ...],
     levels: int,
@@ -168,7 +197,15 @@ def stage_ebs(
     propagates less into the finer levels interpolated from them (QoZ-style
     level-wise error budgeting). The finest level keeps the full ``eb``, so the
     global ``|x - recon| <= eb`` bound still holds unconditionally. ``eb_ratio``
-    1.0 -> flat ``eb`` everywhere (classic SZ)."""
-    plan = stage_plan(shape, levels, anchor_stride, anchor_block)
-    finest = min(stride for _, stride, _ in plan)
-    return [eb * eb_ratio ** np.log2(stride / finest) for _, stride, _ in plan]
+    1.0 -> flat ``eb`` everywhere (classic SZ).
+
+    Depends on ``shape`` only through its rank: the per-stage strides are
+    closed-form (see ``stage_strides``), so no stage masks are built. This keeps
+    the call cheap even on the large same-rank representative grids the chunked
+    codec evaluates it on (a 4-D ``(2*stride)^4`` grid is ~17M points — building
+    its masks cost seconds per compress)."""
+    strides = stage_strides(len(shape), levels, anchor_stride)
+    if not 1 <= anchor_block <= anchor_stride:
+        raise ValueError("anchor_block must be in [1, anchor_stride]")
+    finest = min(strides)
+    return [eb * eb_ratio ** np.log2(stride / finest) for stride in strides]
