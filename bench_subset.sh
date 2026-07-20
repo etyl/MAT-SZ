@@ -27,7 +27,7 @@ export PYTHONUNBUFFERED=1          # flush progress to the SLURM .out live
 export DEEPSZ_M_TILE=$((32**4))    # M-tiling off (chunk-batch 1 fits without it)
 
 # GNN checkpoint (same one eval_tensor.sh uses; override with CKPT=...).
-CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260716-190203-07b676/gnn_predictor.pt}
+CKPT=${CKPT:-./checkpoints/d64-2agg.pt}
 
 # Large source tensor; a centred EDGE^ndim hypercube is cropped out of it.
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
@@ -35,24 +35,17 @@ DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-
 EDGE=${EDGE:-64}                   # subset edge (capped per axis, floored to stride)
 EB=${EB:-0.0001}
 LEVELS=${LEVELS:-5}
-ANCHOR_STRIDE=${ANCHOR_STRIDE:-32}
-AGG=${AGG:-1}                      # neighbourhood aggregation level (1 or 2)
+AGG=${AGG:-2}                      # neighbourhood aggregation level (1 or 2)
 CHUNK=${CHUNK:-32}
 CHUNK_BATCH=${CHUNK_BATCH:-1}
 TUNE=${TUNE:-fast}
 LABEL=${LABEL:-}
-
-# V100 supports Triton, so --compile pays off here (unlike the local Titan Xp).
-# Set COMPILE=0 to disable; add extra flags (e.g. --fp16) via EXTRA=... or "$@".
-COMPILE_FLAG=""
-[ "${COMPILE:-1}" = "1" ] && COMPILE_FLAG="--compile"
 
 python scripts/bench_gnn_subset.py "$DATA" \
     --gnn-checkpoint "$CKPT" \
     --subset-edge "$EDGE" \
     --eb "$EB" \
     --levels "$LEVELS" \
-    --anchor-stride "$ANCHOR_STRIDE" \
     --anchor-block 1 \
     --agg-level "$AGG" \
     --chunk-size "$CHUNK" \
@@ -60,6 +53,7 @@ python scripts/bench_gnn_subset.py "$DATA" \
     --tune "$TUNE" \
     --normalize \
     --label "$LABEL" \
-    $COMPILE_FLAG \
+    --compile \
+    --fp16 \
     ${EXTRA:-} \
     "$@"
