@@ -195,10 +195,10 @@ class _StageGeom:
     tensors — so memory scales with the stage, not the image."""
 
     __slots__ = ("ip", "in_", "dp", "dn", "vp", "vn", "cos", "lognnz",
-                 "query_idx", "idx_np", "M", "ndim")
+                 "query_idx", "idx_np", "M", "ndim", "message_blocks")
 
     def __init__(self, pat, query_coords, shape, max_radius, torch, device,
-                 agg_level=None, query_only=False):
+                 agg_level=None, query_only=False, precompute_messages=True):
         ndim = len(shape)
         self.ndim = ndim
         P = pat.shape[0]
@@ -250,6 +250,9 @@ class _StageGeom:
             setattr(self, name, torch.stack(values, dim=0))
         self.cos = torch.stack(cos, dim=0)
         self.lognnz = torch.stack(lognnz, dim=0).unsqueeze(1)
+        self.message_blocks = (
+            _build_message_blocks(self, torch) if precompute_messages else None
+        )
 
 
 class _LegacyGeom:
@@ -257,7 +260,7 @@ class _LegacyGeom:
     schedule-aware `_StageGeom`, but keeps older trainer/eval callers working."""
 
     __slots__ = ("ip", "in_", "dp", "dn", "vp", "vn", "cos", "lognnz",
-                 "query_idx", "idx_np", "M", "ndim")
+                 "query_idx", "idx_np", "M", "ndim", "message_blocks")
 
     def __init__(self, known, max_radius, torch, device=None, query_idx=None,
                  agg_level=None):
@@ -295,6 +298,58 @@ class _LegacyGeom:
             setattr(self, name, torch.stack(values, dim=0))
         self.cos = torch.stack(cos, dim=0)
         self.lognnz = torch.stack(lognnz, dim=0).unsqueeze(1)
+        self.message_blocks = _build_message_blocks(self, torch)
+
+
+class _MessageBlock:
+    """Static selections for one tiled block of a geometry's message pass."""
+
+    __slots__ = (
+        "valid", "live_idx", "ip", "in_", "cos", "logdp", "logdn",
+        "side_idx", "side_positive", "n_live", "n_side", "L", "M",
+    )
+
+
+def _build_message_blocks(geom, torch):
+    """Precompute all geometry-only selections consumed by ``GNN.embed``.
+
+    In particular, CUDA ``nonzero`` and its data-dependent output size stay out
+    of the compiled/repeated model path.  Blocks mirror ``embed``'s query
+    tiling, so their flattened indices are already local to each tile.
+    """
+    blocks = []
+    for m0 in range(0, geom.M, _M_TILE):
+        m1 = min(m0 + _M_TILE, geom.M)
+        ip = geom.ip[:, m0:m1]
+        in_ = geom.in_[:, m0:m1]
+        dp = geom.dp[:, m0:m1]
+        dn = geom.dn[:, m0:m1]
+        vp = geom.vp[:, m0:m1]
+        vn = geom.vn[:, m0:m1]
+        L, M = vp.shape
+        valid = vp | vn
+        live_idx = valid.reshape(-1).nonzero(as_tuple=True)[0]
+        line_of = live_idx // M
+        vp_f = vp.reshape(-1)[live_idx]
+        vn_f = vn.reshape(-1)[live_idx]
+
+        block = _MessageBlock()
+        block.valid = valid
+        block.live_idx = live_idx
+        block.ip = ip.reshape(-1)[live_idx]
+        block.in_ = in_.reshape(-1)[live_idx]
+        block.cos = geom.cos[line_of]
+        lognnz = geom.lognnz[line_of, 0]
+        block.logdp = torch.log2(dp.reshape(-1)[live_idx]) + lognnz
+        block.logdn = torch.log2(dn.reshape(-1)[live_idx]) + lognnz
+        block.side_idx = (vp_f ^ vn_f).nonzero(as_tuple=True)[0]
+        block.side_positive = vp_f[block.side_idx]
+        block.n_live = int(live_idx.numel())
+        block.n_side = int(block.side_idx.numel())
+        block.L = L
+        block.M = M
+        blocks.append(block)
+    return blocks
 
 
 def _period_prefixes(shape, levels, stride, block):
@@ -557,14 +612,14 @@ def build_model(d: int = 32):
             self.mix = MixEmbed()
             self.coarse = CoarseProj()
 
-        def _line_messages(self, E, geom, msl=slice(None)):
-            """Per-line messages for a slice ``msl`` of this stage's M query
-            points, built from neighbour *embeddings* E (not raw values) so
+        def _line_messages(self, E, block):
+            """Per-line messages for one precomputed query ``block``, built
+            from neighbour *embeddings* E (not raw values) so
             trends/periodicity propagate hop by hop. Returns msgs (L, B, m, K, d)
             and valid (L, m) — the axis dim K is carried through Dir/BiDir as a
             batch dim, each axis reading its neighbours through the rotary phase.
-            geom already holds the +/- neighbour of each query point, so this
-            touches O(m) rows of the field, never the whole grid.
+            The block holds the geometry-only selections, so this touches O(m)
+            rows of the field and performs no data-dependent index discovery.
 
             Live-pair gather: a (line, point) pair with no valid neighbour on
             either side (``~vp & ~vn``) is masked out by line_pool anyway, yet the
@@ -575,31 +630,26 @@ def build_model(d: int = 32):
             (bidir) from one-sided (dir) so neither MLP runs on rows the other
             owns. line_pool already masks dead pairs, so the pooled result is
             bit-identical to the old dense dir + where(both, bidir) form."""
+            # Keep the private geometry call form used by diagnostics/tests for
+            # untiled stages; the hot path passes the block directly.
+            if hasattr(block, "message_blocks"):
+                if len(block.message_blocks) != 1:
+                    raise ValueError("direct _line_messages call requires one tile")
+                block = block.message_blocks[0]
             B = E.shape[0]
             K, d = E.shape[2], self.d
-            ip, in_ = geom.ip[:, msl], geom.in_[:, msl]     # (L, m)
-            dp, dn = geom.dp[:, msl], geom.dn[:, msl]
-            vp, vn = geom.vp[:, msl], geom.vn[:, msl]
-            L, m = vp.shape
-            valid = vp | vn                                 # (L, m)
-            live_idx = valid.reshape(-1).nonzero(as_tuple=True)[0]   # (Nl,)
-            if not live_idx.numel():                        # no neighbours anywhere
+            L, m, Nl = block.L, block.M, block.n_live
+            if not Nl:                                      # no neighbours anywhere
                 msg = E.new_zeros(B, L, m, K, d)
-                return (msg.permute(1, 0, 2, 3, 4).contiguous(), valid)
-            Nl = live_idx.numel()
-            line_of = live_idx // m                         # which direction each pair is on
-            vp_f = vp.reshape(-1)[live_idx]
-            vn_f = vn.reshape(-1)[live_idx]
-            ip_f = ip.reshape(-1)[live_idx]
-            in_f = in_.reshape(-1)[live_idx]
-            cos_f = geom.cos[line_of]                       # (Nl, K)
-            lognnz_f = geom.lognnz[line_of, 0]              # (Nl,)
-            # .to(E.dtype): geom distances are fp32; match model dtype so the
+                return (
+                    msg.permute(1, 0, 2, 3, 4).contiguous(), block.valid
+                )
+            # Distances are precomputed in fp32; match model dtype so the
             # dir/bidir MLPs get fp16 inputs under true-half.
-            lp = (torch.log2(dp.reshape(-1)[live_idx]) + lognnz_f).to(E.dtype)
-            lnn = (torch.log2(dn.reshape(-1)[live_idx]) + lognnz_f).to(E.dtype)
-            ep = self.rope.forward_flat(E[:, ip_f], cos_f, 1.0)   # (B, Nl, K, d)
-            en = self.rope.forward_flat(E[:, in_f], cos_f, -1.0)
+            lp = block.logdp.to(E.dtype)
+            lnn = block.logdn.to(E.dtype)
+            ep = self.rope.forward_flat(E[:, block.ip], block.cos, 1.0)
+            en = self.rope.forward_flat(E[:, block.in_], block.cos, -1.0)
             # bidir over every live pair — two-sided is ~93% of them, so running
             # it on the ~3.6% one-sided too (then overwriting) is far cheaper than
             # a second gather, and peak memory stays at the live-pair size (<=
@@ -608,10 +658,10 @@ def build_model(d: int = 32):
             lp_e = lp.view(1, Nl, 1, 1).expand(B, Nl, K, 1)
             lnn_e = lnn.view(1, Nl, 1, 1).expand(B, Nl, K, 1)
             msg_live = self.bidir(en, ep, lnn_e, lp_e)      # (B, Nl, K, d)
-            s_idx = (vp_f ^ vn_f).nonzero(as_tuple=True)[0]  # exactly one side
-            if s_idx.numel():
-                ns = s_idx.numel()
-                vpo = vp_f[s_idx].view(1, ns, 1, 1)         # only + valid?
+            if block.n_side:
+                s_idx = block.side_idx
+                ns = block.n_side
+                vpo = block.side_positive.view(1, ns, 1, 1)  # only + valid?
                 e_side = torch.where(vpo, ep[:, s_idx], en[:, s_idx])
                 one = e_side.new_ones(())
                 sign = torch.where(vpo, one, -one).expand(B, ns, K, 1)
@@ -620,12 +670,14 @@ def build_model(d: int = 32):
                 msg_live[:, s_idx] = self.dir(
                     e_side, sign, torch.where(vpo, lp_s, lnn_s)).to(msg_live.dtype)
             msg = E.new_zeros(B, L * m, K, d, dtype=msg_live.dtype)  # dead pairs stay 0
-            msg[:, live_idx] = msg_live
+            msg[:, block.live_idx] = msg_live
             msg = msg.reshape(B, L, m, K, d)
-            return (msg.permute(1, 0, 2, 3, 4).contiguous(), valid)
+            return (
+                msg.permute(1, 0, 2, 3, 4).contiguous(), block.valid
+            )
 
-        def _embed_block(self, E, geom, msl):
-            msgs, valid = self._line_messages(E, geom, msl)  # (L,B,m,K,d),(L,m)
+        def _embed_block(self, E, block):
+            msgs, valid = self._line_messages(E, block)  # (L,B,m,K,d),(L,m)
             L, B, m, K, _ = msgs.shape
             flat = msgs.reshape(L, B, m * K, self.d)
             vflat = valid.repeat_interleave(K, dim=1)        # (L, m*K)
@@ -645,11 +697,11 @@ def build_model(d: int = 32):
             this is bit-identical to embedding all M at once."""
             M = geom.M
             if M <= _M_TILE:
-                return self._embed_block(E, geom, slice(None))
+                return self._embed_block(E, geom.message_blocks[0])
             ctx = E.new_empty(E.shape[0], M, geom.ndim, self.d)
-            for m0 in range(0, M, _M_TILE):
-                msl = slice(m0, min(m0 + _M_TILE, M))
-                ctx[:, msl] = self._embed_block(E, geom, msl)
+            for bi, m0 in enumerate(range(0, M, _M_TILE)):
+                m1 = min(m0 + _M_TILE, M)
+                ctx[:, m0:m1] = self._embed_block(E, geom.message_blocks[bi])
             return ctx
 
         def finalize(self, ctx, self_val):
@@ -938,7 +990,8 @@ class _ChunkGeoms:
                 continue
             self.geoms.append(_StageGeom(pats[s], Q + stride, self.padded_shape,
                                          stride, torch, device, agg_level,
-                                         query_only=True))
+                                         query_only=True,
+                                         precompute_messages=False))
             self.coords.append(Q)
             if progress is not None:
                 progress(1)
@@ -1036,7 +1089,7 @@ class _CompactGeom:
 
     __slots__ = _StageGeom.__slots__
 
-    def __init__(self, base, remap):
+    def __init__(self, base, remap, torch):
         for name in ("dp", "dn", "cos", "lognnz", "idx_np", "M", "ndim"):
             setattr(self, name, getattr(base, name))
         self.ip = remap(base.ip)
@@ -1044,6 +1097,7 @@ class _CompactGeom:
         self.query_idx = remap(base.query_idx)
         self.vp = base.vp & (self.ip != 0)
         self.vn = base.vn & (self.in_ != 0)
+        self.message_blocks = _build_message_blocks(self, torch)
 
 
 class _CompactFrame:
@@ -1061,7 +1115,7 @@ class _CompactFrame:
         present = np.concatenate([cg.interior_flat, halo_present])
         self.n_compact = 1 + len(present)
         remap = _build_remap(present, cg.n_padded, torch, device)
-        self.geoms = [None if g is None else _CompactGeom(g, remap)
+        self.geoms = [None if g is None else _CompactGeom(g, remap, torch)
                       for g in cg.geoms]
         # halo cells are laid out right after interior, so their rows are a
         # contiguous slice — no remap needed to fill them.

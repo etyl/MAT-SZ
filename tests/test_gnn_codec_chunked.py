@@ -371,6 +371,41 @@ def test_halo_links_activate_when_neighbour_coded():
     assert halo_valid_links(np.array([True, False])) > 0
 
 
+def test_compact_geometry_precomputes_message_selections(monkeypatch):
+    """The repeated embed path must consume cached geometry metadata without
+    CUDA-style data-dependent selections or distance transforms."""
+    stride, levels = 4, 2
+    edges = shape = (8, 8)
+    grid = (1, 1)
+    cg = build_chunk_geoms(edges, levels, stride, 1, torch, None)
+    frame = _CompactFrame(
+        cg, (0, 0), shape, edges, grid, np.array([False]), torch, None
+    )
+    stage = cg.chain[1]
+    geom = frame.geoms[stage]
+    assert cg.geoms[stage].message_blocks is None
+
+    block = geom.message_blocks[0]
+    valid = geom.vp | geom.vn
+    live = valid.reshape(-1).nonzero(as_tuple=True)[0]
+    np.testing.assert_array_equal(block.valid.numpy(), valid.numpy())
+    np.testing.assert_array_equal(block.live_idx.numpy(), live.numpy())
+    np.testing.assert_array_equal(
+        block.ip.numpy(), geom.ip.reshape(-1)[live].numpy()
+    )
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("embed recomputed static geometry metadata")
+
+    monkeypatch.setattr(torch.Tensor, "nonzero", unexpected)
+    monkeypatch.setattr(torch, "log2", unexpected)
+    model = build_model(d=8).eval()
+    field = torch.zeros(1, frame.n_compact, geom.ndim, model.d)
+    with torch.no_grad():
+        ctx = model.embed(field, geom)
+    assert ctx.shape == (1, geom.M, geom.ndim, model.d)
+
+
 def test_out_of_tensor_halo_never_usable():
     """A corner chunk's halo that falls outside the tensor is never usable,
     regardless of coded flags."""
