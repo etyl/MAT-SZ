@@ -32,7 +32,7 @@ CKPT=${CKPT:-./checkpoints/d64-2agg.pt}
 # Large source tensor; a centred EDGE^ndim hypercube is cropped out of it.
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
 
-EDGE=${EDGE:-64}                   # subset edge (capped per axis, floored to stride)
+EDGE=${EDGE:-128}                   # subset edge (capped per axis, floored to stride)
 EB=${EB:-0.0001}
 LEVELS=${LEVELS:-5}
 AGG=${AGG:-2}                      # neighbourhood aggregation level (1 or 2)

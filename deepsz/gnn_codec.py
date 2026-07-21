@@ -50,14 +50,17 @@ def _log(msg):
 
 
 def _cuda_peak(predictor):
-    """Peak GPU bytes since the last call (resets the counter), or None on CPU."""
+    """Process GPU allocation peak, or ``None`` on CPU.
+
+    Do not reset the global PyTorch counter here: callers such as benchmark
+    harnesses reset it at the start of their measured region, and an internal
+    reset after every wave would silently corrupt their result.
+    """
     torch = getattr(predictor, "_torch", None)
     dev = getattr(predictor, "device", None)
     if torch is None or dev is None or dev.type != "cuda":
         return None
-    peak = torch.cuda.max_memory_allocated(dev)
-    torch.cuda.reset_peak_memory_stats(dev)
-    return peak
+    return torch.cuda.max_memory_allocated(dev)
 
 
 def _progress_bar(tag, n, unit="wave"):

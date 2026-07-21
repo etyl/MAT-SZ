@@ -210,6 +210,38 @@ def test_chunk_geometry_uses_query_only_search_and_reports_progress(monkeypatch)
     assert sum(cached_updates) == len(geom.geoms)
 
 
+def test_field_budget_estimate_warns_instead_of_aborting(v5_ckpt):
+    predictor = ChunkedGNNPredictor(
+        v5_ckpt, 0.0, 1.0, levels=LEVELS, anchor_stride=STRIDE)
+    predictor.shape = (8, 8)
+    predictor.edges = (8, 8)
+    predictor.d = 1 << 30  # force the static estimate beyond the CPU budget
+
+    with pytest.warns(RuntimeWarning, match="estimate is advisory"):
+        predictor._check_field_budget(ndim=2, channels=1)
+
+
+def test_cuda_budget_includes_reusable_allocator_cache():
+    class FakeCuda:
+        @staticmethod
+        def mem_get_info(device):
+            return 2_000, 10_000
+
+        @staticmethod
+        def memory_reserved(device):
+            return 5_000
+
+        @staticmethod
+        def memory_allocated(device):
+            return 1_000
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    # 2,000 driver-free + 4,000 reserved-but-unused, with the 80% margin.
+    assert gp._cuda_working_budget(FakeTorch(), "cuda") == 4_800
+
+
 def test_fp16_flag_roundtrips_and_persists(v5_ckpt):
     """fp16=True round-trips within the bound and the flag rides in the stream so
     decode replays the same float path. (autocast only bites on cuda; on cpu this

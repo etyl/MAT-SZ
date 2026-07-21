@@ -42,6 +42,7 @@ import hashlib
 import itertools
 import math
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +62,21 @@ CKPT_VERSION = 5
 # saturated) and fp16 halves the buffers. Set DEEPSZ_M_TILE=1024 only when
 # running big chunk_batch on tight VRAM. Stored in meta so decode replays it.
 _M_TILE = int(os.environ.get("DEEPSZ_M_TILE", 1 << 30))  # effectively no tiling
+
+
+def _cuda_working_budget(torch, device, fraction: float = 0.8) -> int:
+    """Bytes safely available for new tensors, including reusable torch cache.
+
+    CUDA's driver-level free count excludes blocks reserved by PyTorch even when
+    they are currently unallocated.  Those blocks can satisfy later allocations
+    (notably decode after encode), so omitting them produces false low-memory
+    estimates.
+    """
+    driver_free = int(torch.cuda.mem_get_info(device)[0])
+    reserved = int(torch.cuda.memory_reserved(device))
+    allocated = int(torch.cuda.memory_allocated(device))
+    reusable_cache = max(0, reserved - allocated)
+    return int(fraction * (driver_free + reusable_cache))
 
 
 def half_directions(ndim: int, agg_level: int | None = None) -> list[tuple[int, ...]]:
@@ -1158,12 +1174,13 @@ class ChunkedGNNPredictor:
         self._cg = None
 
     def _check_field_budget(self, ndim, channels, geometry_progress=None):
-        """Fail fast (with numbers + fix) before torch OOMs. Two terms scale with
-        chunk size: the compact field (1 dummy + interior + referenced halo band)
-        and, larger, one stage's message tensor (B, L, M, K, d) where L is the
-        half-direction count ((3^ndim-1)/2, so 40 in 4-D) and M the stage's query
-        count. The embed pass tiles M by ``DEEPSZ_M_TILE``, so its activation
-        estimate must use the tile size rather than the full stage."""
+        """Warn when the static estimate exceeds available memory.
+
+        The estimate is deliberately advisory: allocator reuse and the number
+        of simultaneously live intermediates can make it overly conservative,
+        so the caller is allowed to proceed and let the backend enforce the
+        real memory limit.
+        """
         torch = self._torch
         cshape = tuple(min(e, n) for e, n in zip(self.edges, self.shape))
         cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
@@ -1178,17 +1195,18 @@ class ChunkedGNNPredictor:
         act_bytes = 4 * channels * L * m * ndim * self.d * 4  # ~4 live copies
         need = field_bytes + act_bytes
         if self.device.type == "cuda":
-            budget = int(0.8 * torch.cuda.mem_get_info(self.device)[0])
+            budget = _cuda_working_budget(torch, self.device)
         else:                                # cpu: cap at 64 GiB, still catches it
             budget = 64 << 30
         if need > budget:
-            raise MemoryError(
+            warnings.warn(
                 f"chunked GNN needs up to {need/1e9:.0f} GB per chunk "
                 f"(field {field_bytes/1e9:.1f} + stage activation "
                 f"{act_bytes/1e9:.1f} GB for tile={m:,} of M={M:,} queries "
                 f"x L={L} lines, budget {budget/1e9:.1f} GB). Lower "
                 f"DEEPSZ_M_TILE, or reduce both --chunk-size and "
-                f"--anchor-stride (for example 16 and 16).")
+                f"--anchor-stride (for example 16 and 16). Continuing because "
+                f"this estimate is advisory.", RuntimeWarning, stacklevel=2)
 
     def chunk_slices(self, ci: int):
         cidx = np.unravel_index(ci, self.grid)
@@ -1265,7 +1283,7 @@ class ChunkedGNNPredictor:
                + 8 * len(half_directions(ndim, self.agg_level))
                * m * ndim * self.d) * 4
         if self.device.type == "cuda":
-            budget = int(0.8 * torch.cuda.mem_get_info(self.device)[0])
+            budget = _cuda_working_budget(torch, self.device)
         else:
             budget = 8 << 30                                   # cpu: modest cap
         return max(1, budget // max(per, 1))

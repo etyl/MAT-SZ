@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import resource
 import subprocess
 import sys
 import threading
@@ -77,6 +76,7 @@ class GpuSampler:
         self.interval = interval
         self.util: list[float] = []
         self.mem: list[float] = []
+        self.baseline_mem_mib: float | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sample = self._pick_backend()
@@ -125,6 +125,13 @@ class GpuSampler:
 
     def __enter__(self):
         if self._sample is not None:
+            try:
+                u, m = self._sample()
+                self.util.append(u)
+                self.mem.append(m)
+                self.baseline_mem_mib = m
+            except Exception:
+                pass
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
         return self
@@ -137,13 +144,67 @@ class GpuSampler:
     def summary(self) -> dict:
         if not self.util:
             return {"gpu_util_mean_pct": None, "gpu_util_peak_pct": None,
-                    "gpu_mem_peak_mib": None, "gpu_samples": 0}
+                    "gpu_mem_peak_mib": None, "gpu_mem_increase_mib": None,
+                    "gpu_samples": 0}
+        peak_mem = max(self.mem)
+        increase = (max(0.0, peak_mem - self.baseline_mem_mib)
+                    if self.baseline_mem_mib is not None else None)
         return {
             "gpu_util_mean_pct": round(sum(self.util) / len(self.util), 1),
             "gpu_util_peak_pct": round(max(self.util), 1),
-            "gpu_mem_peak_mib": round(max(self.mem), 1),
+            "gpu_mem_peak_mib": round(peak_mem, 1),
+            "gpu_mem_increase_mib": (round(increase, 1)
+                                     if increase is not None else None),
             "gpu_samples": len(self.util),
         }
+
+
+class HostMemorySampler:
+    """Measure this process's RSS only while the benchmark is running.
+
+    ``resource.ru_maxrss`` is a high-water mark for the process's entire
+    lifetime and cannot be reset before a benchmark.  Sampling the current RSS
+    gives both the peak during the measured region and the increase over the
+    region's initial footprint.
+    """
+
+    _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+    def __init__(self, interval: float = 0.02):
+        self.interval = interval
+        self.baseline_mib = 0.0
+        self.peak_mib = 0.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _rss_mib(self) -> float:
+        with open("/proc/self/statm", encoding="ascii") as statm:
+            resident_pages = int(statm.read().split()[1])
+        return resident_pages * self._PAGE_SIZE / (1024 * 1024)
+
+    def _sample(self) -> None:
+        self.peak_mib = max(self.peak_mib, self._rss_mib())
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval):
+            self._sample()
+
+    @property
+    def increase_mib(self) -> float:
+        return max(0.0, self.peak_mib - self.baseline_mib)
+
+    def __enter__(self):
+        self.baseline_mib = self._rss_mib()
+        self.peak_mib = self.baseline_mib
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._sample()
 
 
 def git_commit() -> str:
@@ -199,7 +260,8 @@ def main(argv=None):
 
     import torch
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    is_cuda = torch.device(device).type == "cuda"
+    torch_device = torch.device(device)
+    is_cuda = torch_device.type == "cuda"
 
     def sync():
         if is_cuda:
@@ -227,17 +289,24 @@ def main(argv=None):
         overlap=args.overlap, device=device)
 
     if is_cuda:
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(torch_device)
+        gpu_base_alloc = torch.cuda.memory_allocated(torch_device)
+        gpu_base_resv = torch.cuda.memory_reserved(torch_device)
+        torch.cuda.reset_peak_memory_stats(torch_device)
+    else:
+        gpu_base_alloc = gpu_base_resv = 0
 
-    with GpuSampler(interval=args.poll_interval) as gpu:
-        sync(); t0 = time.perf_counter()
-        stream = codec.compress(sub)
-        sync(); t_comp = time.perf_counter() - t0
+    with HostMemorySampler() as host_memory:
+        gpu_index = torch_device.index or 0
+        with GpuSampler(device_index=gpu_index,
+                        interval=args.poll_interval) as gpu:
+            sync(); t0 = time.perf_counter()
+            stream = codec.compress(sub)
+            sync(); t_comp = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        rec = codec.uncompress(stream).numpy().reshape(sub.shape)
-        sync(); t_dec = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            rec = codec.uncompress(stream).numpy().reshape(sub.shape)
+            sync(); t_dec = time.perf_counter() - t0
 
     # Quality / size.
     a = sub.astype(np.float64)
@@ -252,11 +321,16 @@ def main(argv=None):
     mvox_s = sub.size / t_comp / 1e6
 
     # Resources.
-    max_rss_mib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
-    gpu_peak_alloc = (torch.cuda.max_memory_allocated() / (1024 * 1024)
+    gpu_peak_alloc = (torch.cuda.max_memory_allocated(torch_device) / (1024 * 1024)
                       if is_cuda else None)
-    gpu_peak_resv = (torch.cuda.max_memory_reserved() / (1024 * 1024)
+    gpu_peak_resv = (torch.cuda.max_memory_reserved(torch_device) / (1024 * 1024)
                      if is_cuda else None)
+    gpu_increase_alloc = ((torch.cuda.max_memory_allocated(torch_device)
+                           - gpu_base_alloc) / (1024 * 1024)
+                          if is_cuda else None)
+    gpu_increase_resv = ((torch.cuda.max_memory_reserved(torch_device)
+                          - gpu_base_resv) / (1024 * 1024)
+                         if is_cuda else None)
     gpu_stats = gpu.summary()
 
     # Human report.
@@ -277,16 +351,19 @@ def main(argv=None):
           f"({nbytes} B)")
     print(f"{'compress':<{w}} {t_comp:8.3f} s   ({mvox_s:.2f} Mvox/s)")
     print(f"{'decompress':<{w}} {t_dec:8.3f} s")
-    print(f"{'max host RAM':<{w}} {max_rss_mib:8.1f} MiB")
+    print(f"{'peak host RAM':<{w}} {host_memory.peak_mib:8.1f} MiB  "
+          f"(+{host_memory.increase_mib:.1f} MiB during roundtrip)")
     if is_cuda:
         print(f"{'peak GPU alloc/resv':<{w}} {gpu_peak_alloc:8.1f} / "
-              f"{gpu_peak_resv:.1f} MiB")
+              f"{gpu_peak_resv:.1f} MiB  (+{gpu_increase_alloc:.1f} / "
+              f"+{gpu_increase_resv:.1f} MiB during roundtrip)")
     if gpu_stats["gpu_samples"]:
         print(f"{'mean/peak GPU util':<{w}} "
               f"{gpu_stats['gpu_util_mean_pct']:8.1f} / "
               f"{gpu_stats['gpu_util_peak_pct']:.1f} %  "
               f"({gpu_stats['gpu_samples']} samples @ {args.poll_interval}s, "
-              f"peak used {gpu_stats['gpu_mem_peak_mib']} MiB)")
+              f"device peak used {gpu_stats['gpu_mem_peak_mib']} MiB, "
+              f"+{gpu_stats['gpu_mem_increase_mib']} MiB)")
     else:
         print(f"{'GPU util':<{w}} (no NVML / nvidia-smi samples)")
 
