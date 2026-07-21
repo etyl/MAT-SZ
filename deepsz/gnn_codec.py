@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import struct
 import sys
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -372,6 +370,145 @@ def _gate_apply(pred_bi, scale_bi, ip, eb, gate_t, gate_sh):
     return p, sc
 
 
+# --- device twins of the inner-loop primitives ----------------------------
+# The chunked encode/decode inner loop runs entirely on the GPU: recon stays
+# resident on the device and quantize / dequantize / gate all execute in torch,
+# so the per-stage critical path never syncs to host. Only the rANS pack/unpack
+# (constriction, host-only) crosses over -- and it does not feed recon, so on
+# encode it is deferred off the critical path. Encoder and decoder call the
+# identical functions, so their reconstructions match bit for bit even where a
+# torch transcendental (exp2/log2) differs from numpy by a ULP; correctness is
+# anchored on enc/dec agreement, not on matching the old numpy stream.
+
+
+def _interp_axis_at_t(torch, W, coords, axis, s, shape):
+    """Device twin of ``_interp_axis_at`` (cubic). ``W`` (C, *S) float64;
+    ``coords`` a tuple of (M,) long tensors. Basic fp64 arithmetic + edge
+    clamping, so bit-identical to the numpy form (verified)."""
+    def gather(off):
+        ca = coords[axis] + off
+        valid = (ca >= 0) & (ca < shape[axis])
+        idx = list(coords)
+        idx[axis] = ca.clamp(0, shape[axis] - 1)
+        return W[(slice(None), *idx)], valid
+
+    Lm1, vm1 = gather(-s)
+    Lp1, vp1 = gather(+s)
+    pred = 0.5 * (Lm1 + Lp1)
+    Lm3, vm3 = gather(-3 * s)
+    Lp3, vp3 = gather(+3 * s)
+    cub = (-Lm3 + 9 * Lm1 + 9 * Lp1 - Lp3) / 16.0
+    pred = torch.where((vm3 & vp3).unsqueeze(0), cub, pred)
+    both = (vm1 & vp1).unsqueeze(0)
+    only_left = (vm1 & ~vp1).unsqueeze(0)
+    return torch.where(both, pred, torch.where(only_left, Lm1, Lp1))
+
+
+def _interp_stage_pred_t(torch, recon_t, sls, coords_t, stride, axes, center):
+    """Device twin of ``_interp_stage_pred``: chunk-local cubic-interp prediction
+    of a stage's points from causal recon, on the GPU. Bit-identical to numpy."""
+    W = recon_t[(slice(None), *sls)].double()
+    shape = tuple(W.shape[1:])
+    if center == 0 or len(axes) == 1:
+        ip = sum(_interp_axis_at_t(torch, W, coords_t, a, stride, shape)
+                 for a in axes) / len(axes)
+    else:
+        ax = axes[0] if center == 1 else axes[-1]
+        ip = _interp_axis_at_t(torch, W, coords_t, ax, stride, shape)
+    return ip.to(torch.float32)   # (C, n)
+
+
+def _laplace_bits_t(torch, absr, b, eb):
+    """Device twin of ``_laplace_bits`` (model cost, ranking only)."""
+    b = b.double().clamp(eb / SCALE_LO_DIV, eb * SCALE_HI_MULT)
+    k = torch.round(absr.double().abs() / (2 * eb))
+    p = torch.where(
+        k == 0,
+        -torch.expm1(-eb / b),
+        0.5 * torch.exp(-((2 * k - 1) * eb / b)) * -torch.expm1(-2 * eb / b),
+    )
+    return (-torch.log2(p)).clamp_max(32.0)
+
+
+def _gate_select_t(torch, r_g, r_i, b, eb):
+    """Device twin of ``_gate_select``: best (T, shift) for one chunk-stage as
+    device scalar int tensors, (0, 0) = off. Branch-free (a single argmin over
+    the (shift, T) cost grid) so it issues no host sync; its choice only ranks
+    settings and travels in the header, so it need not match numpy bit for bit."""
+    dev = b.device
+    GTf = torch.tensor(_GATE_T, dtype=torch.float64, device=dev)
+    GTi = GTf.to(torch.int64)
+    SHi = torch.tensor(_GATE_SHIFTS, dtype=torch.int64, device=dev)
+    nb = _GATE_T.size + 1
+    bucket = torch.bucketize(b.double(), eb * torch.exp2(GTf))
+    # one-hot bucket membership: per-bucket sums via a plain (deterministic)
+    # reduction, not bincount/scatter_add -- those use atomic float adds on CUDA
+    # and would make the gate choice, and thus the stream, non-deterministic.
+    onehot = (bucket.unsqueeze(-1) == torch.arange(nb, device=dev)).double()  # (n, nb)
+
+    def cum(r, bb):
+        w = _laplace_bits_t(torch, r, bb, eb).sum(0)          # (n,)
+        binc = (w.unsqueeze(-1) * onehot).sum(0)              # (nb,)
+        return torch.cumsum(binc, 0)
+
+    base = cum(r_g, b)
+    tot = base[-1]
+    rows = [tot - base[:-1] + cum(r_i, b * 2.0 ** -sh)[:-1] for sh in _GATE_SHIFTS]
+    costs = torch.stack(rows)                          # (n_shift, nb-1)
+    mv, fi = costs.reshape(-1).min(0)
+    fired = mv < tot
+    ncol = nb - 1
+    z = torch.zeros((), dtype=torch.int64, device=dev)
+    gate_t = torch.where(fired, GTi[fi % ncol], z)
+    gate_sh = torch.where(fired, SHi[fi // ncol], z)
+    return gate_t, gate_sh
+
+
+def _gate_apply_t(torch, pred_bi, scale_bi, ip, eb, gate_t, gate_sh):
+    """Device twin of ``_gate_apply``, called unconditionally on both sides: a
+    ``gate_t`` of 0 is a no-op (mirrors numpy's ``if gate_t`` skip), so encoder
+    and decoder stay symmetric without a host-sync branch. (pred, coded scale)."""
+    active = gate_t > 0
+    m = active & (scale_bi < eb * torch.exp2(gate_t.double()))
+    p = torch.where(m.unsqueeze(0), ip, pred_bi.unsqueeze(0))
+    sc = torch.where(m, scale_bi * torch.exp2(-gate_sh.double()).to(scale_bi.dtype),
+                     scale_bi)
+    return p.to(torch.float32), sc.to(torch.float32)
+
+
+def _quantize_t(torch, x, pred, eb, radius, round_output):
+    """Device twin of ``quantize``+``dequantize`` for one chunk-stage. Returns
+    (codes int64, recon float32 with outliers substituted, outliers float32 in
+    scan order). ``recon`` is exactly the numpy encoder's committed
+    reconstruction and ``codes`` are bit-identical to the numpy quantizer
+    (verified), so the host decoder reproduces this recon exactly."""
+    x = x.reshape(-1).to(torch.float32)
+    pred = pred.reshape(-1).to(torch.float32)
+    w = 2.0 * eb
+    q = torch.round((x.double() - pred.double()) / w).to(torch.int64)
+    in_range = q.abs() < radius
+    z = torch.zeros_like(q)
+    codes = torch.where(in_range, q + radius, z)
+    recon = (pred.double() + w * (codes - radius).double()).to(torch.float32)
+    recon_chk = torch.round(recon) if round_output else recon
+    ok = in_range & ((x - recon_chk).abs() <= float(np.float32(eb)))
+    codes = torch.where(ok, codes, z)
+    is_out = codes == 0
+    # reconstruct from the final codes (== dequantize), outliers exact
+    recon = (pred.double() + w * (codes - radius).double()).to(torch.float32)
+    recon = torch.where(is_out, x, recon)
+    return codes, recon, x[is_out]
+
+
+def _dequantize_t(torch, pred, codes, outliers, eb, radius):
+    """Device twin of ``dequantize``: reconstruct float32 from codes + exact
+    outliers, all on the GPU. Matches ``_quantize_t``'s recon bit for bit."""
+    pred = pred.reshape(-1).to(torch.float32)
+    recon = (pred.double() + (2.0 * eb) * (codes - radius).double()).to(torch.float32)
+    is_out = codes == 0
+    return recon.masked_scatter(is_out, outliers)
+
+
 def _compress_chunked(
     values: np.ndarray,
     ebs: list[float],
@@ -388,17 +525,17 @@ def _compress_chunked(
     together in the model's B dim. Stream order is wave -> sub-batch -> stage ->
     chunk, mirrored bitwise by the decoder. Peak memory is O(batch * chunk).
 
-    ``overlap``: run the per-stage rANS packing on a background thread. Only the
-    quantize+dequantize (which writes recon that the next forward reads) stays on
-    the critical path; pack_stage does not feed back, so it can in principle hide
-    behind the next stage's GPU forward. Output bytes are identical -- each pack
-    writes into its reserved slot, flattened in order at the end.
-
-    Caveat (measured): constriction's rANS holds the GIL, so it does not actually
-    overlap the main thread's Python-driven launch loop on an eager/latency-bound
-    GPU -- it comes out ~neutral here. It is likeliest to pay off where the GPU
-    forward is fused/long (``--compile`` on Volta+) so the main thread sits in
-    GIL-releasing CUDA syncs the worker can drain into. Opt-in for that reason."""
+    Device-resident inner loop: after the (host) anchor pass, the reconstruction
+    lives on the GPU and every per-stage step -- forward, pred/scale, cubic-interp
+    gate, quantize/dequantize, recon scatter -- runs in torch, so the critical
+    path (recon feeding the next forward) never syncs to host. The only host-side
+    work is the rANS pack, which does not feed recon; it is deferred to the end of
+    each wave (codes streamed off the GPU during the wave), keeping it off the
+    per-stage path. ``overlap`` is accepted for signature compatibility and no
+    longer does anything -- a background packer cannot help (constriction's rANS
+    holds the GIL), so packing is batched per wave instead."""
+    torch = predictor._torch
+    dev = predictor.device
     c = values.shape[0]
     shape = values.shape[1:]
     stride, block = predictor.anchor_stride, predictor.anchor_block
@@ -422,6 +559,8 @@ def _compress_chunked(
     )
     predictor.anchor_coarse(recon, progress=coarse_bar.update)
     coarse_bar.close()
+    # hand recon to the GPU for the wave loop; it never returns to host on encode
+    recon_t = torch.from_numpy(recon).to(dev)
     B_cap = predictor.max_batch(tuple(min(e, n) for e, n in zip(edges, shape)))
     if batch_cap is not None:  # user cap (never above safe)
         B_cap = max(1, min(B_cap, int(batch_cap)))
@@ -432,120 +571,113 @@ def _compress_chunked(
         f"encode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
         f"{n_sub} model-waves"
     )
-    # Optional background rANS: pack_stage runs on a worker while the main thread
-    # drives the next GPU forward. Each emit reserves an ordered slot the worker
-    # fills, so the joined byte stream is identical to the synchronous path.
-    task_q: queue.Queue | None = None
-    worker: threading.Thread | None = None
-    worker_err: list[BaseException] = []
-    if overlap:
-        # Unbounded on purpose: a bounded queue back-pressures the main thread on
-        # put() whenever the worker can't drain, and constriction's rANS holds
-        # the GIL, so the worker *is* starved during the main thread's launch
-        # loop -- a small cap turns neutral into a large regression (measured
-        # -24% at cap 64). Trades RAM (buffered stage codes) for that safety.
-        task_q = queue.Queue()
-
-        def _rans_worker():
-            while True:
-                item = task_q.get()
-                try:
-                    if item is None:
-                        return
-                    slot, cd, ol, lv, tb = item
-                    slot[0] = pack_stage(cd, ol, rans_levels=lv, rans_tables=tb)
-                except BaseException as exc:  # surface to main
-                    worker_err.append(exc)
-                    return
-                finally:
-                    task_q.task_done()
-
-        worker = threading.Thread(target=_rans_worker, daemon=True)
-        worker.start()
-
-    def emit(codes, outliers, levels, tables):
-        if overlap:
-            if worker_err:
-                raise worker_err[0]
-            slot: list = [None]
-            parts.append(slot)
-            task_q.put((slot, codes, outliers, levels, tables))
-        else:
-            parts.append(
-                pack_stage(codes, outliers, rans_levels=levels, rans_tables=tables)
-            )
-
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
-    mask_cache: dict = {}  # cshape -> (stage masks, counts, stage plan)
-    gates: list[int] | None = [] if gate else None
+    mask_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
+    gates_t: list = [] if gate else None   # per stage-chunk gate byte, device scalars
     bar = _progress_bar("encode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i : i + B_cap]
             cshape = tuple(sl.stop - sl.start for sl in predictor.chunk_slices(ids[0]))
             if cshape not in mask_cache:
-                plan = stage_plan(cshape, predictor.levels, stride, block)
-                mask_cache[cshape] = (
-                    [m for m, _, _ in plan],
-                    [int(m.sum()) for m, _, _ in plan],
-                    plan,
+                mask_cache[cshape] = _chunk_device_plan(
+                    torch, dev, cshape, predictor.levels, stride, block
                 )
-            cmasks, counts, plan = mask_cache[cshape]
-            predictor.start_wave(ids, recon)
-            for s in range(1, len(cmasks)):
-                pos = cmasks[s]
+            counts, pos_dev, interp_dev, center = mask_cache[cshape]
+            # chunk value blocks for this sub-batch, uploaded once (not per stage)
+            vblocks = [
+                torch.from_numpy(
+                    np.ascontiguousarray(values[(slice(None), *predictor.chunk_slices(ci))])
+                ).to(dev)
+                for ci in ids
+            ]
+            predictor.start_wave(ids, recon_t)
+            wave_pending: list = []   # (codes, outliers, sc, tables, eb) or None marker
+            for s in range(1, len(counts)):
                 n = counts[s]
                 tables = stage_tables[s]
                 if n == 0:
-                    for _ in ids:
-                        emit(
-                            np.zeros(0, np.uint32),
-                            np.zeros(0, np.float32),
-                            np.zeros(0, np.uint8),
-                            tables,
-                        )
+                    wave_pending.extend([(None, tables)] * len(ids))
                     continue
-                pred, scale = predictor.predict_wave_stage(s, recon, ebs[s])
-                for bi, ci in enumerate(ids):
-                    sls = predictor.chunk_slices(ci)
-                    cvals = values[(slice(None), *sls)][:, pos]
+                pos = pos_dev[s]
+                pred, scale = predictor.predict_wave_stage(s, recon_t, ebs[s])
+                for bi in range(len(ids)):
+                    sls = predictor.chunk_slices(ids[bi])
+                    cvals = vblocks[bi][(slice(None), pos)]      # (C, n)
                     p = pred[bi][None, :]
                     sc = scale[bi]
                     if gate:
-                        ip = _interp_stage_pred(recon, sls, plan[s])
-                        gate_t, gate_sh = _gate_select(
-                            np.abs(cvals - p), np.abs(cvals - ip), sc, ebs[s]
+                        coords_t, st_i, ax_i = interp_dev[s]
+                        ip = _interp_stage_pred_t(
+                            torch, recon_t, sls, coords_t, st_i, ax_i, center
                         )
-                        gates.append(gate_t << 4 | gate_sh)
-                        if gate_t:
-                            p, sc = _gate_apply(
-                                pred[bi], sc, ip, ebs[s], gate_t, gate_sh
-                            )
-                    codes, outliers = quantize(
-                        cvals, p, ebs[s], radius, round_output=round_output
+                        gt, gs = _gate_select_t(
+                            torch, (cvals - p).abs(), (cvals - ip).abs(), sc, ebs[s]
+                        )
+                        gates_t.append(gt * 16 + gs)
+                        p, sc = _gate_apply_t(
+                            torch, pred[bi], sc, ip, ebs[s], gt, gs
+                        )
+                    codes, recon_stage, outliers = _quantize_t(
+                        torch, cvals, p, ebs[s], radius, round_output
                     )
-                    recon[(slice(None), *sls)][:, pos] = dequantize(
-                        p, codes, outliers, ebs[s], radius
-                    ).reshape(c, n)
-                    emit(
-                        codes,
-                        outliers,
-                        scale_to_level(sc[None, :], ebs[s]).reshape(-1),
+                    view = recon_t[(slice(None), *sls)]
+                    view[:, pos] = recon_stage.reshape(view.shape[0], -1)
+                    wave_pending.append((
+                        codes.to("cpu", non_blocking=True),
+                        outliers.to("cpu", non_blocking=True),
+                        sc.to("cpu", non_blocking=True),
                         tables,
-                    )
-            predictor.finish_wave(recon)
+                        ebs[s],
+                    ))
+            predictor.finish_wave(recon_t)
+            # deferred rANS: the codes streamed off the GPU during the wave; sync
+            # once, then pack in stream order (host-only, off the recon path).
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            for item in wave_pending:
+                if len(item) == 2:        # empty stage
+                    parts.append(pack_stage(
+                        np.zeros(0, np.uint32), np.zeros(0, np.float32),
+                        rans_levels=np.zeros(0, np.uint8), rans_tables=item[1]))
+                    continue
+                codes_c, out_c, sc_c, tables, eb_s = item
+                levels = scale_to_level(
+                    sc_c.numpy()[None, :], eb_s).reshape(-1)
+                parts.append(pack_stage(
+                    codes_c.numpy().astype(np.uint32),
+                    out_c.numpy().astype(np.float32),
+                    rans_levels=levels, rans_tables=tables))
             peak = _cuda_peak(predictor)
             if peak:
                 bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
             bar.update(1)
     bar.close()
-    if overlap:
-        task_q.put(None)
-        worker.join()
-        if worker_err:
-            raise worker_err[0]
-        parts = [p[0] if isinstance(p, list) else p for p in parts]
+    gates = None
+    if gate:
+        gates = [int(x) for x in torch.stack(gates_t).cpu().tolist()] if gates_t \
+            else []
     return b"".join(parts), gates
+
+
+def _chunk_device_plan(torch, dev, cshape, levels, stride, block):
+    """Per-chunk-shape device schedule for the wave inner loop: point counts, the
+    per-stage boolean position masks (for cvals gather + recon scatter), and the
+    per-stage cubic-interp coords/(stride, axes) for the gate. Cached per cshape,
+    since every chunk of a given shape shares this geometry."""
+    plan = stage_plan(cshape, levels, stride, block)
+    counts = [int(m.sum()) for m, _, _ in plan]
+    pos_dev = [torch.from_numpy(np.ascontiguousarray(m)).to(dev) for m, _, _ in plan]
+    interp_dev: list = []
+    for m, st, ax in plan:
+        if ax and int(m.sum()):
+            coords = tuple(torch.from_numpy(np.ascontiguousarray(cc)).to(dev)
+                           for cc in np.nonzero(m))
+            interp_dev.append((coords, st, ax))
+        else:
+            interp_dev.append(None)
+    center = default_interp_center(len(cshape))
+    return counts, pos_dev, interp_dev, center
 
 
 def _decompress_chunked(
@@ -577,6 +709,11 @@ def _decompress_chunked(
     )
     predictor.anchor_coarse(recon, progress=coarse_bar.update)
     coarse_bar.close()
+    torch = predictor._torch
+    dev = predictor.device
+    recon_t = torch.from_numpy(recon).to(dev)   # device-resident, same as encode
+    gates_t = None if gates is None else torch.tensor(
+        gates, dtype=torch.int64, device=dev)
     B_cap = max(1, int(batch))
     waves = _chunk_waves(predictor.grid)
     n_sub = sum(-(-len(g) // B_cap) for g in waves)
@@ -585,7 +722,7 @@ def _decompress_chunked(
         f"{n_sub} model-waves"
     )
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
-    mask_cache: dict = {}  # cshape -> (stage masks, counts, stage plan)
+    mask_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
     gi = 0
     bar = _progress_bar("decode", n_sub)
     for group in waves:
@@ -593,16 +730,12 @@ def _decompress_chunked(
             ids = group[i : i + B_cap]
             cshape = tuple(sl.stop - sl.start for sl in predictor.chunk_slices(ids[0]))
             if cshape not in mask_cache:
-                plan = stage_plan(cshape, predictor.levels, stride, block)
-                mask_cache[cshape] = (
-                    [m for m, _, _ in plan],
-                    [int(m.sum()) for m, _, _ in plan],
-                    plan,
+                mask_cache[cshape] = _chunk_device_plan(
+                    torch, dev, cshape, predictor.levels, stride, block
                 )
-            cmasks, counts, plan = mask_cache[cshape]
-            predictor.start_wave(ids, recon)
-            for s in range(1, len(cmasks)):
-                pos = cmasks[s]
+            counts, pos_dev, interp_dev, center = mask_cache[cshape]
+            predictor.start_wave(ids, recon_t)
+            for s in range(1, len(counts)):
                 n = counts[s]
                 tables = stage_tables[s]
                 if n == 0:
@@ -614,28 +747,33 @@ def _decompress_chunked(
                             rans_tables=tables,
                         )
                     continue
-                pred, scale = predictor.predict_wave_stage(s, recon, ebs[s])
-                for bi, ci in enumerate(ids):
-                    sls = predictor.chunk_slices(ci)
+                pos = pos_dev[s]
+                pred, scale = predictor.predict_wave_stage(s, recon_t, ebs[s])
+                for bi in range(len(ids)):
+                    sls = predictor.chunk_slices(ids[bi])
                     p = pred[bi][None, :]
                     sc = scale[bi]
-                    if gates is not None:
-                        g = gates[gi]
+                    if gates_t is not None:
+                        g = gates_t[gi]
                         gi += 1
-                        gate_t, gate_sh = g >> 4, g & 15
-                        if gate_t:
-                            ip = _interp_stage_pred(recon, sls, plan[s])
-                            p, sc = _gate_apply(
-                                pred[bi], sc, ip, ebs[s], gate_t, gate_sh
-                            )
-                    levels64 = scale_to_level(sc[None, :], ebs[s]).reshape(-1)
+                        coords_t, st_i, ax_i = interp_dev[s]
+                        ip = _interp_stage_pred_t(
+                            torch, recon_t, sls, coords_t, st_i, ax_i, center
+                        )
+                        p, sc = _gate_apply_t(
+                            torch, pred[bi], sc, ip, ebs[s], g >> 4, g & 15
+                        )
+                    levels64 = scale_to_level(sc.cpu().numpy()[None, :], ebs[s]).reshape(-1)
                     codes, outliers, off = unpack_stage(
                         payload, off, rans_levels=levels64, rans_tables=tables
                     )
-                    recon[(slice(None), *sls)][:, pos] = dequantize(
-                        p, codes, outliers, ebs[s], radius
-                    ).reshape(c, n)
-            predictor.finish_wave(recon)
+                    recon_stage = _dequantize_t(
+                        torch, p,
+                        torch.from_numpy(codes.astype(np.int64)).to(dev),
+                        torch.from_numpy(outliers).to(dev), ebs[s], radius)
+                    view = recon_t[(slice(None), *sls)]
+                    view[:, pos] = recon_stage.reshape(view.shape[0], -1)
+            predictor.finish_wave(recon_t)
             peak = _cuda_peak(predictor)
             if peak:
                 bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
@@ -645,7 +783,7 @@ def _decompress_chunked(
         raise ValueError("trailing bytes in DeepSZ GNN payload")
     if gates is not None and gi != len(gates):
         raise ValueError("gate list length does not match the stream")
-    return recon[0]
+    return recon_t[0].cpu().numpy()
 
 
 class GNNCompressorCodec:
@@ -726,9 +864,10 @@ class GNNCompressorCodec:
         # ops that aren't in the GEMMs). Stored in meta so decode uses the same
         # compiled float path. First encode pays a one-off compilation cost.
         self.compile = bool(compile)
-        # overlap: run per-stage rANS packing on a background thread so it hides
-        # behind the next stage's GPU forward. Encode-only; the output bytes are
-        # identical, so nothing about the stream or decode changes.
+        # overlap: retired no-op, kept for API/CLI compatibility. The chunked
+        # encode inner loop is now device-resident and the rANS pack is deferred
+        # per wave (see _compress_chunked), so a background packer -- which the
+        # GIL kept from ever overlapping the launch loop anyway -- buys nothing.
         self.overlap = bool(overlap)
         # gate: scale-gated interp fallback (chunked path only). The encoder
         # sweeps (T, shift) per chunk-stage against the true residuals and

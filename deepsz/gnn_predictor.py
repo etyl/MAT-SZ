@@ -1255,6 +1255,12 @@ class ChunkedGNNPredictor:
         v = (np.clip(vals, self.vmin, self.vmax) - self.vmin) / self.span
         return self._torch.from_numpy(v.astype(np.float32)).to(self.device)
 
+    def _norm_t(self, vals_t):
+        """Device-tensor twin of ``_norm``: normalize recon values already on the
+        GPU, so the wave inner loop never round-trips recon through host memory.
+        Both encoder and decoder call this, so the normalization is identical."""
+        return (vals_t.clamp(self.vmin, self.vmax).float() - self.vmin) / self.span
+
     def anchor_coarse(self, recon: np.ndarray, progress=None):
         """Level-0 coarse embeddings for every chunk, right after the global
         anchor pass — so every chunk has anchor context on all sides before any
@@ -1326,10 +1332,14 @@ class ChunkedGNNPredictor:
             budget = 8 << 30                                   # cpu: modest cap
         return max(1, budget // max(per, 1))
 
-    def start_wave(self, chunk_ids, recon: np.ndarray):
+    def start_wave(self, chunk_ids, recon):
         """Begin a batch of mutually-independent, identical-geometry chunks. One
         representative frame drives the shared stage geometry; the halo/interior
-        field values are gathered per chunk into the model's B dim."""
+        field values are gathered per chunk into the model's B dim.
+
+        ``recon`` is a device float32 tensor (C, *S): the wave inner loop keeps
+        the reconstruction resident on the GPU so no per-stage host round-trip is
+        needed. Encoder and decoder drive this path identically."""
         torch = self._torch
         ndim = len(self.shape)
         B = len(chunk_ids)
@@ -1346,12 +1356,14 @@ class ChunkedGNNPredictor:
         self._wave_fill_halo(E, frame, origins, recon)
         # per-chunk global flat indices per stage, for finalize reads from recon.
         # ravel(c + o) = c @ strides + o @ strides for in-bounds coords, so one
-        # dot per stage replaces the (B, M, ndim) ravel_multi_index.
+        # dot per stage replaces the (B, M, ndim) ravel_multi_index. Kept as device
+        # long tensors so the per-stage recon gather stays on the GPU.
         strides = np.cumprod((1,) + self.shape[:0:-1])[::-1].astype(np.int64)
         obase = origins @ strides                              # (B,)
-        self._wave_gidx = [None if c is None else
-                           (c @ strides)[None, :] + obase[:, None]   # (B, M)
-                           for c in cg.coords]
+        self._wave_gidx = [
+            None if c is None else
+            torch.from_numpy((c @ strides)[None, :] + obase[:, None]).to(self.device)
+            for c in cg.coords]                                # (B, M) long
         self._cg = cg
         self._wave_ids = list(chunk_ids)
         self._E = E
@@ -1369,7 +1381,7 @@ class ChunkedGNNPredictor:
         rep_gc = np.stack(np.unravel_index(frame.h_gflat, self.shape), 1)
         band = rep_gc - origins[0]                             # (H, ndim)
         h_lv = torch.from_numpy(frame.h_lv.astype(np.int64)).to(self.device)
-        flat = recon.reshape(-1)                               # C == 1
+        flat = recon.reshape(-1)                               # C == 1, device
         vals_all, cvec_all = [], []
         for o in origins:
             gc = band + o
@@ -1377,7 +1389,8 @@ class ChunkedGNNPredictor:
                                          self.shape)
             ids = np.ravel_multi_index(
                 [gc[:, k] // self.edges[k] for k in range(ndim)], self.grid)
-            vals_all.append(self._norm(flat[gflat][None, :]))         # (1, H)
+            gflat_t = torch.from_numpy(gflat).to(self.device)
+            vals_all.append(self._norm_t(flat[gflat_t])[None, :])     # (1, H)
             ids_t = torch.from_numpy(ids).to(self.device)
             cvec_all.append(self.coarse[0, ids_t, h_lv])              # (H, K, d)
         with torch.no_grad(), self._amp():
@@ -1385,9 +1398,15 @@ class ChunkedGNNPredictor:
                 self.model, torch.stack(cvec_all, 0), torch.cat(vals_all, 0)
             ).to(E.dtype)
 
-    def predict_wave_stage(self, s: int, recon: np.ndarray, eb: float):
+    def predict_wave_stage(self, s: int, recon, eb: float):
         """Batched `predict_stage`: returns (pred, scale) of shape (B, M) for the
-        wave's B chunks, ordered like ``np.nonzero`` of the local stage mask."""
+        wave's B chunks, ordered like ``np.nonzero`` of the local stage mask.
+
+        ``recon`` is a device tensor and the returned (pred, scale) are device
+        float32 tensors -- the codec quantizes and gates on the GPU, so nothing
+        crosses to host on the per-stage critical path. Encoder and decoder run
+        this identical arithmetic, so their reconstructions stay bit-consistent
+        even though ``exp2`` here differs from numpy by a ULP."""
         torch = self._torch
         cg = self._cg
         j = self._pos + 1
@@ -1396,21 +1415,18 @@ class ChunkedGNNPredictor:
         prev = cg.chain[j - 1]
         gp, gh = self._geoms[prev], self._geoms[s]
         fvals = None if gp is None else \
-            self._norm(recon.reshape(-1)[self._wave_gidx[prev]])   # (B, M)
+            self._norm_t(recon.reshape(-1)[self._wave_gidx[prev]])   # (B, M)
         with torch.no_grad(), self._amp():
             (values, log_b), self._E, self._ctx = stage_forward(
                 self.model, self._E, gp, gh, fvals, torch,
                 finalize_ctx=self._ctx, eb=float(eb) / self.span)
         self._pos = j
-        # One D2H for both heads: two separate .cpu() are two blocking syncs per
-        # stage, and this stage-loop is the wall bottleneck (GPU ~30% utilized).
-        vals_np, logb_np = torch.stack((values, log_b)).cpu().numpy()
-        pred = vals_np * self.span + self.vmin                     # (B, M)
-        scale = np.exp2(logb_np) * self.span
-        return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
-                scale.astype(np.float32))
+        pred = (values.float() * self.span + self.vmin).clamp(
+            self.vmin, self.vmax)                                  # (B, M) f32
+        scale = torch.exp2(log_b.float()) * self.span
+        return pred, scale
 
-    def finish_wave(self, recon: np.ndarray):
+    def finish_wave(self, recon):
         torch = self._torch
         cg = self._cg
         if self._pos != len(cg.chain) - 1:
@@ -1420,7 +1436,7 @@ class ChunkedGNNPredictor:
         E = self._E
         with torch.no_grad(), self._amp():
             if g is not None:
-                fvals = self._norm(recon.reshape(-1)[self._wave_gidx[last]])
+                fvals = self._norm_t(recon.reshape(-1)[self._wave_gidx[last]])
                 ctx = self._ctx if self._ctx is not None else \
                     self.model.embed(E, g)
                 fin = self.model.finalize(ctx, fvals).to(E.dtype)  # fp16->E dtype
