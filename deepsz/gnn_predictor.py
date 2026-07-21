@@ -409,6 +409,20 @@ def build_model(d: int = 32):
                                e1 * sn + e2 * cs), dim=-1)
             return out.reshape(B, L, M, K, d)
 
+        def forward_flat(self, e, cos, sign):
+            # Flat pair layout for the live-pair message pass: e (B, N, K, d),
+            # cos (N, K) — one rotation phase per gathered (line, point) pair.
+            # Same rotation as ``forward``; only the leading dims are collapsed.
+            cos = cos.to(e.dtype)
+            theta = (sign * cos)[..., None] * self.freq   # (N, K, d/2)
+            cs, sn = torch.cos(theta), torch.sin(theta)
+            B, N, K, _ = e.shape
+            pairs = e.reshape(B, N, K, d // 2, 2)
+            e1, e2 = pairs[..., 0], pairs[..., 1]         # (B, N, K, d/2)
+            out = torch.stack((e1 * cs - e2 * sn,
+                               e1 * sn + e2 * cs), dim=-1)
+            return out.reshape(B, N, K, d)
+
     class DirEmbed(nn.Module):
         def __init__(self):
             super().__init__()
@@ -550,41 +564,65 @@ def build_model(d: int = 32):
             and valid (L, m) — the axis dim K is carried through Dir/BiDir as a
             batch dim, each axis reading its neighbours through the rotary phase.
             geom already holds the +/- neighbour of each query point, so this
-            touches O(m) rows of the field, never the whole grid."""
+            touches O(m) rows of the field, never the whole grid.
+
+            Live-pair gather: a (line, point) pair with no valid neighbour on
+            either side (``~vp & ~vn``) is masked out by line_pool anyway, yet the
+            dense form ran rope/dir/bidir over it regardless — ~47% of pairs are
+            dead at these schedules (75% at the coarsest sub-stages), and
+            torch.compile can't skip masked GEMM rows. So gather the live pairs
+            first and run the message MLPs only on them, splitting two-sided pairs
+            (bidir) from one-sided (dir) so neither MLP runs on rows the other
+            owns. line_pool already masks dead pairs, so the pooled result is
+            bit-identical to the old dense dir + where(both, bidir) form."""
             B = E.shape[0]
+            K, d = E.shape[2], self.d
             ip, in_ = geom.ip[:, msl], geom.in_[:, msl]     # (L, m)
             dp, dn = geom.dp[:, msl], geom.dn[:, msl]
             vp, vn = geom.vp[:, msl], geom.vn[:, msl]
-            # Batch all directions into the MLPs at once. This turns the old
-            # per-line Dir/BiDir calls into three larger matmuls per embed pass,
-            # which is much friendlier to GPU inference.
-            ep = E[:, ip]                           # (B, L, m, K, d)
-            en = E[:, in_]
-            ep = self.rope(ep, geom.cos, 1.0)       # (B, L, m, K, d)
-            en = self.rope(en, geom.cos, -1.0)
-            _, L, M, K, _ = ep.shape
-            # .to(ep.dtype): geom distances are fp32; match model dtype so the
-            # dir/bidir MLPs get fp16 inputs under true-half (cast fuses in embed).
-            lp = (torch.log2(dp) + geom.lognnz).to(ep.dtype
-                  ).view(1, L, M, 1, 1).expand(B, L, M, K, 1)
-            lnn = (torch.log2(dn) + geom.lognnz).to(ep.dtype
-                   ).view(1, L, M, 1, 1).expand(B, L, M, K, 1)
-            sign = ep.new_ones(B, L, M, K, 1)
-            both = (vp & vn).view(1, L, M, 1, 1)
-            vp_only = (vp & ~vn).view(1, L, M, 1, 1)
-            # Every single-neighbour point uses the *same* dir weights, differing
-            # only in which neighbour/sign/dist it feeds. Select that input before
-            # the MLP (ep if only +, else en) so dir runs once, not twice — the
-            # second pass was always discarded by the where. Both-neighbour points
-            # get overwritten by bidir. Still one big buffer at a time, so the
-            # finest-stage memory peak is unchanged.
-            e_sel = torch.where(vp_only, ep, en)
-            msg = self.dir(e_sel,
-                           torch.where(vp_only, sign, -sign),
-                           torch.where(vp_only, lp, lnn))
-            msg = torch.where(both, self.bidir(en, ep, lnn, lp), msg)
-            del ep, en, e_sel
-            return (msg.permute(1, 0, 2, 3, 4).contiguous(), (vp | vn))
+            L, m = vp.shape
+            valid = vp | vn                                 # (L, m)
+            live_idx = valid.reshape(-1).nonzero(as_tuple=True)[0]   # (Nl,)
+            if not live_idx.numel():                        # no neighbours anywhere
+                msg = E.new_zeros(B, L, m, K, d)
+                return (msg.permute(1, 0, 2, 3, 4).contiguous(), valid)
+            Nl = live_idx.numel()
+            line_of = live_idx // m                         # which direction each pair is on
+            vp_f = vp.reshape(-1)[live_idx]
+            vn_f = vn.reshape(-1)[live_idx]
+            ip_f = ip.reshape(-1)[live_idx]
+            in_f = in_.reshape(-1)[live_idx]
+            cos_f = geom.cos[line_of]                       # (Nl, K)
+            lognnz_f = geom.lognnz[line_of, 0]              # (Nl,)
+            # .to(E.dtype): geom distances are fp32; match model dtype so the
+            # dir/bidir MLPs get fp16 inputs under true-half.
+            lp = (torch.log2(dp.reshape(-1)[live_idx]) + lognnz_f).to(E.dtype)
+            lnn = (torch.log2(dn.reshape(-1)[live_idx]) + lognnz_f).to(E.dtype)
+            ep = self.rope.forward_flat(E[:, ip_f], cos_f, 1.0)   # (B, Nl, K, d)
+            en = self.rope.forward_flat(E[:, in_f], cos_f, -1.0)
+            # bidir over every live pair — two-sided is ~93% of them, so running
+            # it on the ~3.6% one-sided too (then overwriting) is far cheaper than
+            # a second gather, and peak memory stays at the live-pair size (<=
+            # dense). One-sided pairs read a dummy row on their missing side; the
+            # dir overwrite below discards that, exactly as the old `where` did.
+            lp_e = lp.view(1, Nl, 1, 1).expand(B, Nl, K, 1)
+            lnn_e = lnn.view(1, Nl, 1, 1).expand(B, Nl, K, 1)
+            msg_live = self.bidir(en, ep, lnn_e, lp_e)      # (B, Nl, K, d)
+            s_idx = (vp_f ^ vn_f).nonzero(as_tuple=True)[0]  # exactly one side
+            if s_idx.numel():
+                ns = s_idx.numel()
+                vpo = vp_f[s_idx].view(1, ns, 1, 1)         # only + valid?
+                e_side = torch.where(vpo, ep[:, s_idx], en[:, s_idx])
+                one = e_side.new_ones(())
+                sign = torch.where(vpo, one, -one).expand(B, ns, K, 1)
+                lp_s = lp[s_idx].view(1, ns, 1, 1).expand(B, ns, K, 1)
+                lnn_s = lnn[s_idx].view(1, ns, 1, 1).expand(B, ns, K, 1)
+                msg_live[:, s_idx] = self.dir(
+                    e_side, sign, torch.where(vpo, lp_s, lnn_s)).to(msg_live.dtype)
+            msg = E.new_zeros(B, L * m, K, d, dtype=msg_live.dtype)  # dead pairs stay 0
+            msg[:, live_idx] = msg_live
+            msg = msg.reshape(B, L, m, K, d)
+            return (msg.permute(1, 0, 2, 3, 4).contiguous(), valid)
 
         def _embed_block(self, E, geom, msl):
             msgs, valid = self._line_messages(E, geom, msl)  # (L,B,m,K,d),(L,m)
