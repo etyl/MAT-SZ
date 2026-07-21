@@ -16,10 +16,11 @@ pytest.importorskip("constriction")  # rANS backend; skip if unavailable
 
 from deepsz import GNNCompressorCodec
 import deepsz.gnn_predictor as gp
-from deepsz.gnn_codec import _chunk_waves
+from deepsz.gnn_codec import _chunk_device_plan, _chunk_waves
 from deepsz.gnn_predictor import (CKPT_VERSION, ChunkedGNNPredictor,
                                   _CompactFrame, build_chunk_geoms, build_model,
                                   chunk_halo_info)
+from deepsz.levels import stage_plan
 
 STRIDE = 4
 LEVELS = 2
@@ -167,6 +168,31 @@ def test_chunk_waves_are_mutually_independent():
             for j in range(i + 1, len(coords)):
                 diff = np.abs(np.array(coords[i]) - np.array(coords[j]))
                 assert diff.max() >= 2   # never adjacent (Chebyshev distance >= 2)
+
+
+def test_chunk_device_plan_uses_flat_integer_indices():
+    """Stage indices select the same points as the schedule masks, both within
+    a contiguous chunk block and within the flattened full reconstruction."""
+    cshape = (4, 3)
+    full_shape = (8, 7)
+    counts, positions, recon_offsets, _, _ = _chunk_device_plan(
+        torch, "cpu", cshape, full_shape, LEVELS, STRIDE, 1)
+    plan = stage_plan(cshape, LEVELS, STRIDE, 1)
+    origin = (4, 3)
+    origin_base = np.ravel_multi_index(origin, full_shape)
+
+    for count, pos, recon_off, (mask, _, _) in zip(
+            counts, positions, recon_offsets, plan):
+        expected_pos = np.flatnonzero(mask)
+        np.testing.assert_array_equal(pos.numpy(), expected_pos)
+        assert pos.dtype == torch.int64
+        assert count == expected_pos.size
+
+        coords = np.unravel_index(expected_pos, cshape)
+        expected_global = np.ravel_multi_index(
+            tuple(c + o for c, o in zip(coords, origin)), full_shape)
+        np.testing.assert_array_equal(
+            recon_off.numpy() + origin_base, expected_global)
 
 
 def test_query_only_nearest_search_matches_period_tile_lookup():

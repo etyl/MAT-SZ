@@ -561,6 +561,7 @@ def _compress_chunked(
     coarse_bar.close()
     # hand recon to the GPU for the wave loop; it never returns to host on encode
     recon_t = torch.from_numpy(recon).to(dev)
+    recon_flat = recon_t.reshape(c, -1)
     B_cap = predictor.max_batch(tuple(min(e, n) for e, n in zip(edges, shape)))
     if batch_cap is not None:  # user cap (never above safe)
         B_cap = max(1, min(B_cap, int(batch_cap)))
@@ -572,23 +573,29 @@ def _compress_chunked(
         f"{n_sub} model-waves"
     )
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
-    mask_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
+    index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
+    full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
     gates_t: list = [] if gate else None   # per stage-chunk gate byte, device scalars
     bar = _progress_bar("encode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i : i + B_cap]
             cshape = tuple(sl.stop - sl.start for sl in predictor.chunk_slices(ids[0]))
-            if cshape not in mask_cache:
-                mask_cache[cshape] = _chunk_device_plan(
-                    torch, dev, cshape, predictor.levels, stride, block
+            if cshape not in index_cache:
+                index_cache[cshape] = _chunk_device_plan(
+                    torch, dev, cshape, shape, predictor.levels, stride, block
                 )
-            counts, pos_dev, interp_dev, center = mask_cache[cshape]
+            counts, pos_dev, recon_off_dev, interp_dev, center = index_cache[cshape]
             # chunk value blocks for this sub-batch, uploaded once (not per stage)
             vblocks = [
                 torch.from_numpy(
                     np.ascontiguousarray(values[(slice(None), *predictor.chunk_slices(ci))])
-                ).to(dev)
+                ).to(dev).reshape(c, -1)
+                for ci in ids
+            ]
+            origin_bases = [
+                int(sum(sl.start * st for sl, st in zip(
+                    predictor.chunk_slices(ci), full_strides)))
                 for ci in ids
             ]
             predictor.start_wave(ids, recon_t)
@@ -603,7 +610,7 @@ def _compress_chunked(
                 pred, scale = predictor.predict_wave_stage(s, recon_t, ebs[s])
                 for bi in range(len(ids)):
                     sls = predictor.chunk_slices(ids[bi])
-                    cvals = vblocks[bi][(slice(None), pos)]      # (C, n)
+                    cvals = vblocks[bi].index_select(1, pos)     # (C, n)
                     p = pred[bi][None, :]
                     sc = scale[bi]
                     if gate:
@@ -621,8 +628,8 @@ def _compress_chunked(
                     codes, recon_stage, outliers = _quantize_t(
                         torch, cvals, p, ebs[s], radius, round_output
                     )
-                    view = recon_t[(slice(None), *sls)]
-                    view[:, pos] = recon_stage.reshape(view.shape[0], -1)
+                    gpos = recon_off_dev[s] + origin_bases[bi]
+                    recon_flat.index_copy_(1, gpos, recon_stage.reshape(c, -1))
                     wave_pending.append((
                         codes.to("cpu", non_blocking=True),
                         outliers.to("cpu", non_blocking=True),
@@ -660,24 +667,40 @@ def _compress_chunked(
     return b"".join(parts), gates
 
 
-def _chunk_device_plan(torch, dev, cshape, levels, stride, block):
-    """Per-chunk-shape device schedule for the wave inner loop: point counts, the
-    per-stage boolean position masks (for cvals gather + recon scatter), and the
-    per-stage cubic-interp coords/(stride, axes) for the gate. Cached per cshape,
-    since every chunk of a given shape shares this geometry."""
+def _chunk_device_plan(torch, dev, cshape, full_shape, levels, stride, block):
+    """Per-chunk-shape integer-index schedule for the device wave inner loop.
+
+    ``pos_dev`` addresses a contiguous flattened chunk value block.  The
+    corresponding ``recon_off_dev`` uses full-tensor strides, so adding a
+    chunk's global-flat origin addresses the device-resident reconstruction
+    without scanning a full chunk-sized boolean mask at every stage.  Coordinate
+    tuples are retained only for cubic interpolation.  The plan is cached per
+    chunk shape within one tensor encode/decode.
+    """
     plan = stage_plan(cshape, levels, stride, block)
-    counts = [int(m.sum()) for m, _, _ in plan]
-    pos_dev = [torch.from_numpy(np.ascontiguousarray(m)).to(dev) for m, _, _ in plan]
+    full_strides = np.cumprod((1,) + tuple(full_shape)[:0:-1])[::-1].astype(np.int64)
+    counts: list[int] = []
+    pos_dev: list = []
+    recon_off_dev: list = []
     interp_dev: list = []
     for m, st, ax in plan:
-        if ax and int(m.sum()):
+        pos = np.flatnonzero(m).astype(np.int64, copy=False)
+        coords_np = np.unravel_index(pos, cshape)
+        recon_off = np.zeros(pos.shape, np.int64)
+        for cc, gs in zip(coords_np, full_strides):
+            recon_off += cc * gs
+        counts.append(int(pos.size))
+        pos_dev.append(torch.from_numpy(np.ascontiguousarray(pos)).to(dev))
+        recon_off_dev.append(torch.from_numpy(
+            np.ascontiguousarray(recon_off, dtype=np.int64)).to(dev))
+        if ax and pos.size:
             coords = tuple(torch.from_numpy(np.ascontiguousarray(cc)).to(dev)
-                           for cc in np.nonzero(m))
+                           for cc in coords_np)
             interp_dev.append((coords, st, ax))
         else:
             interp_dev.append(None)
     center = default_interp_center(len(cshape))
-    return counts, pos_dev, interp_dev, center
+    return counts, pos_dev, recon_off_dev, interp_dev, center
 
 
 def _decompress_chunked(
@@ -722,18 +745,25 @@ def _decompress_chunked(
         f"{n_sub} model-waves"
     )
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
-    mask_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
+    index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
+    full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
+    recon_flat = recon_t.reshape(c, -1)
     gi = 0
     bar = _progress_bar("decode", n_sub)
     for group in waves:
         for i in range(0, len(group), B_cap):
             ids = group[i : i + B_cap]
             cshape = tuple(sl.stop - sl.start for sl in predictor.chunk_slices(ids[0]))
-            if cshape not in mask_cache:
-                mask_cache[cshape] = _chunk_device_plan(
-                    torch, dev, cshape, predictor.levels, stride, block
+            if cshape not in index_cache:
+                index_cache[cshape] = _chunk_device_plan(
+                    torch, dev, cshape, shape, predictor.levels, stride, block
                 )
-            counts, pos_dev, interp_dev, center = mask_cache[cshape]
+            counts, _, recon_off_dev, interp_dev, center = index_cache[cshape]
+            origin_bases = [
+                int(sum(sl.start * st for sl, st in zip(
+                    predictor.chunk_slices(ci), full_strides)))
+                for ci in ids
+            ]
             predictor.start_wave(ids, recon_t)
             for s in range(1, len(counts)):
                 n = counts[s]
@@ -747,7 +777,6 @@ def _decompress_chunked(
                             rans_tables=tables,
                         )
                     continue
-                pos = pos_dev[s]
                 pred, scale = predictor.predict_wave_stage(s, recon_t, ebs[s])
                 for bi in range(len(ids)):
                     sls = predictor.chunk_slices(ids[bi])
@@ -771,8 +800,8 @@ def _decompress_chunked(
                         torch, p,
                         torch.from_numpy(codes.astype(np.int64)).to(dev),
                         torch.from_numpy(outliers).to(dev), ebs[s], radius)
-                    view = recon_t[(slice(None), *sls)]
-                    view[:, pos] = recon_stage.reshape(view.shape[0], -1)
+                    gpos = recon_off_dev[s] + origin_bases[bi]
+                    recon_flat.index_copy_(1, gpos, recon_stage.reshape(c, -1))
             predictor.finish_wave(recon_t)
             peak = _cuda_peak(predictor)
             if peak:
