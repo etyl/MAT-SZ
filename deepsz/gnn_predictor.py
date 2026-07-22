@@ -58,9 +58,9 @@ CKPT_VERSION = 5
 # GPU peak scales with _M_TILE, not the stage's full M (line_pool is per-query,
 # so tiling is math-identical within a stream). Off by default: a fixed tile
 # shreds the whole-tensor path (a big 2D stage has M~150k -> ~150 tiny blocks,
-# ~2x slower/image) and isn't needed now that batch=1 fits (batching is
-# saturated) and fp16 halves the buffers. Set DEEPSZ_M_TILE=1024 only when
-# running big chunk_batch on tight VRAM. Stored in meta so decode replays it.
+# ~2x slower/image) and is normally unnecessary with one chunk at a time and
+# fp16 buffers. Set DEEPSZ_M_TILE=1024 only when a large chunk is tight on VRAM.
+# Stored in meta so decode replays it.
 _M_TILE = int(os.environ.get("DEEPSZ_M_TILE", 1 << 30))  # effectively no tiling
 
 
@@ -1206,7 +1206,6 @@ class ChunkedGNNPredictor:
     """
 
     provides_scale = True
-    chunk_batch = 1              # sub-batch size chosen by the codec, into meta
     fp16 = False                # fp16 autocast on the message pass (codec sets it)
     compile = False             # torch.compile the embed pass (codec sets it)
 
@@ -1296,8 +1295,7 @@ class ChunkedGNNPredictor:
                 f"(field {field_bytes/1e9:.1f} + stage activation "
                 f"{act_bytes/1e9:.1f} GB for tile={m:,} of M={M:,} queries "
                 f"x L={L} lines, budget {budget/1e9:.1f} GB). Lower "
-                f"DEEPSZ_M_TILE, or reduce both --chunk-size and "
-                f"--anchor-stride (for example 16 and 16). Continuing because "
+                f"DEEPSZ_M_TILE or --chunk-size. Continuing because "
                 f"this estimate is advisory.", RuntimeWarning, stacklevel=2)
 
     def chunk_slices(self, ci: int):
@@ -1351,7 +1349,7 @@ class ChunkedGNNPredictor:
                 if progress is not None:
                     progress(len(ids))
 
-    # ---- batched wave path (codec): many same-geometry chunks in the B dim ----
+    # ---- chunk path (legacy streams may still decode several chunks at once) --
 
     def _amp(self):
         self._maybe_compile()
@@ -1359,32 +1357,6 @@ class ChunkedGNNPredictor:
             return self._torch.autocast(device_type="cuda",
                                         dtype=self._torch.float16)
         return contextlib.nullcontext()
-
-    def max_batch(self, cshape):
-        """How many same-shape chunks fit in the memory budget at once. Bounded by
-        the finest stage's activation (B, L, M, K, d) plus the compact field, the
-        two terms that scale with B (see `_check_field_budget`)."""
-        torch = self._torch
-        cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
-                               self.anchor_block, torch, self.device,
-                               self.agg_level)
-        ndim = len(cshape)
-        n_field = 1 + int(len(cg.interior_flat)) + int(len(cg.ref_halo_flat))
-        M = max((g.M for g in cg.geoms if g is not None), default=1)
-        m = min(M, _M_TILE)                                   # embed tiles over M
-        # _line_messages peaks at ~ep + en + msg + one Dir/BiDir (hidden width 2d)
-        # all (B, L, m, K, d)-sized and live at once. ~8x the base buffer covers
-        # those plus the concat/where temporaries; the field E persists alongside.
-        # ponytail: this is a static estimate — the encode/decode progress line
-        # prints the *measured* GPU peak, so lower --chunk-batch if that nears VRAM.
-        per = ((n_field * ndim * self.d)                      # persistent field
-               + 8 * len(half_directions(ndim, self.agg_level))
-               * m * ndim * self.d) * 4
-        if self.device.type == "cuda":
-            budget = _cuda_working_budget(torch, self.device)
-        else:
-            budget = 8 << 30                                   # cpu: modest cap
-        return max(1, budget // max(per, 1))
 
     def start_wave(self, chunk_ids, recon):
         """Begin a batch of mutually-independent, identical-geometry chunks. One

@@ -431,7 +431,6 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
     # eager-mode pessimistic; benchmark deployed speed with eval_tensor.py.
     codec = GNNCompressorCodec(
         ckpt_path, error_bound=eb, levels=(args.levels or 4),
-        anchor_stride=(args.stride or 16), max_radius=args.max_radius,
         device=str(device), agg_level=args.agg_level,
         fp16=args.fp16, compile=False)
 

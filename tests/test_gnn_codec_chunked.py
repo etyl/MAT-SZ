@@ -1,7 +1,6 @@
 """Chunked GNN codec: bounded-memory path for large / high-dim tensors.
 
-Covers the v3 (chunked) stream added alongside the v2 whole-tensor path:
-n-D + integer roundtrips within the error bound, encoder determinism, auto vs
+Covers n-D + integer roundtrips within the error bound, encoder determinism, auto vs
 forced chunk selection, chunked-vs-whole equivalence of the guarantee, and the
 halo geometry (that out-of-chunk neighbours become live only once their chunk is
 coded). The error bound holds regardless of predictor quality — it is the
@@ -38,8 +37,8 @@ def v5_ckpt(tmp_path):
 
 def _codec(path, *, eb=1e-2, chunk_size):
     return GNNCompressorCodec(
-        path, error_bound=eb, levels=LEVELS, anchor_stride=STRIDE,
-        anchor_block=1, max_radius=4, chunk_size=chunk_size,
+        path, error_bound=eb, levels=LEVELS,
+        chunk_size=chunk_size,
         fp16=False, compile=False, gate=False)
 
 
@@ -58,12 +57,18 @@ def test_gate_roundtrip_and_header(v5_ckpt):
     f = np.sin(gx) * np.cos(gy) + rng.rand(16, 16).astype(np.float32) * 0.01
     eb = 1e-6
     on = GNNCompressorCodec(
-        v5_ckpt, error_bound=eb, levels=LEVELS, anchor_stride=STRIDE,
-        anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=False,
+        v5_ckpt, error_bound=eb, levels=LEVELS,
+        chunk_size=STRIDE, fp16=False,
         compile=False, gate=True)
     off = _codec(v5_ckpt, eb=eb, chunk_size=STRIDE)
     s_on, s_off = on.compress(f), off.compress(f)
-    gates = _read_stream(s_on)[0].get("gates")
+    meta = _read_stream(s_on)[0]
+    for redundant in (
+        "codec", "coded_shape", "anchor_stride", "anchor_block",
+        "max_radius", "entropy_coder", "chunk_batch",
+    ):
+        assert redundant not in meta
+    gates = meta.get("gates")
     if gates is None:
         assert s_on == s_off
     else:
@@ -131,8 +136,8 @@ def test_chunked_matches_whole_bound(v5_ckpt):
     rng = np.random.RandomState(11)
     x = rng.rand(8, 12).astype(np.float32)
 
-    whole = _codec(v5_ckpt, chunk_size=0)   # force whole-tensor (v2)
-    chunk = _codec(v5_ckpt, chunk_size=STRIDE)  # force chunked (v3)
+    whole = _codec(v5_ckpt, chunk_size=0)   # force whole-tensor
+    chunk = _codec(v5_ckpt, chunk_size=STRIDE)  # force chunked
 
     yw = whole.uncompress(whole.compress(x))
     yc = chunk.uncompress(chunk.compress(x))
@@ -150,17 +155,23 @@ def test_auto_chunk_selection(v5_ckpt):
     edges = codec._chunk_edges(big)
     assert edges is not None
     assert all(e % STRIDE == 0 and e > 0 for e in edges)
+    assert np.prod([min(e, n) for e, n in zip(edges, big)]) <= 1 << 21
+    assert np.prod([min(e + STRIDE, n) for e, n in zip(edges, big)]) > 1 << 21
+
+    elongated = codec._chunk_edges((1 << 20, 16))
+    assert elongated[1] >= 16
+    assert elongated[0] > edges[0]  # short axis leaves room for a longer chunk
 
     bad = _codec(v5_ckpt, chunk_size=STRIDE + 1)            # not a multiple
     with pytest.raises(ValueError):
         bad.compress(np.zeros((8, 8), np.float32))
 
 
-# --- wave batching: same-color chunks are independent, so they batch ---------
+# --- color ordering: same-color chunks are mutually independent --------------
 
 def test_chunk_waves_are_mutually_independent():
     """Every wave's chunks are >=2 apart on each axis they differ, so their
-    one-chunk-thick halos never overlap -> batching them is order-independent."""
+    one-chunk-thick halos never overlap and sequential order is immaterial."""
     grid = (6, 4)
     for wave in _chunk_waves(grid):
         coords = [np.unravel_index(ci, grid) for ci in wave]
@@ -277,8 +288,8 @@ def test_fp16_flag_roundtrips_and_persists(v5_ckpt):
     rng = np.random.RandomState(9)
     x = rng.rand(8, 8).astype(np.float32)
     codec = GNNCompressorCodec(
-        v5_ckpt, error_bound=0.02, levels=LEVELS, anchor_stride=STRIDE,
-        anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=True,
+        v5_ckpt, error_bound=0.02, levels=LEVELS,
+        chunk_size=STRIDE, fp16=True,
         compile=False)
 
     stream = codec.compress(x)
@@ -297,8 +308,8 @@ def test_compile_flag_roundtrips_and_persists(v5_ckpt, monkeypatch):
     rng = np.random.RandomState(11)
     x = rng.rand(8, 8).astype(np.float32)
     codec = GNNCompressorCodec(
-        v5_ckpt, error_bound=0.02, levels=LEVELS, anchor_stride=STRIDE,
-        anchor_block=1, max_radius=4, chunk_size=STRIDE, fp16=False,
+        v5_ckpt, error_bound=0.02, levels=LEVELS,
+        chunk_size=STRIDE, fp16=False,
         compile=True)
 
     stream = codec.compress(x)
@@ -310,22 +321,6 @@ def test_compile_flag_roundtrips_and_persists(v5_ckpt, monkeypatch):
     meta, _ = _read_stream(bytes(stream))
     assert meta.get("compiled") is True
     assert _maxerr(codec.uncompress(stream), x) <= 0.02
-
-
-def test_batch_size_invariant_within_bound(v5_ckpt):
-    """A wave split into different sub-batch sizes still round-trips within the
-    bound (the closed loop stays consistent because enc/dec share the batch)."""
-    rng = np.random.RandomState(5)
-    x = rng.rand(24, 16).astype(np.float32)   # grid 6x4 -> waves of size 2
-    for batch in (1, 2, 64):
-        orig = ChunkedGNNPredictor.max_batch
-        ChunkedGNNPredictor.max_batch = lambda self, cs, _b=batch: _b
-        try:
-            codec = _codec(v5_ckpt, eb=0.02, chunk_size=STRIDE)
-            y = codec.uncompress(codec.compress(x))
-        finally:
-            ChunkedGNNPredictor.max_batch = orig
-        assert _maxerr(y, x) <= 0.02
 
 
 # --- halo geometry: out-of-chunk neighbours go live only once coded ---------

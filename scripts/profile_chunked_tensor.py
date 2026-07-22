@@ -22,11 +22,11 @@ cap 6.1). This targets Volta+ (V100), which is also what `--compile`/Triton
 needs anyway.
 
     python scripts/profile_chunked_tensor.py data/rti_normal.npy \
-        --gnn-checkpoint checkpoints/d32.pt --eb 0.01 --levels 4 \
-        --anchor-stride 16 --chunk-size 16 --anchor-block 1 --agg-level 2 \
-        --chunk-batch 1 --fp16 --compile
+        --gnn-checkpoint checkpoints/d32.pt --eb 0.01 \
+        --levels 4 --chunk-size 16 --agg-level 2 \
+        --fp16 --compile
 
-Same knobs the codec takes (--fp16, --compile, --overlap, --chunk-size, ...).
+Same knobs the codec takes (--fp16, --compile, --chunk-size, ...).
 """
 
 from __future__ import annotations
@@ -62,18 +62,14 @@ def main(argv=None):
     ap.add_argument("--rel", action="store_true",
                     help="scale eb by the value range (max-min)")
     ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
-    ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--agg-level", type=int, default=None)
     ap.add_argument("--chunk-size", type=int, default=None,
-                    help="chunk edge (multiple of anchor-stride); 0 = whole-tensor")
-    ap.add_argument("--chunk-batch", type=int, default=None)
+                    help="chunk edge (multiple of 2 ** levels); 0 = whole-tensor")
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--zstd-level", type=int, default=9)
     ap.add_argument("--eb-ratio", type=float, default=1.0)
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--compile", action="store_true")
-    ap.add_argument("--overlap", action="store_true")
     ap.add_argument("--warmup", type=int, default=10,
                     help="chunk-encoding steps to warm up on before the timed step")
     ap.add_argument("--trace", default="chunk_step_trace.json",
@@ -111,11 +107,10 @@ def main(argv=None):
     def make():
         return GNNCompressorCodec(
             args.gnn_checkpoint, error_bound=eb, levels=args.levels,
-            anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
             agg_level=args.agg_level, radius=args.radius,
             zstd_level=args.zstd_level, eb_ratio=args.eb_ratio, tune="fast",
-            chunk_size=args.chunk_size, chunk_batch=args.chunk_batch,
-            fp16=args.fp16, compile=args.compile, overlap=args.overlap,
+            chunk_size=args.chunk_size,
+            fp16=args.fp16, compile=args.compile,
             device=args.device)
 
     # Tag the coarse codec phases with record_function so they show up as named
@@ -142,7 +137,7 @@ def main(argv=None):
         label(ChunkedGNNPredictor, m)
 
     # Step-level warm-up + single-step profiling. A step is one model-wave
-    # (start_wave..finish_wave) = one chunk at chunk-batch 1. Warm up over the
+    # (start_wave..finish_wave) = one chunk. Warm up over the
     # first `warmup` steps (this also warms the CUDA context and the compiled
     # graph), start kineto on the (warmup+1)-th step, stop + abort after it.
     class _Stop(Exception):
@@ -189,9 +184,9 @@ def main(argv=None):
 
     total = timed["t_step"]
     print(f"\ntensor {args.input} {arr.shape} {arr.dtype}  eb={eb}")
-    print(f"chunk-size={args.chunk_size} chunk-batch={args.chunk_batch} "
+    print(f"chunk-size={args.chunk_size} "
           f"agg-level={args.agg_level} fp16={args.fp16} compile={args.compile} "
-          f"overlap={args.overlap} device={args.device}")
+          f"device={args.device}")
     print(f"single chunk-step (after {args.warmup} warm-up steps): "
           f"{1000*total:.2f}ms  (wall; kineto adds overhead below)")
 

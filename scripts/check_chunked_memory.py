@@ -55,7 +55,6 @@ def main():
     ap.add_argument("--eb", type=float, default=1e-2)
     ap.add_argument("--d", type=int, default=32, help="model width")
     ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
     ap.add_argument("--checkpoint", default=None,
                     help="real checkpoint (default: random weights)")
     ap.add_argument("--seed", type=int, default=0)
@@ -88,7 +87,7 @@ def main():
 
     codec = GNNCompressorCodec(
         ckpt, error_bound=args.eb, levels=args.levels,
-        anchor_stride=args.anchor_stride, chunk_size=args.chunk_size,
+        chunk_size=args.chunk_size,
         strict_checkpoint=False)
 
     t0 = time.time()

@@ -24,7 +24,7 @@ module purge
 module load pytorch-gpu
 
 export PYTHONUNBUFFERED=1          # flush progress to the SLURM .out live
-export DEEPSZ_M_TILE=$((32**4))    # M-tiling off (chunk-batch 1 fits without it)
+export DEEPSZ_M_TILE=$((32**4))    # M-tiling off for this explicitly sized chunk
 
 # GNN checkpoint (same one eval_tensor.sh uses; override with CKPT=...).
 CKPT=${CKPT:-./checkpoints/d64-2agg.pt}
@@ -37,7 +37,6 @@ EB=${EB:-0.0001}
 LEVELS=${LEVELS:-5}
 AGG=${AGG:-2}                      # neighbourhood aggregation level (1 or 2)
 CHUNK=${CHUNK:-32}
-CHUNK_BATCH=${CHUNK_BATCH:-1}
 TUNE=${TUNE:-fast}
 LABEL=${LABEL:-}
 
@@ -46,10 +45,8 @@ python scripts/bench_gnn_subset.py "$DATA" \
     --subset-edge "$EDGE" \
     --eb "$EB" \
     --levels "$LEVELS" \
-    --anchor-block 1 \
     --agg-level "$AGG" \
     --chunk-size "$CHUNK" \
-    --chunk-batch "$CHUNK_BATCH" \
     --tune "$TUNE" \
     --normalize \
     --label "$LABEL" \

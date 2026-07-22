@@ -6,12 +6,12 @@ that matter for judging an optimisation: reconstruction quality (PSNR, max
 error), size (bits/value, ratio), speed (compress/decompress wall + voxel
 throughput), and resource use (peak host RAM, peak GPU memory, mean/peak GPU
 SM utilisation). The subset edge is capped per axis to the tensor's real extent
-and floored to a multiple of ``--anchor-stride``, so the *same* script runs on
+and floored to a multiple of ``2 ** levels``, so the *same* script runs on
 the 32^4 local ``rti_normal.npy`` and on the full-size Jean Zay tensor.
 
     python scripts/bench_gnn_subset.py data/rti_normal.npy \
         --gnn-checkpoint checkpoints/d64.pt --eb 1e-4 --normalize \
-        --levels 5 --anchor-stride 32 --chunk-size 32 --agg-level 1
+        --levels 5 --chunk-size 32 --agg-level 1
 
 Each run prints one report (config + git commit + every metric) to stdout;
 tag it with ``--label`` and re-run before/after an optimisation to compare.
@@ -229,7 +229,7 @@ def main(argv=None):
     ap.add_argument("--subset-edge", type=int, default=64,
                     help="edge of the centred n-D hypercube to benchmark "
                          "(capped to each axis, floored to a multiple of "
-                         "--anchor-stride)")
+                         "2 ** --levels)")
     ap.add_argument("--eb", type=float, default=1e-4)
     ap.add_argument("--rel", action="store_true",
                     help="scale eb by the value range (max-min)")
@@ -237,18 +237,14 @@ def main(argv=None):
                     help="min-max scale the subset to [0,1] before compressing")
     # Codec knobs (defaults = the realistic 4-D level-5 case).
     ap.add_argument("--levels", type=int, default=5)
-    ap.add_argument("--anchor-stride", type=int, default=32)
-    ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--agg-level", type=int, default=1)
     ap.add_argument("--chunk-size", type=int, default=32)
-    ap.add_argument("--chunk-batch", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--zstd-level", type=int, default=9)
     ap.add_argument("--eb-ratio", type=float, default=None)
     ap.add_argument("--tune", default="fast", choices=("fast", "size"))
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--compile", action="store_true")
-    ap.add_argument("--overlap", action="store_true")
     ap.add_argument("--device", default=None)
     ap.add_argument("--poll-interval", type=float, default=0.1,
                     help="GPU sampling period in seconds")
@@ -268,7 +264,8 @@ def main(argv=None):
             torch.cuda.synchronize()
 
     raw = load_tensor(args.input)
-    sub = centred_subset(np.asarray(raw), args.subset_edge, args.anchor_stride)
+    anchor_stride = 1 << args.levels
+    sub = centred_subset(np.asarray(raw), args.subset_edge, anchor_stride)
     if sub.dtype == np.float64:
         print("note: float64 input cast to float32")
         sub = sub.astype(np.float32)
@@ -282,11 +279,10 @@ def main(argv=None):
     from deepsz.gnn_codec import GNNCompressorCodec
     codec = GNNCompressorCodec(
         args.gnn_checkpoint, error_bound=eb, levels=args.levels,
-        anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
         agg_level=args.agg_level, radius=args.radius, zstd_level=args.zstd_level,
         eb_ratio=args.eb_ratio, tune=args.tune, chunk_size=args.chunk_size,
-        chunk_batch=args.chunk_batch, fp16=args.fp16, compile=args.compile,
-        overlap=args.overlap, device=device)
+        fp16=args.fp16, compile=args.compile,
+        device=device)
 
     if is_cuda:
         torch.cuda.synchronize(torch_device)
@@ -340,8 +336,8 @@ def main(argv=None):
     print(f"{'input':<{w}} {args.input} {tuple(sub.shape)} "
           f"({sub.size} voxels, {orig_bytes} B)")
     print(f"{'eb':<{w}} {eb:g}   device {device}")
-    print(f"{'levels/stride/agg':<{w}} {args.levels}/{args.anchor_stride}/"
-          f"{args.agg_level}   chunk {args.chunk_size} batch {args.chunk_batch} "
+    print(f"{'levels/stride/agg':<{w}} {args.levels}/{anchor_stride}/"
+          f"{args.agg_level}   chunk {args.chunk_size} "
           f"tune {args.tune} fp16 {args.fp16} compile {args.compile}")
     print("-" * 60)
     print(f"{'PSNR':<{w}} {psnr:8.3f} dB")

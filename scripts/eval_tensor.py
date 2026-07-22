@@ -74,15 +74,9 @@ def main(argv=None):
     ap.add_argument("input", help="tensor file (.npy or .pt/.pth)")
     add_common(ap)
     ap.add_argument("--chunk-size", type=int, default=None,
-                    help="gnn only: force chunk edge (multiple of anchor-stride); "
-                         "0 = whole-tensor, omit = auto. Peak field/chunk is "
-                         "(edge+2*anchor_stride)^ndim, so keep edge small and "
-                         "anchor-stride << edge for large n-D tensors")
-    ap.add_argument("--chunk-batch", type=int, default=None,
-                    help="gnn only: cap how many chunks are coded together in the "
-                         "model batch dim (omit = auto from encode-GPU memory). "
-                         "The value is stored in the stream and replayed at decode, "
-                         "so set it to what the smallest decode device can hold")
+                    help="gnn only: force chunk edge (multiple of 2 ** levels); "
+                         "0 = whole-tensor, omit = maximize chunk size within "
+                         "the automatic point budget")
     ap.add_argument("--fp16", action="store_true",
                     help="gnn only: fp16 autocast on the GNN message pass (cuda; "
                          "~2x forward, readout stays fp32). May cost a little ratio "
@@ -90,10 +84,6 @@ def main(argv=None):
     ap.add_argument("--normalize", action="store_true",
                     help="min-max scale the tensor to [0,1] before compressing, so "
                          "eb is comparable across tensors of different raw scale")
-    ap.add_argument("--overlap", action="store_true",
-                    help="gnn chunked only: pack the per-stage rANS on a "
-                         "background thread so it hides behind the next stage's "
-                         "GPU forward. Output bytes are identical; encode-only")
     ap.add_argument("--compile", action="store_true",
                     help="gnn only: torch.compile the message-pass embed (fuses "
                          "the elementwise ~40%%; one-off compile cost on first "
@@ -120,13 +110,12 @@ def main(argv=None):
         from deepsz.gnn_codec import GNNCompressorCodec
         codec = GNNCompressorCodec(
             args.gnn_checkpoint, error_bound=eb, levels=args.levels,
-            anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
             agg_level=args.agg_level,
             radius=args.radius, zstd_level=args.zstd_level,
             eb_ratio=args.eb_ratio,
             tune=args.tune if args.tune in ("fast", "size") else "fast",
-            chunk_size=args.chunk_size, chunk_batch=args.chunk_batch,
-            fp16=args.fp16, compile=args.compile, overlap=args.overlap)
+            chunk_size=args.chunk_size,
+            fp16=args.fp16, compile=args.compile)
         t0 = time.time()
         stream = codec.compress(arr)
         t_comp = time.time() - t0

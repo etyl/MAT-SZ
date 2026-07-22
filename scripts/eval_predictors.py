@@ -101,7 +101,6 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
     from deepsz.gnn_codec import GNNCompressorCodec
     codec = GNNCompressorCodec(
         args.gnn_checkpoint, error_bound=eb, levels=args.levels,
-        anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
         radius=args.radius, zstd_level=args.zstd_level,
         eb_ratio=args.eb_ratio,
         tune=args.tune if args.tune in ("fast", "size") else "fast",

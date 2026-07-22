@@ -30,10 +30,14 @@ stream = codec.compress(array_or_tensor)
 reconstructed = codec.uncompress(stream)  # torch.Tensor
 ```
 
+The GNN codec derives its anchor stride as `2 ** levels`; inference callers
+only specify `levels`, so the dyadic schedule always reaches unit stride.
+
 The stream records the tensor shape, dtype, codec parameters, numerical mode,
 and checkpoint hash. Decoding checks the checkpoint hash by default. Large
-tensors are automatically divided into dependency-safe chunks; set
-`chunk_size=0` to force the whole-tensor path.
+tensors are automatically divided into the largest dependency-safe chunks that
+fit the codec's point budget and processed one at a time; set `chunk_size=0` to
+force the whole-tensor path.
 
 The lower-level API supports both predictors and returns codec diagnostics:
 

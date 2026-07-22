@@ -23,16 +23,14 @@ from .rans import SCALE_HI_MULT, SCALE_LO_DIV, build_laplace_tables, scale_to_le
 
 
 _MAGIC = b"DEEPSZGN"
-_VERSION = 4  # whole-tensor streams (v2 + widened rANS scale grid)
-_VERSION_CHUNKED = 5  # chunk-major streams (v3 + widened rANS scale grid)
-_VERSION_GATED = 6  # chunked + scale-gated interp fallback (meta["gates"])
+_VERSION = 7
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
+_ANCHOR_BLOCK = 1
 
 # auto mode: whole-tensor below this many points, chunked above (whole-tensor
 # memory is ~30*L*K*d bytes/point in transients — ~2^21 points is a few GB)
 _AUTO_CHUNK_THRESHOLD = 1 << 21
-_AUTO_CHUNK_POINTS = 1 << 18  # target points per chunk
 # torch.compile only pays past this many chunks (dynamo warmup is seconds; the
 # fused embed saves ~ms per wave). ponytail: rough amortization cutoff, tune if
 # compile cost or per-wave savings change materially.
@@ -94,19 +92,9 @@ def _as_numpy(x: Any) -> np.ndarray:
 
 
 def _meta_agg_level(meta: dict[str, Any]) -> int | None:
-    """Neighbourhood aggregation level recorded in a stream, or None (full) for
-    streams written before the option existed."""
-    v = meta.get("agg_level")
+    """Neighbourhood aggregation level recorded in a stream."""
+    v = meta["agg_level"]
     return None if v is None else int(v)
-
-
-def _dtype_meta(dtype: np.dtype) -> dict[str, Any]:
-    dtype = np.dtype(dtype)
-    return {
-        "str": dtype.str,
-        "kind": dtype.kind,
-        "itemsize": dtype.itemsize,
-    }
 
 
 def _restore_dtype(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
@@ -118,12 +106,10 @@ def _restore_dtype(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
     return values.astype(dtype, copy=False)
 
 
-def _write_stream(
-    meta: dict[str, Any], payload: bytes, zstd_level: int, version: int = _VERSION
-) -> bytes:
+def _write_stream(meta: dict[str, Any], payload: bytes, zstd_level: int) -> bytes:
     header = json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8")
     body = zstandard.ZstdCompressor(level=zstd_level).compress(payload)
-    return struct.pack(_PREFIX, _MAGIC, version, len(header)) + header + body
+    return struct.pack(_PREFIX, _MAGIC, _VERSION, len(header)) + header + body
 
 
 def _read_stream(stream: bytes) -> tuple[dict[str, Any], bytes]:
@@ -132,7 +118,7 @@ def _read_stream(stream: bytes) -> tuple[dict[str, Any], bytes]:
     magic, version, header_len = struct.unpack_from(_PREFIX, stream, 0)
     if magic != _MAGIC:
         raise ValueError(f"not a DeepSZ GNN stream (bad magic {magic!r})")
-    if version not in (_VERSION, _VERSION_CHUNKED, _VERSION_GATED):
+    if version != _VERSION:
         raise ValueError(f"unsupported DeepSZ GNN stream version {version}")
     off = _PREFIX_SIZE
     meta = json.loads(stream[off : off + header_len].decode("utf-8"))
@@ -228,11 +214,34 @@ def _anchor_axes(shape: tuple[int, ...], stride: int, block: int) -> list[np.nda
 
 
 def _auto_chunk_edges(shape: tuple[int, ...], stride: int) -> tuple[int, ...]:
-    """Uniform chunk edge targeting ~_AUTO_CHUNK_POINTS points per chunk,
-    rounded down to a multiple of the anchor stride (>= one stride)."""
-    target = _AUTO_CHUNK_POINTS ** (1.0 / len(shape))
-    edge = max(stride, int(target) // stride * stride)
-    return (edge,) * len(shape)
+    """Largest near-isotropic chunk below the automatic point budget.
+
+    Short axes are included in full so elongated tensors do not waste most of
+    the budget.  Edges are multiples of the anchor stride as required by the
+    chunk geometry.
+    """
+    target = _AUTO_CHUNK_THRESHOLD
+    fixed = 1
+    remaining = len(shape)
+    free_edge = float(target) ** (1.0 / remaining)
+    full_axes: set[int] = set()
+    for axis in sorted(range(len(shape)), key=shape.__getitem__):
+        free_edge = (target / fixed) ** (1.0 / remaining)
+        if shape[axis] > free_edge:
+            break
+        full_axes.add(axis)
+        fixed *= shape[axis]
+        remaining -= 1
+        if not remaining:
+            break
+    if remaining:
+        free_edge = (target / fixed) ** (1.0 / remaining)
+    return tuple(
+        max(stride, -(-n // stride) * stride)
+        if axis in full_axes
+        else max(stride, int(free_edge) // stride * stride)
+        for axis, n in enumerate(shape)
+    )
 
 
 def _code_anchor_stage(values, recon, axes, eb0, radius, round_output):
@@ -272,11 +281,9 @@ def _chunk_waves(grid: tuple[int, ...]) -> list[list[int]]:
     """Group chunk ids into color waves. A wave = chunks with the same per-axis
     parity ("color") and the same tensor-boundary signature. Same-color chunks
     are >=2 apart on every axis they differ, so their halos (thickness one chunk)
-    never overlap -> they are mutually independent and, given the color ordering,
-    share one coded-neighbour pattern -> identical stage geometry, so they batch
-    in the model's B dim. Ordered by color so a wave's cross-color neighbours in
-    earlier colors are already coded. Correctness (the error bound) holds for any
-    order; only which context is available, hence the ratio, shifts."""
+    never overlap. Ordered by color so a wave's cross-color neighbours in earlier
+    colors are already coded. Correctness (the error bound) holds for any order;
+    only which context is available, hence the ratio, shifts."""
     groups: dict = {}
     for ci in range(int(np.prod(grid))):
         cidx = np.unravel_index(ci, grid)
@@ -516,14 +523,13 @@ def _compress_chunked(
     round_output: bool,
     predictor: ChunkedGNNPredictor,
     edges: tuple[int, ...],
-    batch_cap: int | None = None,
-    overlap: bool = False,
     gate: bool = False,
 ) -> tuple[bytes, list[int] | None]:
-    """Wave-batched encode: global anchor pass, then chunks coded in color waves
-    (see `_chunk_waves`), each wave split into memory-bounded sub-batches run
-    together in the model's B dim. Stream order is wave -> sub-batch -> stage ->
-    chunk, mirrored bitwise by the decoder. Peak memory is O(batch * chunk).
+    """Encode a global anchor pass followed by one chunk at a time.
+
+    Color-wave ordering (see ``_chunk_waves``) determines which neighbouring
+    chunks are available as causal context, but model memory is devoted to one
+    maximally sized chunk instead of batching several chunks together.
 
     Device-resident inner loop: after the (host) anchor pass, the reconstruction
     lives on the GPU and every per-stage step -- forward, pred/scale, cubic-interp
@@ -531,9 +537,7 @@ def _compress_chunked(
     path (recon feeding the next forward) never syncs to host. The only host-side
     work is the rANS pack, which does not feed recon; it is deferred to the end of
     each wave (codes streamed off the GPU during the wave), keeping it off the
-    per-stage path. ``overlap`` is accepted for signature compatibility and no
-    longer does anything -- a background packer cannot help (constriction's rANS
-    holds the GIL), so packing is batched per wave instead."""
+    per-stage path."""
     torch = predictor._torch
     dev = predictor.device
     c = values.shape[0]
@@ -562,31 +566,26 @@ def _compress_chunked(
     # hand recon to the GPU for the wave loop; it never returns to host on encode
     recon_t = torch.from_numpy(recon).to(dev)
     recon_flat = recon_t.reshape(c, -1)
-    B_cap = predictor.max_batch(tuple(min(e, n) for e, n in zip(edges, shape)))
-    if batch_cap is not None:  # user cap (never above safe)
-        B_cap = max(1, min(B_cap, int(batch_cap)))
-    predictor.chunk_batch = B_cap  # surfaced into stream meta
     waves = _chunk_waves(predictor.grid)
-    n_sub = sum(-(-len(g) // B_cap) for g in waves)
     _log(
-        f"encode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
-        f"{n_sub} model-waves"
+        f"encode: anchors done, {predictor.n_chunks} chunks, "
+        f"{predictor.n_chunks} model passes"
     )
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
     full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
     gates_t: list = [] if gate else None   # per stage-chunk gate byte, device scalars
-    bar = _progress_bar("encode", n_sub)
+    bar = _progress_bar("encode", predictor.n_chunks)
     for group in waves:
-        for i in range(0, len(group), B_cap):
-            ids = group[i : i + B_cap]
+        for ci in group:
+            ids = [ci]
             cshape = tuple(sl.stop - sl.start for sl in predictor.chunk_slices(ids[0]))
             if cshape not in index_cache:
                 index_cache[cshape] = _chunk_device_plan(
                     torch, dev, cshape, shape, predictor.levels, stride, block
                 )
             counts, pos_dev, recon_off_dev, interp_dev, center = index_cache[cshape]
-            # chunk value blocks for this sub-batch, uploaded once (not per stage)
+            # The chunk value block is uploaded once, not once per stage.
             vblocks = [
                 torch.from_numpy(
                     np.ascontiguousarray(values[(slice(None), *predictor.chunk_slices(ci))])
@@ -710,7 +709,6 @@ def _decompress_chunked(
     radius: int,
     predictor: ChunkedGNNPredictor,
     edges: tuple[int, ...],
-    batch: int,
     gates: list[int] | None = None,
 ) -> np.ndarray:
     c = 1
@@ -737,22 +735,17 @@ def _decompress_chunked(
     recon_t = torch.from_numpy(recon).to(dev)   # device-resident, same as encode
     gates_t = None if gates is None else torch.tensor(
         gates, dtype=torch.int64, device=dev)
-    B_cap = max(1, int(batch))
     waves = _chunk_waves(predictor.grid)
-    n_sub = sum(-(-len(g) // B_cap) for g in waves)
-    _log(
-        f"decode: anchors done, {predictor.n_chunks} chunks, batch={B_cap}, "
-        f"{n_sub} model-waves"
-    )
+    _log(f"decode: anchors done, {predictor.n_chunks} chunks/model passes")
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
     full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
     recon_flat = recon_t.reshape(c, -1)
     gi = 0
-    bar = _progress_bar("decode", n_sub)
+    bar = _progress_bar("decode", predictor.n_chunks)
     for group in waves:
-        for i in range(0, len(group), B_cap):
-            ids = group[i : i + B_cap]
+        for ci in group:
+            ids = [ci]
             cshape = tuple(sl.stop - sl.start for sl in predictor.chunk_slices(ids[0]))
             if cshape not in index_cache:
                 index_cache[cshape] = _chunk_device_plan(
@@ -830,10 +823,7 @@ class GNNCompressorCodec:
         error_bound: float = 1e-2,
         *,
         levels: int = 5,
-        anchor_stride: int = 32,
-        anchor_block: int = 1,
         radius: int = 1 << 15,
-        max_radius: int = 64,
         agg_level: int | None = 2,
         device: str | None = None,  # None -> cuda if available, else cpu
         zstd_level: int = 9,
@@ -841,10 +831,8 @@ class GNNCompressorCodec:
         tune: str = "fast",
         strict_checkpoint: bool = True,
         chunk_size: int | tuple[int, ...] | None = None,
-        chunk_batch: int | None = None,
-        fp16: bool = False,
+        fp16: bool = True,
         compile: bool = True,
-        overlap: bool = False,
         gate: bool = True,
     ):
         self.checkpoint_path = Path(checkpoint_path)
@@ -857,10 +845,12 @@ class GNNCompressorCodec:
 
         self.error_bound = float(error_bound)
         self.levels = int(levels)
-        self.anchor_stride = int(anchor_stride)
-        self.anchor_block = int(anchor_block)
+        if self.levels < 1:
+            raise ValueError("levels must be >= 1")
+        # A level is one dyadic refinement, so inference always starts on the
+        # unique coarse grid that reaches unit stride after ``levels`` steps.
+        self.anchor_stride = 1 << self.levels
         self.radius = int(radius)
-        self.max_radius = int(max_radius)
         # Neighbourhood aggregation level: cap on the L1 length of the GNN's
         # neighbour lines (None = full neighbourhood). Smaller = fewer directions
         # per point = faster inference, most impactful in high dimensions. Frozen
@@ -875,33 +865,23 @@ class GNNCompressorCodec:
         self.eb_ratio = eb_ratio
         self.tune = tune
         self.strict_checkpoint = bool(strict_checkpoint)
-        # chunk_size: None = auto (whole-tensor for small inputs, chunked
-        # above _AUTO_CHUNK_THRESHOLD points); 0 = force whole-tensor; an int
-        # or per-axis tuple forces chunked with those edges (multiples of
-        # anchor_stride).
+        # chunk_size: None = auto (whole-tensor for small inputs, otherwise the
+        # largest near-isotropic chunk within _AUTO_CHUNK_THRESHOLD points);
+        # 0 = force whole-tensor; an int or per-axis tuple forces chunked with
+        # those edges (multiples of anchor_stride).
         self.chunk_size = chunk_size
-        # chunk_batch: None = auto (as many same-geometry chunks as fit the encode
-        # GPU); an int caps it (capped again at the memory-safe auto value). The
-        # value used is frozen into the stream so decode replays it — set it to
-        # what the smallest decode device can hold.
-        self.chunk_batch = None if chunk_batch is None else max(1, int(chunk_batch))
         # fp16: run the message-pass matmuls in fp16 autocast (cuda only; the
         # readout stays fp32). ~2x on the GNN forward, may cost a little ratio at
-        # small eb -> opt-in. Stored in meta so decode uses the same float path.
+        # small eb. Stored in meta so decode uses the same float path.
         self.fp16 = bool(fp16)
         # compile: torch.compile the message-pass embed (fuses the elementwise
         # ops that aren't in the GEMMs). Stored in meta so decode uses the same
         # compiled float path. First encode pays a one-off compilation cost.
         self.compile = bool(compile)
-        # overlap: retired no-op, kept for API/CLI compatibility. The chunked
-        # encode inner loop is now device-resident and the rANS pack is deferred
-        # per wave (see _compress_chunked), so a background packer -- which the
-        # GIL kept from ever overlapping the launch loop anyway -- buys nothing.
-        self.overlap = bool(overlap)
         # gate: scale-gated interp fallback (chunked path only). The encoder
         # sweeps (T, shift) per chunk-stage against the true residuals and
         # writes the winners into the header, so the gate self-disables where
-        # it does not pay (e.g. high eb) and the stream stays v5-identical
+        # it does not pay (e.g. high eb) and the stream stays byte-identical
         # when every choice is off. Buys ~2 bpv at eb=1e-6 on RTI.
         self.gate = bool(gate)
         self.checkpoint_hash = self._checkpoint_hash()
@@ -964,37 +944,29 @@ class GNNCompressorCodec:
         )
         candidates: list[tuple[int, bytes]] = []
         for ratio in ratio_candidates:
-            chunk_batch = None
             gates = None
             if edges is None:
                 payload = self._compress_payload(values, dtype, eb, vmin, vmax, ratio)
             else:
-                payload, chunk_batch, gates = self._compress_chunked_payload(
+                payload, gates = self._compress_chunked_payload(
                     values, dtype, eb, vmin, vmax, ratio, edges, use_compile
                 )
                 if gates is not None and not any(gates):
-                    gates = None  # gate never fired -> plain v5 stream
+                    gates = None  # gate never fired -> plain ungated stream
             meta = {
-                "codec": "deepsz.gnn",
                 "shape": list(original_shape),
-                "coded_shape": list(shape),
-                "dtype": _dtype_meta(dtype),
+                "dtype": dtype.str,
                 "error_bound": eb,
                 "levels": self.levels,
-                "anchor_stride": self.anchor_stride,
-                "anchor_block": self.anchor_block,
                 "radius": self.radius,
-                "max_radius": self.max_radius,
                 "agg_level": self.agg_level,
                 "vmin": vmin,
                 "vmax": vmax,
                 "eb_ratio": ratio,
-                "entropy_coder": "rans",
                 "checkpoint_hash": self.checkpoint_hash.hex(),
             }
             if edges is not None:
                 meta["chunks"] = list(edges)
-                meta["chunk_batch"] = int(chunk_batch)
                 meta["m_tile"] = int(_gp._M_TILE)  # replay the exact float path
                 meta["fp16"] = bool(self.fp16)
                 meta["compiled"] = bool(use_compile)
@@ -1002,16 +974,7 @@ class GNNCompressorCodec:
                 # ponytail: JSON list of one small int per chunk-stage; pack to
                 # base64 bytes if header size ever matters at huge chunk counts
                 meta["gates"] = gates
-            stream = _write_stream(
-                meta,
-                payload,
-                self.zstd_level,
-                _VERSION
-                if edges is None
-                else _VERSION_GATED
-                if gates is not None
-                else _VERSION_CHUNKED,
-            )
+            stream = _write_stream(meta, payload, self.zstd_level)
             candidates.append((len(stream), stream))
         return min(candidates, key=lambda item: item[0])[1]
 
@@ -1020,15 +983,13 @@ class GNNCompressorCodec:
         import torch
 
         meta, payload = _read_stream(bytes(stream))
-        if meta.get("codec") != "deepsz.gnn":
-            raise ValueError("not a DeepSZ GNN tensor stream")
-        got_hash = meta.get("checkpoint_hash")
+        got_hash = meta["checkpoint_hash"]
         if self.strict_checkpoint and got_hash != self.checkpoint_hash.hex():
             raise ValueError("checkpoint hash differs from the stream metadata")
 
-        shape = tuple(int(n) for n in meta["coded_shape"])
         original_shape = tuple(int(n) for n in meta["shape"])
-        dtype = np.dtype(meta["dtype"]["str"])
+        shape = original_shape or (1,)
+        dtype = np.dtype(meta["dtype"])
         vmin = float(meta["vmin"])
         vmax = float(meta["vmax"])
         if vmax <= vmin:
@@ -1037,16 +998,18 @@ class GNNCompressorCodec:
         if "chunks" in meta:
             edges = tuple(int(e) for e in meta["chunks"])
             predictor = self._chunked_predictor(vmin, vmax, meta)
+            levels = int(meta["levels"])
+            anchor_stride = 1 << levels
             ebs = _chunk_stage_ebs(
                 shape,
-                int(meta["levels"]),
-                int(meta["anchor_stride"]),
-                int(meta["anchor_block"]),
+                levels,
+                anchor_stride,
+                _ANCHOR_BLOCK,
                 float(meta["error_bound"]),
                 float(meta["eb_ratio"]),
             )
             saved_tile = _gp._M_TILE
-            _gp._M_TILE = int(meta.get("m_tile", saved_tile))  # match encode path
+            _gp._M_TILE = int(meta["m_tile"])  # match encode path
             try:
                 values = _decompress_chunked(
                     payload,
@@ -1055,7 +1018,6 @@ class GNNCompressorCodec:
                     int(meta["radius"]),
                     predictor,
                     edges,
-                    int(meta.get("chunk_batch", 1)),
                     gates=meta.get("gates"),
                 )
             finally:
@@ -1064,23 +1026,24 @@ class GNNCompressorCodec:
             return torch.as_tensor(out)
 
         predictor = self._predictor(vmin, vmax, meta)
+        levels = int(meta["levels"])
+        anchor_stride = 1 << levels
         masks = stage_masks(
             shape,
-            int(meta["levels"]),
-            int(meta["anchor_stride"]),
-            int(meta["anchor_block"]),
+            levels,
+            anchor_stride,
+            _ANCHOR_BLOCK,
         )
         ebs = stage_ebs(
             shape,
-            int(meta["levels"]),
-            int(meta["anchor_stride"]),
-            int(meta["anchor_block"]),
+            levels,
+            anchor_stride,
+            _ANCHOR_BLOCK,
             float(meta["error_bound"]),
             float(meta["eb_ratio"]),
         )
-        use_rans = meta.get("entropy_coder", "huffman") == "rans"
         values = _decompress_region(
-            payload, shape, masks, ebs, int(meta["radius"]), predictor, use_rans
+            payload, shape, masks, ebs, int(meta["radius"]), predictor, True
         )
         out = _restore_dtype(values.reshape(original_shape), dtype)
         return torch.as_tensor(out)
@@ -1098,13 +1061,13 @@ class GNNCompressorCodec:
     ) -> bytes:
         predictor = self._predictor(vmin, vmax)
         masks = stage_masks(
-            values.shape, self.levels, self.anchor_stride, self.anchor_block
+            values.shape, self.levels, self.anchor_stride, _ANCHOR_BLOCK
         )
         ebs = stage_ebs(
             values.shape,
             self.levels,
             self.anchor_stride,
-            self.anchor_block,
+            _ANCHOR_BLOCK,
             eb,
             eb_ratio,
         )
@@ -1130,14 +1093,14 @@ class GNNCompressorCodec:
         eb_ratio: float,
         edges: tuple[int, ...],
         use_compile: bool,
-    ) -> bytes:
+    ) -> tuple[bytes, list[int] | None]:
         predictor = self._chunked_predictor(vmin, vmax)
         predictor.compile = bool(use_compile)
         ebs = _chunk_stage_ebs(
             values.shape,
             self.levels,
             self.anchor_stride,
-            self.anchor_block,
+            _ANCHOR_BLOCK,
             eb,
             eb_ratio,
         )
@@ -1148,11 +1111,9 @@ class GNNCompressorCodec:
             dtype.kind in "bi",
             predictor,
             edges,
-            self.chunk_batch,
-            overlap=self.overlap,
             gate=self.gate,
         )
-        return payload, int(predictor.chunk_batch), gates
+        return payload, gates
 
     def _chunked_predictor(
         self,
@@ -1161,10 +1122,7 @@ class GNNCompressorCodec:
         meta: dict[str, Any] | None = None,
     ) -> ChunkedGNNPredictor:
         levels = self.levels if meta is None else int(meta["levels"])
-        anchor_stride = (
-            self.anchor_stride if meta is None else int(meta["anchor_stride"])
-        )
-        anchor_block = self.anchor_block if meta is None else int(meta["anchor_block"])
+        anchor_stride = 1 << levels
         agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
         predictor = ChunkedGNNPredictor(
             self.checkpoint_path,
@@ -1173,13 +1131,13 @@ class GNNCompressorCodec:
             device=self.device,
             levels=levels,
             anchor_stride=anchor_stride,
-            anchor_block=anchor_block,
+            anchor_block=_ANCHOR_BLOCK,
             agg_level=agg_level,
         )
         # encode: from the codec flag; decode: replay the stream's float path
-        predictor.fp16 = self.fp16 if meta is None else bool(meta.get("fp16", False))
+        predictor.fp16 = self.fp16 if meta is None else bool(meta["fp16"])
         predictor.compile = (
-            self.compile if meta is None else bool(meta.get("compiled", False))
+            self.compile if meta is None else bool(meta["compiled"])
         )
         return predictor
 
@@ -1190,21 +1148,17 @@ class GNNCompressorCodec:
         meta: dict[str, Any] | None = None,
     ) -> GNNPredictor:
         levels = self.levels if meta is None else int(meta["levels"])
-        anchor_stride = (
-            self.anchor_stride if meta is None else int(meta["anchor_stride"])
-        )
-        anchor_block = self.anchor_block if meta is None else int(meta["anchor_block"])
-        max_radius = self.max_radius if meta is None else int(meta["max_radius"])
+        anchor_stride = 1 << levels
         agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
         return GNNPredictor(
             self.checkpoint_path,
             vmin,
             vmax,
-            max_radius=max_radius,
+            max_radius=anchor_stride,
             device=self.device,
             levels=levels,
             anchor_stride=anchor_stride,
-            anchor_block=anchor_block,
+            anchor_block=_ANCHOR_BLOCK,
             agg_level=agg_level,
         )
 

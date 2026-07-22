@@ -17,16 +17,16 @@ module load pytorch-gpu
 export PYTHONUNBUFFERED=1
 
 : "${CKPT:?Set CKPT to a GNN checkpoint before running this launcher}"
+DATA=${DATA:-./data/rti_normal.npy}
 
 # Operator-level trace of one worst-case chunk's GNN forward: shows which ops
 # (matmul/gelu/softmax/index/copy...) dominate CUDA time -> what to optimize.
-python scripts/profile_gnn.py \
+python scripts/profile_chunked_tensor.py "$DATA" \
     --gnn-checkpoint "$CKPT" \
+    --device cuda \
     --levels 4 \
-    --anchor-stride 16 \
-    --profile \
-    --profile-batch 1 \
-    --profile-rows 30 \
+    --chunk-size 16 \
+    --row-limit 30 \
     --fp16 \
     --compile \
     "$@"

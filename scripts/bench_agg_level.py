@@ -111,8 +111,6 @@ def parse_args(argv=None):
     ap.add_argument("--shape", type=int, nargs="+", default=(32, 32, 32, 32))
     ap.add_argument("--eb", type=float, default=1e-2)
     ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
-    ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--d", type=int, default=32, help="model width (random ckpt)")
     ap.add_argument("--checkpoint", default=None,
@@ -159,8 +157,9 @@ def main(argv=None):
     x = synth_field(shape, args.seed)
     values = x[None, ...].astype(np.float32)
     vmin, vmax = float(values.min()), float(values.max())
-    masks = stage_masks(shape, args.levels, args.anchor_stride, args.anchor_block)
-    ebs = stage_ebs(shape, args.levels, args.anchor_stride, args.anchor_block,
+    anchor_stride = 1 << args.levels
+    masks = stage_masks(shape, args.levels, anchor_stride, 1)
+    ebs = stage_ebs(shape, args.levels, anchor_stride, 1,
                     args.eb, 1.0)
 
     tested = args.levels_to_test or list(range(1, ndim + 1))
@@ -175,8 +174,8 @@ def main(argv=None):
         n_lines = len(half_directions(ndim, lvl))
         predictor = GNNPredictor(
             ckpt, vmin, vmax, max_radius=64, device=device,
-            levels=args.levels, anchor_stride=args.anchor_stride,
-            anchor_block=args.anchor_block, agg_level=lvl)
+            levels=args.levels, anchor_stride=anchor_stride,
+            anchor_block=1, agg_level=lvl)
         for _ in range(args.warmup):
             closed_loop_ms(values, predictor, masks, ebs, args.radius, device)
         samples = [closed_loop_ms(values, predictor, masks, ebs, args.radius, device)
@@ -186,8 +185,8 @@ def main(argv=None):
     # Reference: the full neighbourhood (agg_level=None) is the current default.
     ref_predictor = GNNPredictor(
         ckpt, vmin, vmax, max_radius=64, device=device,
-        levels=args.levels, anchor_stride=args.anchor_stride,
-        anchor_block=args.anchor_block, agg_level=None)
+        levels=args.levels, anchor_stride=anchor_stride,
+        anchor_block=1, agg_level=None)
     for _ in range(args.warmup):
         closed_loop_ms(values, ref_predictor, masks, ebs, args.radius, device)
     ref_samples = [closed_loop_ms(values, ref_predictor, masks, ebs, args.radius, device)
@@ -214,7 +213,6 @@ def main(argv=None):
     for lvl in tested + [None]:
         codec = GNNCompressorCodec(
             ckpt, error_bound=args.eb, levels=args.levels,
-            anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
             agg_level=lvl, radius=args.radius, chunk_size=0,
             strict_checkpoint=False, device=device)
         stream = codec.compress(x)
