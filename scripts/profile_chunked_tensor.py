@@ -64,7 +64,6 @@ def main(argv=None):
     ap.add_argument("--levels", type=int, default=4)
     ap.add_argument("--anchor-stride", type=int, default=16)
     ap.add_argument("--anchor-block", type=int, default=1)
-    ap.add_argument("--agg-level", type=int, default=None)
     ap.add_argument("--chunk-size", type=int, default=None,
                     help="chunk edge (multiple of anchor-stride); 0 = whole-tensor")
     ap.add_argument("--chunk-batch", type=int, default=None)
@@ -112,7 +111,7 @@ def main(argv=None):
         return GNNCompressorCodec(
             args.gnn_checkpoint, error_bound=eb, levels=args.levels,
             anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
-            agg_level=args.agg_level, radius=args.radius,
+            radius=args.radius,
             zstd_level=args.zstd_level, eb_ratio=args.eb_ratio, tune="fast",
             chunk_size=args.chunk_size, chunk_batch=args.chunk_batch,
             fp16=args.fp16, compile=args.compile, overlap=args.overlap,
@@ -190,7 +189,7 @@ def main(argv=None):
     total = timed["t_step"]
     print(f"\ntensor {args.input} {arr.shape} {arr.dtype}  eb={eb}")
     print(f"chunk-size={args.chunk_size} chunk-batch={args.chunk_batch} "
-          f"agg-level={args.agg_level} fp16={args.fp16} compile={args.compile} "
+          f"fp16={args.fp16} compile={args.compile} "
           f"overlap={args.overlap} device={args.device}")
     print(f"single chunk-step (after {args.warmup} warm-up steps): "
           f"{1000*total:.2f}ms  (wall; kineto adds overhead below)")

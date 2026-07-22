@@ -16,6 +16,7 @@ def tiny_checkpoint(tmp_path):
     path = tmp_path / "gnn.pt"
     torch.save({
         "d": model.d,
+        "agg_level": 2,
         "state_dict": model.state_dict(),
         "version": CKPT_VERSION,
     }, path)
@@ -43,7 +44,6 @@ def test_defaults_match_eval_tensor(tiny_checkpoint):
     assert codec.levels == 5
     assert codec.anchor_stride == 32
     assert codec.anchor_block == 1
-    assert codec.agg_level == 2
     assert codec.chunk_size is None
     assert codec.chunk_batch is None
     assert codec.fp16 is False

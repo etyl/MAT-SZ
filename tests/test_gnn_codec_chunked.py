@@ -31,7 +31,7 @@ def v5_ckpt(tmp_path):
     torch.manual_seed(0)
     model = build_model(d=8).eval()
     path = tmp_path / "gnn_v5.pt"
-    torch.save({"d": model.d, "state_dict": model.state_dict(),
+    torch.save({"d": model.d, "agg_level": 2, "state_dict": model.state_dict(),
                 "version": CKPT_VERSION}, path)
     return path
 

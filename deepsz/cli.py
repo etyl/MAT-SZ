@@ -55,9 +55,7 @@ def build_predictor(args, header: Header):
                         max_radius=header.max_radius,
                         levels=header.levels,
                         anchor_stride=header.anchor_stride,
-                        anchor_block=header.anchor_block,
-                        agg_level=(None if header.agg_level < 0
-                                   else header.agg_level))
+                        anchor_block=header.anchor_block)
     pred.fp16 = bool(header.flags & FLAG_FP16)
     pred.compile = bool(header.flags & FLAG_COMPILED)
     if pred.checkpoint_hash != header.ckpt_hash:
@@ -74,13 +72,6 @@ def add_common(ap):
     ap.add_argument("--levels", type=int, default=4)
     ap.add_argument("--anchor-stride", type=int, default=16)
     ap.add_argument("--anchor-block", type=int, default=1)
-    ap.add_argument("--agg-level", type=int, default=None,
-                    help="gnn only: neighbourhood aggregation level -- cap on the "
-                         "L1 length of neighbour lines. 1 = axis-aligned direct "
-                         "neighbours only; 2 = +2-axis diagonals; omit = full "
-                         "neighbourhood. Lower is faster in high dimensions (the "
-                         "line count is (3^ndim-1)/2 at full). Frozen into the "
-                         "stream so decode matches")
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--zstd-level", type=int, default=9)
     ap.add_argument("--eb-ratio", type=float, default=None,
@@ -115,8 +106,7 @@ def run_compress(img: np.ndarray, args) -> tuple[bytes, dict]:
                                  float(img.max()),
                                  levels=args.levels,
                                  anchor_stride=args.anchor_stride,
-                                 anchor_block=args.anchor_block,
-                                 agg_level=args.agg_level)
+                                 anchor_block=args.anchor_block)
     return compress(img, eb, predictor, levels=args.levels,
                     anchor_stride=args.anchor_stride,
                     anchor_block=args.anchor_block, radius=args.radius,

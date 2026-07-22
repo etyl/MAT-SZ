@@ -423,7 +423,7 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
     from deepsz.gnn_codec import GNNCompressorCodec
 
     torch.save({"state_dict": model.state_dict(), "d": d,
-                "version": CKPT_VERSION}, ckpt_path)
+                "agg_level": args.agg_level, "version": CKPT_VERSION}, ckpt_path)
     # compile=False: each eval loads a fresh model instance, so compiling here
     # recompiles from scratch every 500 steps and (under
     # DEEPSZ_COMPILE_MODE=reduce-overhead) allocates CUDA-graph pools sized by
@@ -432,8 +432,7 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
     codec = GNNCompressorCodec(
         ckpt_path, error_bound=eb, levels=(args.levels or 4),
         anchor_stride=(args.stride or 16), max_radius=args.max_radius,
-        device=str(device), agg_level=args.agg_level,
-        fp16=args.fp16, compile=False)
+        device=str(device), fp16=args.fp16, compile=False)
 
     base_gpu = 0
     if device.type == "cuda":
@@ -808,7 +807,7 @@ def main():
               f"correlation={tuple(args.synthetic_correlation)}, "
               f"stride={args.synthetic_stride}")
 
-    model = build_model(args.d).to(device)
+    model = build_model(args.d, args.agg_level).to(device)
     if args.compile:
         mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
         # dynamic=True is required: embed specializes on geom.M (per-stage
@@ -1023,6 +1022,7 @@ def main():
             torch.save({
                 "state_dict": model.state_dict(),
                 "d": args.d,
+                "agg_level": args.agg_level,
                 "version": CKPT_VERSION,
             }, checkpoint)
             last_saved_step = step
@@ -1055,6 +1055,7 @@ def main():
     torch.save({
         "state_dict": model.state_dict(),
         "d": args.d,
+        "agg_level": args.agg_level,
         "version": CKPT_VERSION,
     }, out)
     print(f"saved {out}")

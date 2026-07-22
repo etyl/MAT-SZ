@@ -239,7 +239,6 @@ def main(argv=None):
     ap.add_argument("--levels", type=int, default=5)
     ap.add_argument("--anchor-stride", type=int, default=32)
     ap.add_argument("--anchor-block", type=int, default=1)
-    ap.add_argument("--agg-level", type=int, default=1)
     ap.add_argument("--chunk-size", type=int, default=32)
     ap.add_argument("--chunk-batch", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
@@ -283,7 +282,7 @@ def main(argv=None):
     codec = GNNCompressorCodec(
         args.gnn_checkpoint, error_bound=eb, levels=args.levels,
         anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
-        agg_level=args.agg_level, radius=args.radius, zstd_level=args.zstd_level,
+        radius=args.radius, zstd_level=args.zstd_level,
         eb_ratio=args.eb_ratio, tune=args.tune, chunk_size=args.chunk_size,
         chunk_batch=args.chunk_batch, fp16=args.fp16, compile=args.compile,
         overlap=args.overlap, device=device)
@@ -340,8 +339,8 @@ def main(argv=None):
     print(f"{'input':<{w}} {args.input} {tuple(sub.shape)} "
           f"({sub.size} voxels, {orig_bytes} B)")
     print(f"{'eb':<{w}} {eb:g}   device {device}")
-    print(f"{'levels/stride/agg':<{w}} {args.levels}/{args.anchor_stride}/"
-          f"{args.agg_level}   chunk {args.chunk_size} batch {args.chunk_batch} "
+    print(f"{'levels/stride':<{w}} {args.levels}/{args.anchor_stride}"
+          f"   chunk {args.chunk_size} batch {args.chunk_batch} "
           f"tune {args.tune} fp16 {args.fp16} compile {args.compile}")
     print("-" * 60)
     print(f"{'PSNR':<{w}} {psnr:8.3f} dB")

@@ -363,8 +363,10 @@ def run_interp(field, stats):
 
 def run_gnn(field, stats, skel):
     from deepsz.gnn_codec import GNNCompressorCodec
+    # agg_level is now frozen into the checkpoint (see build_model); AGG only
+    # documents which checkpoint this bench expects to be run against.
     kw = dict(error_bound=EB, levels=LEVELS, anchor_stride=STRIDE,
-              anchor_block=BLOCK, agg_level=AGG, chunk_size=CHUNK,
+              anchor_block=BLOCK, chunk_size=CHUNK,
               tune=TUNE, fp16=FP16, compile=False)
     codec = None
     try:

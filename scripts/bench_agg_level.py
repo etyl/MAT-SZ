@@ -16,9 +16,10 @@ use the same level, so prediction stays bit-identical).
 
     python scripts/bench_agg_level.py --shape 32 32 32 32 --eb 1e-2
 
-With a real checkpoint the numbers are representative; with none, a random v5
-model is used (inference *time* is a function of the architecture and shapes,
-not the weights, so the speed-up measurement is valid either way).
+The aggregation level is baked into the checkpoint (it sizes the model), so the
+sweep builds one random model per level; inference *time* is a function of the
+architecture and shapes, not the weights, so the speed-up measurement is valid.
+A real --checkpoint bakes exactly one level and is benched only at that level.
 """
 
 from __future__ import annotations
@@ -116,7 +117,8 @@ def parse_args(argv=None):
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--d", type=int, default=32, help="model width (random ckpt)")
     ap.add_argument("--checkpoint", default=None,
-                    help="real v5 checkpoint (default: random weights)")
+                    help="real checkpoint; benched only at its baked agg level "
+                         "(default: per-level random weights)")
     ap.add_argument("--device", default=None)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=3)
@@ -149,12 +151,23 @@ def main(argv=None):
     ndim = len(shape)
     torch.manual_seed(args.seed)
 
-    ckpt = args.checkpoint
-    if ckpt is None:
-        model = build_model(d=args.d).eval()
-        ckpt = str(Path(tempfile.mkdtemp()) / "gnn_random.pt")
-        torch.save({"d": args.d, "state_dict": model.state_dict(),
-                    "version": CKPT_VERSION}, ckpt)
+    # The aggregation level is now baked into the checkpoint (it sizes the
+    # model's direction-state table), so each level needs its own checkpoint.
+    # Timing is weight-independent, so the sweep uses per-level random models;
+    # a real --checkpoint bakes exactly one level and is benched only there.
+    tmpdir = tempfile.mkdtemp()
+    ckpt_for: dict[int, str] = {}
+
+    def ckpt_for_level(lvl: int) -> str:
+        path = ckpt_for.get(lvl)
+        if path is None:
+            model = build_model(d=args.d, agg_level=lvl).eval()
+            path = str(Path(tmpdir) / f"gnn_random_agg{lvl}.pt")
+            torch.save({"d": args.d, "agg_level": lvl,
+                        "state_dict": model.state_dict(),
+                        "version": CKPT_VERSION}, path)
+            ckpt_for[lvl] = path
+        return path
 
     x = synth_field(shape, args.seed)
     values = x[None, ...].astype(np.float32)
@@ -164,30 +177,39 @@ def main(argv=None):
                     args.eb, 1.0)
 
     tested = args.levels_to_test or list(range(1, ndim + 1))
-    full_lines = len(half_directions(ndim))
+    ref_level = ndim                            # full neighbourhood
+    if args.checkpoint is not None:
+        # A trained checkpoint bakes exactly one aggregation level, so a real
+        # checkpoint can only be benched at its own level.
+        baked = int(torch.load(args.checkpoint, map_location="cpu",
+                               weights_only=True)["agg_level"])
+        ckpt_for[baked] = args.checkpoint
+        tested = [baked]
+        ref_level = baked
+    full_lines = len(half_directions(ndim, ref_level))
     print(f"tensor {shape} ({x.size/1e6:.2f}M points) | ndim={ndim} | device={device} "
           f"| eb={args.eb} | rANS: {backend}")
-    print(f"full neighbourhood = {full_lines} lines per point "
-          f"((3^{ndim}-1)/2); m_tile={args.m_tile}\n")
+    print(f"reference (agg {ref_level}) = {full_lines} lines per point; "
+          f"m_tile={args.m_tile}\n")
 
     rows = []
     for lvl in tested:
         n_lines = len(half_directions(ndim, lvl))
         predictor = GNNPredictor(
-            ckpt, vmin, vmax, max_radius=64, device=device,
+            ckpt_for_level(lvl), vmin, vmax, max_radius=64, device=device,
             levels=args.levels, anchor_stride=args.anchor_stride,
-            anchor_block=args.anchor_block, agg_level=lvl)
+            anchor_block=args.anchor_block)
         for _ in range(args.warmup):
             closed_loop_ms(values, predictor, masks, ebs, args.radius, device)
         samples = [closed_loop_ms(values, predictor, masks, ebs, args.radius, device)
                    for _ in range(args.repeats)]
         rows.append((lvl, n_lines, statistics.median(samples), min(samples)))
 
-    # Reference: the full neighbourhood (agg_level=None) is the current default.
+    # Reference: the full neighbourhood (agg_level == ndim).
     ref_predictor = GNNPredictor(
-        ckpt, vmin, vmax, max_radius=64, device=device,
+        ckpt_for_level(ref_level), vmin, vmax, max_radius=64, device=device,
         levels=args.levels, anchor_stride=args.anchor_stride,
-        anchor_block=args.anchor_block, agg_level=None)
+        anchor_block=args.anchor_block)
     for _ in range(args.warmup):
         closed_loop_ms(values, ref_predictor, masks, ebs, args.radius, device)
     ref_samples = [closed_loop_ms(values, ref_predictor, masks, ebs, args.radius, device)
@@ -199,7 +221,7 @@ def main(argv=None):
     for lvl, n_lines, med, mn in rows:
         print(f"{lvl:>10} {n_lines:>7} {100*n_lines/full_lines:>6.0f}% "
               f"{med:>10.1f}ms {mn:>10.1f}ms {ref_ms/med:>8.2f}x")
-    print(f"{'full/None':>10} {full_lines:>7} {'100%':>7} "
+    print(f"{f'ref/{ref_level}':>10} {full_lines:>7} {'100%':>7} "
           f"{ref_ms:>10.1f}ms {min(ref_samples):>10.1f}ms {1.0:>8.2f}x")
 
     if args.no_roundtrip:
@@ -211,16 +233,16 @@ def main(argv=None):
     print("\nCodec roundtrip error-bound check (whole-tensor path):")
     from deepsz.gnn_codec import GNNCompressorCodec
 
-    for lvl in tested + [None]:
+    for lvl in sorted(set(tested) | {ref_level}):
         codec = GNNCompressorCodec(
-            ckpt, error_bound=args.eb, levels=args.levels,
+            ckpt_for_level(lvl), error_bound=args.eb, levels=args.levels,
             anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
-            agg_level=lvl, radius=args.radius, chunk_size=0,
+            radius=args.radius, chunk_size=0,
             strict_checkpoint=False, device=device)
         stream = codec.compress(x)
         rec = codec.uncompress(stream).numpy().reshape(x.shape)
         max_err = float(np.abs(x.astype(np.float64) - rec.astype(np.float64)).max())
-        tag = "full" if lvl is None else f"level {lvl}"
+        tag = f"level {lvl}"
         print(f"  {tag:>8}: max|err| = {max_err:.3e}  "
               f"({'PASS' if max_err <= args.eb + 1e-6 else 'FAIL'} <= {args.eb})")
 

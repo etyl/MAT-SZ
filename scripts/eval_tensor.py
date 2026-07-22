@@ -121,7 +121,6 @@ def main(argv=None):
         codec = GNNCompressorCodec(
             args.gnn_checkpoint, error_bound=eb, levels=args.levels,
             anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
-            agg_level=args.agg_level,
             radius=args.radius, zstd_level=args.zstd_level,
             eb_ratio=args.eb_ratio,
             tune=args.tune if args.tune in ("fast", "size") else "fast",
