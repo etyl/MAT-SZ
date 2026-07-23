@@ -38,8 +38,10 @@ LUMA = np.array([0.299, 0.587, 0.114])
 # SZ3-style multilevel spline interpolation
 # ---------------------------------------------------------------------------
 
-def _pred_block(O: np.ndarray, axis: int, main: np.ndarray, other: np.ndarray,
-                s: int, cubic: bool) -> np.ndarray:
+
+def _pred_block(
+    O: np.ndarray, axis: int, main: np.ndarray, other: np.ndarray, s: int, cubic: bool
+) -> np.ndarray:
     """Predict the grid block (varying `main` along `axis`, fixed `other` on the
     orthogonal axis) by 1-D interpolation from the ORIGINAL field `O` at offsets
     +-s (linear) and +-3s (cubic) along `axis`. Points missing the full cubic
@@ -50,23 +52,25 @@ def _pred_block(O: np.ndarray, axis: int, main: np.ndarray, other: np.ndarray,
         idx = np.clip(main + off, 0, n - 1)
         return O[np.ix_(idx, other)] if axis == 0 else O[np.ix_(other, idx)]
 
-    def col(mask: np.ndarray) -> np.ndarray:            # broadcast along `main`
+    def col(mask: np.ndarray) -> np.ndarray:  # broadcast along `main`
         return mask[:, None] if axis == 0 else mask[None, :]
 
     left = gather(-s)
     lin = 0.5 * (left + gather(+s))
-    out = np.where(col(main + s < n), lin, left)        # copy left at far border
+    out = np.where(col(main + s < n), lin, left)  # copy left at far border
 
     if cubic:
         ok = (main - 3 * s >= 0) & (main + 3 * s < n)
-        cub = (-gather(-3 * s) + 9 * gather(-s)
-               + 9 * gather(+s) - gather(+3 * s)) / 16.0
+        cub = (
+            -gather(-3 * s) + 9 * gather(-s) + 9 * gather(+s) - gather(+3 * s)
+        ) / 16.0
         out = np.where(col(ok), cub, out)
     return out
 
 
-def sz_interp(field: np.ndarray, cubic: bool = True,
-              coarsest: int | None = None) -> np.ndarray:
+def sz_interp(
+    field: np.ndarray, cubic: bool = True, coarsest: int | None = None
+) -> np.ndarray:
     """SZ3 top-down dyadic spline interpolation of a 2-D field.
 
     Starting from stride L (the largest power of two below the image, or
@@ -79,7 +83,7 @@ def sz_interp(field: np.ndarray, cubic: bool = True,
     h, w = O.shape
 
     if coarsest is not None:
-        s = coarsest // 2                               # keep the coarse grid exact
+        s = coarsest // 2  # keep the coarse grid exact
     else:
         s = 1
         while s * 2 < max(h, w):
@@ -111,11 +115,13 @@ def sz_predict_rgb(img: np.ndarray, cubic: bool, coarsest: int | None) -> np.nda
 
 # ---------------------------------------------------------------------------
 
+
 def load_image(path: Path, gray: bool = False) -> np.ndarray:
     from PIL import Image
+
     im = Image.open(path)
     if gray:
-        return np.asarray(im.convert("L"))[..., None]   # (H, W, 1)
+        return np.asarray(im.convert("L"))[..., None]  # (H, W, 1)
     return np.asarray(im.convert("RGB"))
 
 
@@ -133,8 +139,9 @@ def residual_stats(res: np.ndarray) -> dict:
 
 def run_all(args):
     images = sorted(KODAK_DIR.glob("kodim*.png"))
-    print(f"{'image':<12}{'MAE':>8}{'std':>8}{'max':>8}"
-          f"{'%<=1':>8}{'%<=2':>8}{'%<=4':>8}")
+    print(
+        f"{'image':<12}{'MAE':>8}{'std':>8}{'max':>8}{'%<=1':>8}{'%<=2':>8}{'%<=4':>8}"
+    )
     print("-" * 60)
     maes = []
     for p in images:
@@ -143,8 +150,10 @@ def run_all(args):
         res = img - pred
         s = residual_stats(res)
         maes.append(s["mae"])
-        print(f"{p.name:<12}{s['mae']:8.3f}{s['std']:8.3f}{s['max']:8.0f}"
-              f"{s['p_le1']:8.1f}{s['p_le2']:8.1f}{s['p_le4']:8.1f}")
+        print(
+            f"{p.name:<12}{s['mae']:8.3f}{s['std']:8.3f}{s['max']:8.0f}"
+            f"{s['p_le1']:8.1f}{s['p_le2']:8.1f}{s['p_le4']:8.1f}"
+        )
     print("-" * 60)
     anchor = f"anchor grid {args.stride}" if args.stride else "full pyramid"
     print(f"{'MEAN':<12}{np.mean(maes):8.3f}   (interp={args.interp}, {anchor})")
@@ -162,12 +171,12 @@ def run_one(args):
     res = img - pred
 
     if args.gray:
-        res_luma = res[..., 0]                       # single channel
+        res_luma = res[..., 0]  # single channel
         show_img = img[..., 0]
         show_pred = np.clip(pred[..., 0], 0, 255)
         show_kw = dict(cmap="gray", vmin=0, vmax=255)
     else:
-        res_luma = res @ LUMA                        # signed luminance residual
+        res_luma = res @ LUMA  # signed luminance residual
         show_img = img.astype(np.uint8)
         show_pred = np.clip(pred, 0, 255).astype(np.uint8)
         show_kw = {}
@@ -184,13 +193,13 @@ def run_one(args):
     ax[0, 1].imshow(show_pred, **show_kw)
     ax[0, 1].set_title(f"SZ prediction  ({args.interp} interp, {anchor})")
 
-    im = ax[1, 0].imshow(res_luma, cmap="RdBu_r",
-                         norm=TwoSlopeNorm(0.0, -vlim, vlim))
+    im = ax[1, 0].imshow(res_luma, cmap="RdBu_r", norm=TwoSlopeNorm(0.0, -vlim, vlim))
     ax[1, 0].set_title(f"Residual ({'gray' if args.gray else 'luma'}, signed)")
     fig.colorbar(im, ax=ax[1, 0], fraction=0.046, pad=0.04)
 
     for a in ax.flat[:3]:
-        a.set_xticks([]); a.set_yticks([])
+        a.set_xticks([])
+        a.set_yticks([])
 
     hb = ax[1, 1]
     hb.hist(res.ravel(), bins=201, range=(-40, 40), color="steelblue")
@@ -198,13 +207,19 @@ def run_one(args):
     hb.set_xlabel("residual (0-255 scale)")
     hb.set_ylabel("count (log)")
     hb.set_title("Residual histogram" + ("" if args.gray else " (all channels)"))
-    hb.text(0.02, 0.95,
-            f"MAE={stats['mae']:.2f}\nstd={stats['std']:.2f}\n"
-            f"max={stats['max']:.0f}\n"
-            f"|r|<=1: {stats['p_le1']:.1f}%\n"
-            f"|r|<=2: {stats['p_le2']:.1f}%\n"
-            f"|r|<=4: {stats['p_le4']:.1f}%",
-            transform=hb.transAxes, va="top", family="monospace", fontsize=9)
+    hb.text(
+        0.02,
+        0.95,
+        f"MAE={stats['mae']:.2f}\nstd={stats['std']:.2f}\n"
+        f"max={stats['max']:.0f}\n"
+        f"|r|<=1: {stats['p_le1']:.1f}%\n"
+        f"|r|<=2: {stats['p_le2']:.1f}%\n"
+        f"|r|<=4: {stats['p_le4']:.1f}%",
+        transform=hb.transAxes,
+        va="top",
+        family="monospace",
+        fontsize=9,
+    )
 
     fig.suptitle("SZ3 interpolation-predictor residuals", fontsize=14)
     plt.tight_layout()
@@ -214,25 +229,39 @@ def run_one(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--image", type=int, default=23, help="kodak image index 1-24")
-    ap.add_argument("--stride", type=int, default=0,
-                    help="cap the coarsest anchor grid at this stride (power of two); "
-                         "0 = full top-down pyramid (single anchor, SZ3 default)")
+    ap.add_argument(
+        "--stride",
+        type=int,
+        default=0,
+        help="cap the coarsest anchor grid at this stride (power of two); "
+        "0 = full top-down pyramid (single anchor, SZ3 default)",
+    )
     ap.add_argument("--interp", choices=["cubic", "linear"], default="cubic")
-    ap.add_argument("--gray", action="store_true",
-                    help="convert to grayscale (single luma channel) before predicting")
-    ap.add_argument("--all", action="store_true",
-                    help="print residual stats over all 24 images instead of plotting")
+    ap.add_argument(
+        "--gray",
+        action="store_true",
+        help="convert to grayscale (single luma channel) before predicting",
+    )
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="print residual stats over all 24 images instead of plotting",
+    )
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
     if args.output is None:
-        args.output = str(ROOT / "data" /
-                          ("sz_residuals_gray.png" if args.gray else "sz_residuals.png"))
+        args.output = str(
+            ROOT
+            / "data"
+            / ("sz_residuals_gray.png" if args.gray else "sz_residuals.png")
+        )
     if args.stride & (args.stride - 1):
         sys.exit("--stride must be a power of two")
-    args.stride = args.stride or None       # 0 -> full pyramid
+    args.stride = args.stride or None  # 0 -> full pyramid
     run_all(args) if args.all else run_one(args)
 
 

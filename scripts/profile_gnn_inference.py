@@ -29,31 +29,46 @@ from deepsz.quantizer import dequantize, quantize
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--checkpoint", required=True, help="versioned GNN checkpoint")
     ap.add_argument("--input", type=Path, help="image or .npy input")
-    ap.add_argument("--shape", type=int, nargs="+", default=(128, 128),
-                    help="synthetic spatial shape when --input is omitted")
-    ap.add_argument("--eb", type=float, default=0.01,
-                    help="absolute error bound in input units")
-    ap.add_argument("--device", help="cpu, cuda, or cuda:N (default: CUDA if available)")
-    ap.add_argument("--mode", choices=("predictor", "codec"), default="predictor",
-                    help="profile staged prediction or the complete image codec")
+    ap.add_argument(
+        "--shape",
+        type=int,
+        nargs="+",
+        default=(128, 128),
+        help="synthetic spatial shape when --input is omitted",
+    )
+    ap.add_argument(
+        "--eb", type=float, default=0.01, help="absolute error bound in input units"
+    )
+    ap.add_argument(
+        "--device", help="cpu, cuda, or cuda:N (default: CUDA if available)"
+    )
+    ap.add_argument(
+        "--mode",
+        choices=("predictor", "codec"),
+        default="predictor",
+        help="profile staged prediction or the complete image codec",
+    )
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--repeats", type=int, default=5)
     ap.add_argument("--levels", type=int, default=4)
     ap.add_argument("--anchor-stride", type=int, default=16)
     ap.add_argument("--anchor-block", type=int, default=1)
-    ap.add_argument("--max-radius", type=int, default=64,
-                    help="maximum GNN neighbour radius")
-    ap.add_argument("--radius", type=int, default=1 << 15,
-                    help="quantizer radius")
+    ap.add_argument(
+        "--max-radius", type=int, default=64, help="maximum GNN neighbour radius"
+    )
+    ap.add_argument("--radius", type=int, default=1 << 15, help="quantizer radius")
     ap.add_argument("--threads", type=int, help="PyTorch CPU thread count")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--profile", action="store_true",
-                    help="print a torch.profiler operator table")
-    ap.add_argument("--trace", type=Path,
-                    help="write a Chrome profiler trace (implies --profile)")
+    ap.add_argument(
+        "--profile", action="store_true", help="print a torch.profiler operator table"
+    )
+    ap.add_argument(
+        "--trace", type=Path, help="write a Chrome profiler trace (implies --profile)"
+    )
     ap.add_argument("--profile-rows", type=int, default=30)
     return ap.parse_args(argv)
 
@@ -89,10 +104,15 @@ def predictor_values(arr: np.ndarray) -> tuple[np.ndarray, tuple[int, ...]]:
 
 def make_predictor(args, vmin: float, vmax: float) -> GNNPredictor:
     return GNNPredictor(
-        args.checkpoint, vmin, vmax,
-        max_radius=args.max_radius, device=args.device,
-        levels=args.levels, anchor_stride=args.anchor_stride,
-        anchor_block=args.anchor_block)
+        args.checkpoint,
+        vmin,
+        vmax,
+        max_radius=args.max_radius,
+        device=args.device,
+        levels=args.levels,
+        anchor_stride=args.anchor_stride,
+        anchor_block=args.anchor_block,
+    )
 
 
 def synchronize(device: str) -> None:
@@ -102,8 +122,9 @@ def synchronize(device: str) -> None:
         torch.cuda.synchronize(device)
 
 
-def predictor_pass(values, predictor, masks, ebs, args, round_output=False,
-                   collect_stages=True):
+def predictor_pass(
+    values, predictor, masks, ebs, args, round_output=False, collect_stages=True
+):
     """Run the encoder's prediction/quantization feedback loop without coding."""
     import torch
 
@@ -126,10 +147,11 @@ def predictor_pass(values, predictor, masks, ebs, args, round_output=False,
             if collect_stages:
                 stage_ms.append((stage_idx, n, (time.perf_counter() - t0) * 1e3))
         codes, outliers = quantize(
-            values[:, pos], pred, eb, args.radius,
-            round_output=round_output)
-        recon[:, pos] = dequantize(
-            pred, codes, outliers, eb, args.radius).reshape(values.shape[0], n)
+            values[:, pos], pred, eb, args.radius, round_output=round_output
+        )
+        recon[:, pos] = dequantize(pred, codes, outliers, eb, args.radius).reshape(
+            values.shape[0], n
+        )
         known |= pos
     synchronize(args.device)
     return (time.perf_counter() - t_total) * 1e3, stage_ms
@@ -139,8 +161,10 @@ def summarize(name: str, samples: list[float]) -> None:
     mean = statistics.fmean(samples)
     median = statistics.median(samples)
     std = statistics.pstdev(samples) if len(samples) > 1 else 0.0
-    print(f"{name:<18} mean {mean:9.2f} ms | p50 {median:9.2f} ms | "
-          f"std {std:8.2f} ms | min {min(samples):9.2f} ms")
+    print(
+        f"{name:<18} mean {mean:9.2f} ms | p50 {median:9.2f} ms | "
+        f"std {std:8.2f} ms | min {min(samples):9.2f} ms"
+    )
 
 
 def run_predictor(args, arr):
@@ -150,18 +174,21 @@ def run_predictor(args, arr):
         vmax = vmin + 1.0
     predictor = make_predictor(args, vmin, vmax)
     masks = stage_masks(shape, args.levels, args.anchor_stride, args.anchor_block)
-    ebs = stage_ebs(shape, args.levels, args.anchor_stride, args.anchor_block,
-                    args.eb, 1.0)
+    ebs = stage_ebs(
+        shape, args.levels, args.anchor_stride, args.anchor_block, args.eb, 1.0
+    )
     round_output = np.issubdtype(arr.dtype, np.integer)
 
     for _ in range(args.warmup):
-        predictor_pass(values, predictor, masks, ebs, args, round_output,
-                       collect_stages=False)
+        predictor_pass(
+            values, predictor, masks, ebs, args, round_output, collect_stages=False
+        )
 
     totals, per_stage = [], {}
     for _ in range(args.repeats):
         total, stages = predictor_pass(
-            values, predictor, masks, ebs, args, round_output)
+            values, predictor, masks, ebs, args, round_output
+        )
         totals.append(total)
         for stage_idx, n, elapsed in stages:
             per_stage.setdefault((stage_idx, n), []).append(elapsed)
@@ -171,12 +198,13 @@ def run_predictor(args, arr):
     print("\nPer-stage prediction (mean across repeats)")
     print(f"{'stage':>7} {'values':>12} {'latency':>12}")
     for (stage_idx, n), samples in per_stage.items():
-        print(f"{stage_idx:>7} {n * values.shape[0]:>12,} "
-              f"{statistics.fmean(samples):>10.2f} ms")
+        print(
+            f"{stage_idx:>7} {n * values.shape[0]:>12,} "
+            f"{statistics.fmean(samples):>10.2f} ms"
+        )
 
     if args.profile or args.trace:
-        profile_predictor(
-            args, values, predictor, masks, ebs, round_output)
+        profile_predictor(args, values, predictor, masks, ebs, round_output)
 
 
 def profile_predictor(args, values, predictor, masks, ebs, round_output):
@@ -186,14 +214,17 @@ def profile_predictor(args, values, predictor, masks, ebs, round_output):
     if torch.device(args.device).type == "cuda":
         activities.append(torch.profiler.ProfilerActivity.CUDA)
     with torch.profiler.profile(
-            activities=activities, record_shapes=True,
-            profile_memory=True, with_stack=False) as prof:
-        predictor_pass(values, predictor, masks, ebs, args, round_output,
-                       collect_stages=False)
+        activities=activities, record_shapes=True, profile_memory=True, with_stack=False
+    ) as prof:
+        predictor_pass(
+            values, predictor, masks, ebs, args, round_output, collect_stages=False
+        )
 
-    sort_by = ("self_cuda_time_total"
-               if torch.device(args.device).type == "cuda"
-               else "self_cpu_time_total")
+    sort_by = (
+        "self_cuda_time_total"
+        if torch.device(args.device).type == "cuda"
+        else "self_cpu_time_total"
+    )
     print("\nPyTorch operator profile")
     print(prof.key_averages().table(sort_by=sort_by, row_limit=args.profile_rows))
     if args.trace:
@@ -215,9 +246,16 @@ def run_codec(args, arr):
         synchronize(args.device)
         t0 = time.perf_counter()
         stream, stats = compress(
-            arr, args.eb, encoder, levels=args.levels,
-            anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
-            radius=args.radius, eb_ratio=1.0, tune="fast")
+            arr,
+            args.eb,
+            encoder,
+            levels=args.levels,
+            anchor_stride=args.anchor_stride,
+            anchor_block=args.anchor_block,
+            radius=args.radius,
+            eb_ratio=1.0,
+            tune="fast",
+        )
         synchronize(args.device)
         t1 = time.perf_counter()
         decompress(stream, lambda _header: decoder)
@@ -249,14 +287,15 @@ def run_codec(args, arr):
         if torch.device(args.device).type == "cuda":
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         with torch.profiler.profile(
-                activities=activities, record_shapes=True,
-                profile_memory=True) as prof:
+            activities=activities, record_shapes=True, profile_memory=True
+        ) as prof:
             roundtrip()
-        sort_by = ("self_cuda_time_total"
-                   if torch.device(args.device).type == "cuda"
-                   else "self_cpu_time_total")
-        print(prof.key_averages().table(sort_by=sort_by,
-                                        row_limit=args.profile_rows))
+        sort_by = (
+            "self_cuda_time_total"
+            if torch.device(args.device).type == "cuda"
+            else "self_cpu_time_total"
+        )
+        print(prof.key_averages().table(sort_by=sort_by, row_limit=args.profile_rows))
         if args.trace:
             args.trace.parent.mkdir(parents=True, exist_ok=True)
             prof.export_chrome_trace(str(args.trace))
@@ -266,7 +305,9 @@ def run_codec(args, arr):
 def main(argv=None):
     args = parse_args(argv)
     if args.eb <= 0 or args.warmup < 0 or args.repeats < 1:
-        raise SystemExit("--eb must be positive, --warmup non-negative, and --repeats >= 1")
+        raise SystemExit(
+            "--eb must be positive, --warmup non-negative, and --repeats >= 1"
+        )
 
     import torch
 
@@ -276,8 +317,10 @@ def main(argv=None):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     arr = load_input(args)
-    print(f"input={arr.shape} {arr.dtype} | device={args.device} | eb={args.eb} | "
-          f"warmup={args.warmup} repeats={args.repeats}")
+    print(
+        f"input={arr.shape} {arr.dtype} | device={args.device} | eb={args.eb} | "
+        f"warmup={args.warmup} repeats={args.repeats}"
+    )
 
     if args.mode == "predictor":
         run_predictor(args, arr)

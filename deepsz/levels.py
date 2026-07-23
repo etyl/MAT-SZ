@@ -57,9 +57,11 @@ def stage_plan(
     # otherwise the finest pixels never become midpoints and get dumped into the
     # remainder clause below as one huge, badly-predicted stage (60-90% bloat).
     if (1 << levels) < anchor_stride:
-        raise ValueError(f"levels={levels} too small for anchor_stride="
-                         f"{anchor_stride}: need levels >= log2(anchor_stride) = "
-                         f"{anchor_stride.bit_length() - 1} to densify to stride 1")
+        raise ValueError(
+            f"levels={levels} too small for anchor_stride="
+            f"{anchor_stride}: need levels >= log2(anchor_stride) = "
+            f"{anchor_stride.bit_length() - 1} to densify to stride 1"
+        )
 
     coords = [np.arange(n) for n in shape]
     covered = np.zeros(shape, bool)
@@ -78,9 +80,9 @@ def stage_plan(
             for axes in itertools.combinations(range(ndim), w):
                 mask = np.ones(shape, bool)
                 for j, cj in enumerate(coords):
-                    if j in axes:       # midpoint (odd multiple of s) on this axis
+                    if j in axes:  # midpoint (odd multiple of s) on this axis
                         sel = ((cj % s) == 0) & ((cj % (2 * s)) != 0)
-                    else:               # on the coarse (stride 2s) grid
+                    else:  # on the coarse (stride 2s) grid
                         sel = (cj % (2 * s)) == 0
                     mask &= _axis_mask(sel, j, ndim)
                 mask &= ~covered
@@ -98,7 +100,9 @@ def stage_masks(
     anchor_stride: int,
     anchor_block: int = 1,
 ) -> list[np.ndarray]:
-    return [mask for mask, _, _ in stage_plan(shape, levels, anchor_stride, anchor_block)]
+    return [
+        mask for mask, _, _ in stage_plan(shape, levels, anchor_stride, anchor_block)
+    ]
 
 
 def stage_strides(ndim: int, levels: int, anchor_stride: int) -> list[int]:
@@ -120,9 +124,11 @@ def stage_strides(ndim: int, levels: int, anchor_stride: int) -> list[int]:
     if anchor_stride < 2 or anchor_stride & (anchor_stride - 1):
         raise ValueError("anchor_stride must be a power of two >= 2")
     if (1 << levels) < anchor_stride:
-        raise ValueError(f"levels={levels} too small for anchor_stride="
-                         f"{anchor_stride}: need levels >= log2(anchor_stride) = "
-                         f"{anchor_stride.bit_length() - 1} to densify to stride 1")
+        raise ValueError(
+            f"levels={levels} too small for anchor_stride="
+            f"{anchor_stride}: need levels >= log2(anchor_stride) = "
+            f"{anchor_stride.bit_length() - 1} to densify to stride 1"
+        )
     per_level = (1 << ndim) - 1
     strides = [anchor_stride]
     for k in range(1, levels + 1):

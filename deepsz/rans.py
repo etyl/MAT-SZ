@@ -68,8 +68,9 @@ def build_laplace_tables(
     lo = eb / SCALE_LO_DIV
     hi = eb * SCALE_HI_MULT
     grid = np.exp(np.linspace(np.log(lo), np.log(hi), n_levels)).astype(np.float32)
-    return RansTables(cdfs=cdfs, precision=precision, eb=eb, radius=radius,
-                      scale_grid=grid)
+    return RansTables(
+        cdfs=cdfs, precision=precision, eb=eb, radius=radius, scale_grid=grid
+    )
 
 
 @lru_cache(maxsize=128)
@@ -117,8 +118,7 @@ def model_bits(codes: np.ndarray, levels64: np.ndarray, tables: RansTables) -> f
         if len(idx):
             syms = codes[idx].astype(np.int64)
             cdf = tables.cdfs[level]
-            probs[idx] = (cdf[syms + 1].astype(np.int64)
-                          - cdf[syms].astype(np.int64))
+            probs[idx] = cdf[syms + 1].astype(np.int64) - cdf[syms].astype(np.int64)
     return float((-np.log2(probs / tables.total)).sum())
 
 
@@ -169,8 +169,7 @@ def rans_decode(blob: bytes, levels64: np.ndarray, tables: RansTables) -> np.nda
     for level in range(n_levels):
         idx = np.flatnonzero(levels == level)
         if len(idx):
-            out[idx] = dec.decode(models[level], len(idx)).astype(
-                np.uint32, copy=False)
+            out[idx] = dec.decode(models[level], len(idx)).astype(np.uint32, copy=False)
     if not dec.is_empty():
         raise ValueError("trailing data in rANS payload")
     return out
@@ -185,11 +184,11 @@ def _ans_models(radius: int, n_levels: int, precision: int):
     """
     import constriction
 
-    cdfs = _build_laplace_cdfs_cached(
-        int(radius), int(n_levels), int(precision))
+    cdfs = _build_laplace_cdfs_cached(int(radius), int(n_levels), int(precision))
     return tuple(
         constriction.stream.model.Categorical(
-            np.diff(cdf.astype(np.int64)).astype(np.float32), perfect=False)
+            np.diff(cdf.astype(np.int64)).astype(np.float32), perfect=False
+        )
         for cdf in cdfs
     )
 

@@ -320,6 +320,7 @@ def _interp_axis_at_t(torch, W, coords, axis, s, shape):
     ``W`` is ``(C, *S)`` float64 and ``coords`` is a tuple of ``(M,)`` long
     tensors.
     """
+
     def gather(off):
         ca = coords[axis] + off
         valid = (ca >= 0) & (ca < shape[axis])
@@ -344,12 +345,13 @@ def _interp_stage_pred_t(torch, recon_t, sls, coords_t, stride, axes, center):
     W = recon_t[(slice(None), *sls)].double()
     shape = tuple(W.shape[1:])
     if center == 0 or len(axes) == 1:
-        ip = sum(_interp_axis_at_t(torch, W, coords_t, a, stride, shape)
-                 for a in axes) / len(axes)
+        ip = sum(
+            _interp_axis_at_t(torch, W, coords_t, a, stride, shape) for a in axes
+        ) / len(axes)
     else:
         ax = axes[0] if center == 1 else axes[-1]
         ip = _interp_axis_at_t(torch, W, coords_t, ax, stride, shape)
-    return ip.to(torch.float32)   # (C, n)
+    return ip.to(torch.float32)  # (C, n)
 
 
 def _laplace_bits_t(torch, absr, b, eb):
@@ -381,14 +383,14 @@ def _gate_select_t(torch, r_g, r_i, b, eb):
     onehot = (bucket.unsqueeze(-1) == torch.arange(nb, device=dev)).double()  # (n, nb)
 
     def cum(r, bb):
-        w = _laplace_bits_t(torch, r, bb, eb).sum(0)          # (n,)
-        binc = (w.unsqueeze(-1) * onehot).sum(0)              # (nb,)
+        w = _laplace_bits_t(torch, r, bb, eb).sum(0)  # (n,)
+        binc = (w.unsqueeze(-1) * onehot).sum(0)  # (nb,)
         return torch.cumsum(binc, 0)
 
     base = cum(r_g, b)
     tot = base[-1]
-    rows = [tot - base[:-1] + cum(r_i, b * 2.0 ** -sh)[:-1] for sh in _GATE_SHIFTS]
-    costs = torch.stack(rows)                          # (n_shift, nb-1)
+    rows = [tot - base[:-1] + cum(r_i, b * 2.0**-sh)[:-1] for sh in _GATE_SHIFTS]
+    costs = torch.stack(rows)  # (n_shift, nb-1)
     mv, fi = costs.reshape(-1).min(0)
     fired = mv < tot
     ncol = nb - 1
@@ -405,8 +407,9 @@ def _gate_apply_t(torch, pred_bi, scale_bi, ip, eb, gate_t, gate_sh):
     active = gate_t > 0
     m = active & (scale_bi < eb * torch.exp2(gate_t.double()))
     p = torch.where(m.unsqueeze(0), ip, pred_bi.unsqueeze(0))
-    sc = torch.where(m, scale_bi * torch.exp2(-gate_sh.double()).to(scale_bi.dtype),
-                     scale_bi)
+    sc = torch.where(
+        m, scale_bi * torch.exp2(-gate_sh.double()).to(scale_bi.dtype), scale_bi
+    )
     return p.to(torch.float32), sc.to(torch.float32)
 
 
@@ -501,7 +504,7 @@ def _compress_chunked(
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
     full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
-    gates_t: list = [] if gate else None   # per stage-chunk gate byte, device scalars
+    gates_t: list = [] if gate else None  # per stage-chunk gate byte, device scalars
     bar = _progress_bar("encode", predictor.n_chunks)
     for group in waves:
         for ci in group:
@@ -515,17 +518,25 @@ def _compress_chunked(
             # The chunk value block is uploaded once, not once per stage.
             vblocks = [
                 torch.from_numpy(
-                    np.ascontiguousarray(values[(slice(None), *predictor.chunk_slices(ci))])
-                ).to(dev).reshape(c, -1)
+                    np.ascontiguousarray(
+                        values[(slice(None), *predictor.chunk_slices(ci))]
+                    )
+                )
+                .to(dev)
+                .reshape(c, -1)
                 for ci in ids
             ]
             origin_bases = [
-                int(sum(sl.start * st for sl, st in zip(
-                    predictor.chunk_slices(ci), full_strides)))
+                int(
+                    sum(
+                        sl.start * st
+                        for sl, st in zip(predictor.chunk_slices(ci), full_strides)
+                    )
+                )
                 for ci in ids
             ]
             predictor.start_wave(ids, recon_t)
-            wave_pending: list = []   # (codes, outliers, sc, tables, eb) or None marker
+            wave_pending: list = []  # (codes, outliers, sc, tables, eb) or None marker
             for s in range(1, len(counts)):
                 n = counts[s]
                 tables = stage_tables[s]
@@ -536,7 +547,7 @@ def _compress_chunked(
                 pred, scale = predictor.predict_wave_stage(s, recon_t, ebs[s])
                 for bi in range(len(ids)):
                     sls = predictor.chunk_slices(ids[bi])
-                    cvals = vblocks[bi].index_select(1, pos)     # (C, n)
+                    cvals = vblocks[bi].index_select(1, pos)  # (C, n)
                     p = pred[bi][None, :]
                     sc = scale[bi]
                     if gate:
@@ -548,39 +559,47 @@ def _compress_chunked(
                             torch, (cvals - p).abs(), (cvals - ip).abs(), sc, ebs[s]
                         )
                         gates_t.append(gt * 16 + gs)
-                        p, sc = _gate_apply_t(
-                            torch, pred[bi], sc, ip, ebs[s], gt, gs
-                        )
+                        p, sc = _gate_apply_t(torch, pred[bi], sc, ip, ebs[s], gt, gs)
                     codes, recon_stage, outliers = _quantize_t(
                         torch, cvals, p, ebs[s], radius, round_output
                     )
                     gpos = recon_off_dev[s] + origin_bases[bi]
                     recon_flat.index_copy_(1, gpos, recon_stage.reshape(c, -1))
-                    wave_pending.append((
-                        codes.to("cpu", non_blocking=True),
-                        outliers.to("cpu", non_blocking=True),
-                        sc.to("cpu", non_blocking=True),
-                        tables,
-                        ebs[s],
-                    ))
+                    wave_pending.append(
+                        (
+                            codes.to("cpu", non_blocking=True),
+                            outliers.to("cpu", non_blocking=True),
+                            sc.to("cpu", non_blocking=True),
+                            tables,
+                            ebs[s],
+                        )
+                    )
             predictor.finish_wave(recon_t)
             # deferred rANS: the codes streamed off the GPU during the wave; sync
             # once, then pack in stream order (host-only, off the recon path).
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
             for item in wave_pending:
-                if len(item) == 2:        # empty stage
-                    parts.append(pack_stage(
-                        np.zeros(0, np.uint32), np.zeros(0, np.float32),
-                        rans_levels=np.zeros(0, np.uint8), rans_tables=item[1]))
+                if len(item) == 2:  # empty stage
+                    parts.append(
+                        pack_stage(
+                            np.zeros(0, np.uint32),
+                            np.zeros(0, np.float32),
+                            rans_levels=np.zeros(0, np.uint8),
+                            rans_tables=item[1],
+                        )
+                    )
                     continue
                 codes_c, out_c, sc_c, tables, eb_s = item
-                levels = scale_to_level(
-                    sc_c.numpy()[None, :], eb_s).reshape(-1)
-                parts.append(pack_stage(
-                    codes_c.numpy().astype(np.uint32),
-                    out_c.numpy().astype(np.float32),
-                    rans_levels=levels, rans_tables=tables))
+                levels = scale_to_level(sc_c.numpy()[None, :], eb_s).reshape(-1)
+                parts.append(
+                    pack_stage(
+                        codes_c.numpy().astype(np.uint32),
+                        out_c.numpy().astype(np.float32),
+                        rans_levels=levels,
+                        rans_tables=tables,
+                    )
+                )
             peak = _cuda_peak(predictor)
             if peak:
                 bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
@@ -588,8 +607,7 @@ def _compress_chunked(
     bar.close()
     gates = None
     if gate:
-        gates = [int(x) for x in torch.stack(gates_t).cpu().tolist()] if gates_t \
-            else []
+        gates = [int(x) for x in torch.stack(gates_t).cpu().tolist()] if gates_t else []
     return b"".join(parts), gates
 
 
@@ -617,11 +635,13 @@ def _chunk_device_plan(torch, dev, cshape, full_shape, levels, stride, block):
             recon_off += cc * gs
         counts.append(int(pos.size))
         pos_dev.append(torch.from_numpy(np.ascontiguousarray(pos)).to(dev))
-        recon_off_dev.append(torch.from_numpy(
-            np.ascontiguousarray(recon_off, dtype=np.int64)).to(dev))
+        recon_off_dev.append(
+            torch.from_numpy(np.ascontiguousarray(recon_off, dtype=np.int64)).to(dev)
+        )
         if ax and pos.size:
-            coords = tuple(torch.from_numpy(np.ascontiguousarray(cc)).to(dev)
-                           for cc in coords_np)
+            coords = tuple(
+                torch.from_numpy(np.ascontiguousarray(cc)).to(dev) for cc in coords_np
+            )
             interp_dev.append((coords, st, ax))
         else:
             interp_dev.append(None)
@@ -659,9 +679,10 @@ def _decompress_chunked(
     coarse_bar.close()
     torch = predictor._torch
     dev = predictor.device
-    recon_t = torch.from_numpy(recon).to(dev)   # device-resident, same as encode
-    gates_t = None if gates is None else torch.tensor(
-        gates, dtype=torch.int64, device=dev)
+    recon_t = torch.from_numpy(recon).to(dev)  # device-resident, same as encode
+    gates_t = (
+        None if gates is None else torch.tensor(gates, dtype=torch.int64, device=dev)
+    )
     waves = _chunk_waves(predictor.grid)
     _log(f"decode: anchors done, {predictor.n_chunks} chunks/model passes")
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
@@ -680,8 +701,12 @@ def _decompress_chunked(
                 )
             counts, _, recon_off_dev, interp_dev, center = index_cache[cshape]
             origin_bases = [
-                int(sum(sl.start * st for sl, st in zip(
-                    predictor.chunk_slices(ci), full_strides)))
+                int(
+                    sum(
+                        sl.start * st
+                        for sl, st in zip(predictor.chunk_slices(ci), full_strides)
+                    )
+                )
                 for ci in ids
             ]
             predictor.start_wave(ids, recon_t)
@@ -712,14 +737,20 @@ def _decompress_chunked(
                         p, sc = _gate_apply_t(
                             torch, pred[bi], sc, ip, ebs[s], g >> 4, g & 15
                         )
-                    levels64 = scale_to_level(sc.cpu().numpy()[None, :], ebs[s]).reshape(-1)
+                    levels64 = scale_to_level(
+                        sc.cpu().numpy()[None, :], ebs[s]
+                    ).reshape(-1)
                     codes, outliers, off = unpack_stage(
                         payload, off, rans_levels=levels64, rans_tables=tables
                     )
                     recon_stage = _dequantize_t(
-                        torch, p,
+                        torch,
+                        p,
                         torch.from_numpy(codes.astype(np.int64)).to(dev),
-                        torch.from_numpy(outliers).to(dev), ebs[s], radius)
+                        torch.from_numpy(outliers).to(dev),
+                        ebs[s],
+                        radius,
+                    )
                     gpos = recon_off_dev[s] + origin_bases[bi]
                     recon_flat.index_copy_(1, gpos, recon_stage.reshape(c, -1))
             predictor.finish_wave(recon_t)
@@ -1054,9 +1085,7 @@ class GNNCompressorCodec:
         )
         # encode: from the codec flag; decode: replay the stream's float path
         predictor.fp16 = self.fp16 if meta is None else bool(meta["fp16"])
-        predictor.compile = (
-            self.compile if meta is None else bool(meta["compiled"])
-        )
+        predictor.compile = self.compile if meta is None else bool(meta["compiled"])
         return predictor
 
     def _predictor(

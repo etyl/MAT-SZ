@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 def _ensure_rans_backend():
     try:
         import constriction  # noqa: F401
+
         return "constriction"
     except ImportError:
         import deepsz.bitstream as bitstream
@@ -50,15 +51,21 @@ def _ensure_rans_backend():
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--shape", type=int, nargs="+", default=(256, 256, 256))
-    ap.add_argument("--chunk-size", type=int, default=None,
-                    help="chunk edge (default: codec auto)")
+    ap.add_argument(
+        "--chunk-size", type=int, default=None, help="chunk edge (default: codec auto)"
+    )
     ap.add_argument("--eb", type=float, default=1e-2)
     ap.add_argument("--d", type=int, default=32, help="model width")
-    ap.add_argument("--agg-level", type=int, default=2,
-                    help="aggregation level baked into the random checkpoint")
+    ap.add_argument(
+        "--agg-level",
+        type=int,
+        default=2,
+        help="aggregation level baked into the random checkpoint",
+    )
     ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--checkpoint", default=None,
-                    help="real checkpoint (default: random weights)")
+    ap.add_argument(
+        "--checkpoint", default=None, help="real checkpoint (default: random weights)"
+    )
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -73,9 +80,15 @@ def main():
         torch.manual_seed(args.seed)
         model = build_model(d=args.d, agg_level=args.agg_level).eval()
         ckpt = str(Path(tempfile.mkdtemp()) / "gnn_random.pt")
-        torch.save({"d": args.d, "agg_level": args.agg_level,
-                    "state_dict": model.state_dict(),
-                    "version": CKPT_VERSION}, ckpt)
+        torch.save(
+            {
+                "d": args.d,
+                "agg_level": args.agg_level,
+                "state_dict": model.state_dict(),
+                "version": CKPT_VERSION,
+            },
+            ckpt,
+        )
 
     shape = tuple(args.shape)
     n = int(np.prod(shape))
@@ -85,12 +98,14 @@ def main():
     for k, s in enumerate(shape):
         wave = np.cos(np.linspace(0, 4 * np.pi, s, dtype=np.float32))
         x += wave.reshape([-1 if i == k else 1 for i in range(len(shape))])
-    print(f"shape={shape} ({n / 1e6:.1f}M points, {x.nbytes / 2**20:.0f} MiB), "
-          f"eb={args.eb}, d={args.d}, rans backend: {backend}")
+    print(
+        f"shape={shape} ({n / 1e6:.1f}M points, {x.nbytes / 2**20:.0f} MiB), "
+        f"eb={args.eb}, d={args.d}, rans backend: {backend}"
+    )
 
     codec = GNNCompressorCodec(
-        ckpt, error_bound=args.eb, levels=args.levels,
-        chunk_size=args.chunk_size)
+        ckpt, error_bound=args.eb, levels=args.levels, chunk_size=args.chunk_size
+    )
 
     t0 = time.time()
     stream = codec.compress(x)
@@ -100,10 +115,14 @@ def main():
 
     err = float(np.abs(y - x).max())
     peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    print(f"compress {t1 - t0:.1f}s, decompress {t2 - t1:.1f}s, "
-          f"stream {len(stream) / 2**20:.1f} MiB")
-    print(f"max |x - recon| = {err:.6g} (eb {args.eb}): "
-          f"{'OK' if err <= args.eb else 'VIOLATED'}")
+    print(
+        f"compress {t1 - t0:.1f}s, decompress {t2 - t1:.1f}s, "
+        f"stream {len(stream) / 2**20:.1f} MiB"
+    )
+    print(
+        f"max |x - recon| = {err:.6g} (eb {args.eb}): "
+        f"{'OK' if err <= args.eb else 'VIOLATED'}"
+    )
     print(f"peak RSS: {peak_kb / 2**20:.2f} GiB")
     if err > args.eb:
         raise SystemExit(1)

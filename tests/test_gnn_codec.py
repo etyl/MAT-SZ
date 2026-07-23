@@ -14,12 +14,15 @@ def tiny_checkpoint(tmp_path):
     torch.manual_seed(0)
     model = build_model(d=8).eval()
     path = tmp_path / "gnn.pt"
-    torch.save({
-        "d": model.d,
-        "agg_level": 2,
-        "state_dict": model.state_dict(),
-        "version": CKPT_VERSION,
-    }, path)
+    torch.save(
+        {
+            "d": model.d,
+            "agg_level": 2,
+            "state_dict": model.state_dict(),
+            "version": CKPT_VERSION,
+        },
+        path,
+    )
     return path
 
 
@@ -75,8 +78,14 @@ def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):
     assert meta["shape"] == list(x.shape)
     assert meta["dtype"] == x.dtype.str
     for redundant in (
-        "codec", "coded_shape", "anchor_stride", "anchor_block",
-        "max_radius", "agg_level", "entropy_coder", "chunk_batch",
+        "codec",
+        "coded_shape",
+        "anchor_stride",
+        "anchor_block",
+        "max_radius",
+        "agg_level",
+        "entropy_coder",
+        "chunk_batch",
     ):
         assert redundant not in meta
     assert isinstance(stream, bytes)

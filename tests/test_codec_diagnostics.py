@@ -42,8 +42,7 @@ def test_uint8_style_eb_is_too_coarse_for_normalized_float_images():
 
     coarse_stream, _ = compress(img, 1.0, InterpPredictor("cubic", **kw), **kw)
     coarse = decompress(coarse_stream)
-    fine_stream, _ = compress(img, 1.0 / 255.0,
-                              InterpPredictor("cubic", **kw), **kw)
+    fine_stream, _ = compress(img, 1.0 / 255.0, InterpPredictor("cubic", **kw), **kw)
     fine = decompress(fine_stream)
 
     assert _psnr_unit(coarse, img) < 15.0
@@ -59,11 +58,13 @@ def test_tighter_coarse_level_eb_reduces_propagated_interp_distortion():
     eb = 4.0 / 255.0
     kw = dict(levels=4, anchor_stride=16, anchor_block=1)
 
-    flat_stream, _ = compress(img, eb, InterpPredictor("cubic", **kw),
-                              **kw, eb_ratio=1.0)
+    flat_stream, _ = compress(
+        img, eb, InterpPredictor("cubic", **kw), **kw, eb_ratio=1.0
+    )
     flat = decompress(flat_stream)
-    tight_stream, _ = compress(img, eb, InterpPredictor("cubic", **kw),
-                               **kw, eb_ratio=0.7)
+    tight_stream, _ = compress(
+        img, eb, InterpPredictor("cubic", **kw), **kw, eb_ratio=0.7
+    )
     tight = decompress(tight_stream)
 
     flat_mse = float(np.mean((img.astype(np.float64) - flat.astype(np.float64)) ** 2))

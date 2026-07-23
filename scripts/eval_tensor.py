@@ -34,8 +34,10 @@ def _cap_crop(arr: np.ndarray, stride: int, cap: int) -> np.ndarray:
     edge = max(int(cap ** (1.0 / arr.ndim)), stride)
     edge -= edge % stride or 0
     edge = max(edge, stride)
-    sl = tuple(slice((d - min(d, edge)) // 2, (d - min(d, edge)) // 2 + min(d, edge))
-               for d in arr.shape)
+    sl = tuple(
+        slice((d - min(d, edge)) // 2, (d - min(d, edge)) // 2 + min(d, edge))
+        for d in arr.shape
+    )
     return np.ascontiguousarray(arr[sl])
 
 
@@ -45,14 +47,20 @@ def report(label, arr, rec, nbytes, eb, t_comp=None, t_dec=None):
     r = rec.reshape(arr.shape).astype(np.float64)
     max_err = float(np.abs(a - r).max())
     mse = float(np.mean((a - r) ** 2))
-    peak = 255.0 if arr.dtype == np.uint8 else max(float(arr.max()) - float(arr.min()), 1e-12)
-    psnr = 10 * np.log10(peak ** 2 / mse) if mse > 0 else float("inf")
+    peak = (
+        255.0
+        if arr.dtype == np.uint8
+        else max(float(arr.max()) - float(arr.min()), 1e-12)
+    )
+    psnr = 10 * np.log10(peak**2 / mse) if mse > 0 else float("inf")
     bpv = 8 * nbytes / arr.size
     ratio = arr.nbytes / nbytes
     t = f"  {t_comp:.1f}s/{t_dec:.1f}s" if t_comp is not None else ""
-    print(f"  [{label:6s}] {nbytes:>10} B  ratio {ratio:7.2f}  {bpv:7.3f} bpv  "
-          f"PSNR {psnr:6.2f} dB  maxerr {max_err:.3g} "
-          f"{'PASS' if max_err <= eb else 'FAIL'}{t}")
+    print(
+        f"  [{label:6s}] {nbytes:>10} B  ratio {ratio:7.2f}  {bpv:7.3f} bpv  "
+        f"PSNR {psnr:6.2f} dB  maxerr {max_err:.3g} "
+        f"{'PASS' if max_err <= eb else 'FAIL'}{t}"
+    )
     return max_err <= eb
 
 
@@ -61,33 +69,50 @@ def load_tensor(path: str) -> np.ndarray:
         return np.load(path)
     if path.endswith((".pt", ".pth")):
         import torch
+
         obj = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(obj, torch.Tensor):
-            raise ValueError(f"{path} holds {type(obj).__name__}, expected a single tensor")
+            raise ValueError(
+                f"{path} holds {type(obj).__name__}, expected a single tensor"
+            )
         return obj.detach().cpu().numpy()
     raise ValueError(f"unsupported extension: {path} (use .npy/.pt/.pth)")
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("input", help="tensor file (.npy or .pt/.pth)")
     add_common(ap)
-    ap.add_argument("--chunk-size", type=int, default=None,
-                    help="gnn only: force chunk edge (multiple of 2 ** levels); "
-                         "0 = whole-tensor, omit = maximize chunk size within "
-                         "the automatic point budget")
-    ap.add_argument("--fp16", action="store_true",
-                    help="gnn only: fp16 autocast on the GNN message pass (cuda; "
-                         "~2x forward, readout stays fp32). May cost a little ratio "
-                         "at small eb -- compare bits/value with and without")
-    ap.add_argument("--normalize", action="store_true",
-                    help="min-max scale the tensor to [0,1] before compressing, so "
-                         "eb is comparable across tensors of different raw scale")
-    ap.add_argument("--compile", action="store_true",
-                    help="gnn only: torch.compile the message-pass embed (fuses "
-                         "the elementwise ~40%%; one-off compile cost on first "
-                         "chunk). Same float path replayed at decode")
+    ap.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="gnn only: force chunk edge (multiple of 2 ** levels); "
+        "0 = whole-tensor, omit = maximize chunk size within "
+        "the automatic point budget",
+    )
+    ap.add_argument(
+        "--fp16",
+        action="store_true",
+        help="gnn only: fp16 autocast on the GNN message pass (cuda; "
+        "~2x forward, readout stays fp32). May cost a little ratio "
+        "at small eb -- compare bits/value with and without",
+    )
+    ap.add_argument(
+        "--normalize",
+        action="store_true",
+        help="min-max scale the tensor to [0,1] before compressing, so "
+        "eb is comparable across tensors of different raw scale",
+    )
+    ap.add_argument(
+        "--compile",
+        action="store_true",
+        help="gnn only: torch.compile the message-pass embed (fuses "
+        "the elementwise ~40%%; one-off compile cost on first "
+        "chunk). Same float path replayed at decode",
+    )
     args = ap.parse_args(argv)
 
     arr = load_tensor(args.input)
@@ -97,7 +122,7 @@ def main(argv=None):
         arr = arr.astype(np.float32)
     if args.normalize:
         lo, hi = float(arr.min()), float(arr.max())
-        arr = ((arr.astype(np.float32) - lo) / max(hi - lo, 1e-12))
+        arr = (arr.astype(np.float32) - lo) / max(hi - lo, 1e-12)
         print(f"normalized [{lo:.4g},{hi:.4g}] -> [0,1]")
     eb = args.eb
     if args.rel:
@@ -108,13 +133,19 @@ def main(argv=None):
         # allocates a dense embedding field over the whole tensor and OOMs.
         os.environ.setdefault("DEEPSZ_PROGRESS", "1")  # per-chunk progress to stderr
         from deepsz.gnn_codec import GNNCompressorCodec
+
         codec = GNNCompressorCodec(
-            args.gnn_checkpoint, error_bound=eb, levels=args.levels,
-            radius=args.radius, zstd_level=args.zstd_level,
+            args.gnn_checkpoint,
+            error_bound=eb,
+            levels=args.levels,
+            radius=args.radius,
+            zstd_level=args.zstd_level,
             eb_ratio=args.eb_ratio,
             tune=args.tune if args.tune in ("fast", "size") else "fast",
             chunk_size=args.chunk_size,
-            fp16=args.fp16, compile=args.compile)
+            fp16=args.fp16,
+            compile=args.compile,
+        )
         t0 = time.time()
         stream = codec.compress(arr)
         t_comp = time.time() - t0
@@ -131,12 +162,13 @@ def main(argv=None):
         rec = decompress(stream, lambda hdr: build_predictor(args, hdr))
         t_dec = time.time() - t0
 
-    print(f"tensor {args.input} {arr.shape} {arr.dtype}, eb={eb} "
-          f"(orig {orig_bytes} B)")
+    print(f"tensor {args.input} {arr.shape} {arr.dtype}, eb={eb} (orig {orig_bytes} B)")
     main_label = args.predictor
     bound_ok = report(main_label, arr, rec, len(stream), eb, t_comp, t_dec)
-    print(f"  ({main_label}: outliers {stats['outliers']} "
-          f"= {100*stats['outliers']/arr.size:.3f}%)")
+    print(
+        f"  ({main_label}: outliers {stats['outliers']} "
+        f"= {100 * stats['outliers'] / arr.size:.3f}%)"
+    )
 
     # Baselines at the identical eb. Two gotchas this handles:
     #  * interp compresses the whole field un-chunked -> OOMs on a big field
@@ -168,11 +200,18 @@ def main(argv=None):
         b_tc = time.time() - t0
         t0 = time.time()
         b_rec = decompress(b_stream, lambda hdr: build_predictor(bargs, hdr))
-        report(f"interp{list(sub.shape) if cropped else ''}", sub, b_rec,
-               len(b_stream), eb, b_tc, time.time() - t0)
-        sz3(sub)                 # same crop -> fair interp-vs-sz3
+        report(
+            f"interp{list(sub.shape) if cropped else ''}",
+            sub,
+            b_rec,
+            len(b_stream),
+            eb,
+            b_tc,
+            time.time() - t0,
+        )
+        sz3(sub)  # same crop -> fair interp-vs-sz3
         if cropped:
-            sz3(arr)             # full field -> headline vs the GNN
+            sz3(arr)  # full field -> headline vs the GNN
     else:
         sz3(arr)
 

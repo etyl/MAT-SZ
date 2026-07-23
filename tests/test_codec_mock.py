@@ -15,19 +15,27 @@ def smooth_image(h, w, c, seed=0):
     """Smooth-ish synthetic image so prediction has something to work with."""
     rng = np.random.RandomState(seed)
     yy, xx = np.mgrid[0:h, 0:w]
-    img = np.stack([
-        128 + 100 * np.sin(xx / (10 + 5 * k)) * np.cos(yy / (13 + 3 * k))
-        + rng.randn(h, w) * 2
-        for k in range(c)], axis=-1)
+    img = np.stack(
+        [
+            128
+            + 100 * np.sin(xx / (10 + 5 * k)) * np.cos(yy / (13 + 3 * k))
+            + rng.randn(h, w) * 2
+            for k in range(c)
+        ],
+        axis=-1,
+    )
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
-@pytest.mark.parametrize("shape,eb", [
-    ((130, 70, 3), 0.5),
-    ((130, 70, 3), 2.0),
-    ((100, 100, 1), 8.0),
-    ((64, 64, 3), 2.0),
-])
+@pytest.mark.parametrize(
+    "shape,eb",
+    [
+        ((130, 70, 3), 0.5),
+        ((130, 70, 3), 2.0),
+        ((100, 100, 1), 8.0),
+        ((64, 64, 3), 2.0),
+    ],
+)
 def test_roundtrip_bound(shape, eb):
     h, w, c = shape
     img = smooth_image(h, w, c)

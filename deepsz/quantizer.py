@@ -73,7 +73,9 @@ def dequantize(
     is_outlier = codes == 0
     n_out = int(is_outlier.sum())
     if n_out != len(outlier_vals):
-        raise ValueError(f"outlier count mismatch: {n_out} zeros vs {len(outlier_vals)} values")
+        raise ValueError(
+            f"outlier count mismatch: {n_out} zeros vs {len(outlier_vals)} values"
+        )
     recon[is_outlier] = np.asarray(outlier_vals, dtype=np.float32)
     return recon
 

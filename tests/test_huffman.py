@@ -4,14 +4,17 @@ import pytest
 from deepsz.huffman import huffman_decode, huffman_encode
 
 
-@pytest.mark.parametrize("name,symbols", [
-    ("uniform", np.random.RandomState(0).randint(0, 256, 5000)),
-    ("skewed", np.random.RandomState(1).geometric(0.3, 5000) - 1),
-    ("single", np.full(1000, 42)),
-    ("empty", np.zeros(0, np.uint32)),
-    ("two", np.array([7, 7, 7, 9])),
-    ("big_alphabet", np.random.RandomState(2).randint(0, 65536, 20000)),
-])
+@pytest.mark.parametrize(
+    "name,symbols",
+    [
+        ("uniform", np.random.RandomState(0).randint(0, 256, 5000)),
+        ("skewed", np.random.RandomState(1).geometric(0.3, 5000) - 1),
+        ("single", np.full(1000, 42)),
+        ("empty", np.zeros(0, np.uint32)),
+        ("two", np.array([7, 7, 7, 9])),
+        ("big_alphabet", np.random.RandomState(2).randint(0, 65536, 20000)),
+    ],
+)
 def test_roundtrip(name, symbols):
     symbols = symbols.astype(np.uint32)
     blob = huffman_encode(symbols)

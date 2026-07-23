@@ -5,21 +5,24 @@ from deepsz.levels import stage_masks
 
 
 # all levels == log2(stride) so the schedule densifies to stride 1 (guard)
-@pytest.mark.parametrize("shape,levels,stride,block", [
-    ((64, 64), 3, 8, 1),
-    ((64, 64), 3, 8, 4),
-    ((512, 512), 3, 8, 4),
-    ((512, 512), 4, 16, 8),
-    ((64, 48), 2, 4, 1),
-    ((33, 65), 4, 16, 2),
-    ((16, 16, 16), 3, 8, 1),   # 3-D: schedule is dimension-agnostic
-    ((24,), 3, 8, 1),          # 1-D
-])
+@pytest.mark.parametrize(
+    "shape,levels,stride,block",
+    [
+        ((64, 64), 3, 8, 1),
+        ((64, 64), 3, 8, 4),
+        ((512, 512), 3, 8, 4),
+        ((512, 512), 4, 16, 8),
+        ((64, 48), 2, 4, 1),
+        ((33, 65), 4, 16, 2),
+        ((16, 16, 16), 3, 8, 1),  # 3-D: schedule is dimension-agnostic
+        ((24,), 3, 8, 1),  # 1-D
+    ],
+)
 def test_partition(shape, levels, stride, block):
     masks = stage_masks(shape, levels, stride, block)
     ndim = len(shape)
     # anchor + (2^ndim - 1) sub-stages per level (one per non-empty odd-axis set)
-    assert len(masks) == 1 + (2 ** ndim - 1) * levels
+    assert len(masks) == 1 + (2**ndim - 1) * levels
     total = np.zeros(shape, int)
     for m in masks:
         assert m.shape == shape

@@ -4,7 +4,9 @@ import pytest
 from deepsz.quantizer import dequantize, quantize
 
 
-@pytest.mark.parametrize("scale,eb", [(1.0, 0.01), (255.0, 2.0), (1e6, 1e-3), (1e-3, 1e-7)])
+@pytest.mark.parametrize(
+    "scale,eb", [(1.0, 0.01), (255.0, 2.0), (1e6, 1e-3), (1e-3, 1e-7)]
+)
 def test_bound_holds_random(scale, eb):
     rng = np.random.RandomState(42)
     x = (rng.randn(10000) * scale).astype(np.float32)

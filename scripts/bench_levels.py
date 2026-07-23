@@ -57,9 +57,7 @@ CHUNK = int(os.environ.get("CHUNK", "32"))
 TUNE = os.environ.get("TUNE", "fast")
 FP16 = os.environ.get("FP16", "0") == "1"
 CODECS = [
-    c.strip()
-    for c in os.environ.get("CODECS", "interp,gnn").split(",")
-    if c.strip()
+    c.strip() for c in os.environ.get("CODECS", "interp,gnn").split(",") if c.strip()
 ]
 DATA = os.environ.get("DATA", "").strip()
 WHATIF = os.environ.get("WHATIF", "0") == "1"
