@@ -5,8 +5,8 @@ File = a fixed little-endian header, the spatial shape, and one zstd frame.
 The stage payload (produced by the codec, opaque here) contains, per stage:
   [n_codes u32][entropy blob len u64][entropy blob][n_outliers u32][outliers f32...]
 
-For legacy streams the entropy blob is canonical Huffman. Streams whose header
-sets FLAG_RANS use scale-conditioned context coding over the same code array.
+The entropy blob is canonical Huffman unless the header sets ``FLAG_RANS``, in
+which case it uses scale-conditioned context coding over the same code array.
 """
 
 from __future__ import annotations

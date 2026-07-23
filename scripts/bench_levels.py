@@ -1,4 +1,4 @@
-"""Per-level bpp + MSE breakdown, INTERP vs chunked GNN (vs skel), in fp32.
+"""Per-level bpp + MSE breakdown, interpolation vs chunked GNN.
 
 For every interpolation level we report:
   - bpp        : order-0 entropy of that level's quantized codes (+32 b/outlier)
@@ -19,14 +19,13 @@ Levels are tagged by the per-stage error bound (each interpolation level has a
 distinct eb under the default schedule; the anchor pass = coarsest level).
 Point counts per level are analytic (point_levels).
 
-Purpose: locate WHERE the GNN loses to interp and test whether the skeleton
-codec (global 1-skeleton line context across chunk seams) recovers the
-finest-level seam penalty -- run in fp32 so the fp16 message-pass noise floor
-(~1e-3) no longer masks the finest predictions.
+Purpose: locate where the GNN loses to interpolation across progressive levels.
+Run in fp32 so the fp16 message-pass noise floor (~1e-3) no longer masks the
+finest predictions.
 
 Env knobs (all optional):
-  N=64  EB=1e-4  LEVELS=5  STRIDE=32  BLOCK=1  CHUNK=32  AGG=2
-  CODECS="interp,gnn,skel"   TUNE=fast   FP16=0   DATA=<path.npy>
+  N=64  EB=1e-4  LEVELS=5  STRIDE=32  BLOCK=1  CHUNK=32
+  CODECS="interp,gnn"   TUNE=fast   FP16=0   DATA=<path.npy>
   CKPT=checkpoints/d64.pt
   WHATIF=1 : simulate a scale-gated interp fallback inside the GNN encode
              (if delta=log2(b/eb) < T, swap the GNN prediction for chunk-local
@@ -59,7 +58,7 @@ TUNE = os.environ.get("TUNE", "fast")
 FP16 = os.environ.get("FP16", "0") == "1"
 CODECS = [
     c.strip()
-    for c in os.environ.get("CODECS", "interp,gnn,skel").split(",")
+    for c in os.environ.get("CODECS", "interp,gnn").split(",")
     if c.strip()
 ]
 DATA = os.environ.get("DATA", "").strip()
@@ -191,13 +190,9 @@ class LevelStats:
 def hook_all(stats):
     """Wrap `quantize` in every module that owns a reference, restore on exit."""
     import deepsz.codec as cc
+    import deepsz.gnn_codec as gc
 
-    mods = [cc]
-    for name in ("gnn_codec", "skel_codec"):
-        try:
-            mods.append(__import__("deepsz." + name, fromlist=[name]))
-        except Exception:
-            pass
+    mods = [cc, gc]
     saved = []
     for m in mods:
         if hasattr(m, "quantize"):
@@ -408,7 +403,7 @@ def attach_whatif(wi):
     return [(_P, "predict_wave_stage", orig)]
 
 
-def run_interp(field, stats):
+def run_interp(field):
     import deepsz.codec as cc
     from deepsz.predictor import InterpPredictor
 
@@ -416,7 +411,7 @@ def run_interp(field, stats):
         order="cubic", levels=LEVELS, anchor_stride=STRIDE, anchor_block=BLOCK
     )
     t0 = time.time()
-    stream, st = cc.compress(
+    stream, _ = cc.compress(
         field,
         EB,
         pred,
@@ -428,7 +423,7 @@ def run_interp(field, stats):
     return len(stream), time.time() - t0
 
 
-def run_gnn(field, stats, skel):
+def run_gnn(field):
     from deepsz.gnn_codec import GNNCompressorCodec
 
     kw = dict(
@@ -441,14 +436,7 @@ def run_gnn(field, stats, skel):
     )
     codec = None
     try:
-        if skel:
-            from deepsz.skel_codec import SkeletonGNNCodec
-
-            codec = SkeletonGNNCodec(
-                CKPT, line_order="cubic", interfaces=False, anchor_stride=STRIDE, **kw
-            )
-        else:
-            codec = GNNCompressorCodec(CKPT, gate=GATE, **kw)
+        codec = GNNCompressorCodec(CKPT, gate=GATE, **kw)
         t0 = time.time()
         stream = codec.compress(field)
         return len(stream), time.time() - t0
@@ -504,7 +492,7 @@ if __name__ == "__main__":
     prec = "fp16" if FP16 else "fp32"
     print(
         f"bench_levels: N={N} eb={EB} levels={LEVELS} stride={STRIDE} "
-        f"chunk={CHUNK} agg={AGG} tune={TUNE} precision={prec}"
+        f"chunk={CHUNK} tune={TUNE} precision={prec}"
     )
     print(f"  data={'synthetic RTI' if not DATA else DATA}  codecs={CODECS}")
     field = load_field()
@@ -521,11 +509,9 @@ if __name__ == "__main__":
             saved += attach_whatif(wi)
         try:
             if codec == "interp":
-                tot, dt = run_interp(field, st)
+                tot, dt = run_interp(field)
             elif codec == "gnn":
-                tot, dt = run_gnn(field, st, skel=False)
-            elif codec == "skel":
-                tot, dt = run_gnn(field, st, skel=True)
+                tot, dt = run_gnn(field)
             else:
                 print(f"  (unknown codec {codec}, skipping)")
                 continue

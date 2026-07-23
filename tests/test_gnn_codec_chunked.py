@@ -26,10 +26,10 @@ LEVELS = 2
 
 
 @pytest.fixture()
-def v5_ckpt(tmp_path):
+def current_ckpt(tmp_path):
     torch.manual_seed(0)
     model = build_model(d=8).eval()
-    path = tmp_path / "gnn_v5.pt"
+    path = tmp_path / "gnn_v6.pt"
     torch.save({"d": model.d, "agg_level": 2, "state_dict": model.state_dict(),
                 "version": CKPT_VERSION}, path)
     return path
@@ -46,7 +46,7 @@ def _maxerr(y, x):
     return float(torch.max(torch.abs(y.float() - torch.as_tensor(x).float())))
 
 
-def test_gate_roundtrip_and_header(v5_ckpt):
+def test_gate_roundtrip_and_header(current_ckpt):
     """Scale-gated interp fallback: the bound holds, decode is driven by the
     header (not the codec flag), and an all-off gate leaves the stream
     byte-identical to gate=False."""
@@ -57,15 +57,15 @@ def test_gate_roundtrip_and_header(v5_ckpt):
     f = np.sin(gx) * np.cos(gy) + rng.rand(16, 16).astype(np.float32) * 0.01
     eb = 1e-6
     on = GNNCompressorCodec(
-        v5_ckpt, error_bound=eb, levels=LEVELS,
+        current_ckpt, error_bound=eb, levels=LEVELS,
         chunk_size=STRIDE, fp16=False,
         compile=False, gate=True)
-    off = _codec(v5_ckpt, eb=eb, chunk_size=STRIDE)
+    off = _codec(current_ckpt, eb=eb, chunk_size=STRIDE)
     s_on, s_off = on.compress(f), off.compress(f)
     meta = _read_stream(s_on)[0]
     for redundant in (
         "codec", "coded_shape", "anchor_stride", "anchor_block",
-        "max_radius", "entropy_coder", "chunk_batch",
+        "max_radius", "agg_level", "entropy_coder", "chunk_batch",
     ):
         assert redundant not in meta
     gates = meta.get("gates")
@@ -85,7 +85,7 @@ def test_gate_roundtrip_and_header(v5_ckpt):
     (8, 8, 8),         # 3D, 2x2x2
     (8, 8, 8, 8),      # 4D
 ])
-def test_chunked_roundtrip_float(v5_ckpt, shape):
+def test_chunked_roundtrip_float(current_ckpt, shape):
     rng = np.random.RandomState(len(shape))
     # smooth-ish field so the predictor has something to do (bound holds anyway)
     x = np.zeros(shape, np.float32)
@@ -93,7 +93,7 @@ def test_chunked_roundtrip_float(v5_ckpt, shape):
         wave = np.cos(np.linspace(0, 2 * np.pi, s, dtype=np.float32))
         x = x + wave.reshape([-1 if i == k else 1 for i in range(len(shape))])
     x += rng.rand(*shape).astype(np.float32) * 0.05
-    codec = _codec(v5_ckpt, eb=0.02, chunk_size=STRIDE)
+    codec = _codec(current_ckpt, eb=0.02, chunk_size=STRIDE)
 
     y = codec.uncompress(codec.compress(x))
 
@@ -101,10 +101,10 @@ def test_chunked_roundtrip_float(v5_ckpt, shape):
     assert _maxerr(y, x) <= 0.02
 
 
-def test_chunked_roundtrip_integer(v5_ckpt):
+def test_chunked_roundtrip_integer(current_ckpt):
     rng = np.random.RandomState(7)
     x = (rng.rand(8, 8) * 50).astype(np.int32)
-    codec = _codec(v5_ckpt, eb=1.0, chunk_size=STRIDE)
+    codec = _codec(current_ckpt, eb=1.0, chunk_size=STRIDE)
 
     y = codec.uncompress(codec.compress(x))
 
@@ -116,10 +116,10 @@ def test_chunked_roundtrip_integer(v5_ckpt):
 # --- determinism ------------------------------------------------------------
 
 @pytest.mark.parametrize("shape", [(8, 8), (8, 8, 8)])
-def test_chunked_encoder_deterministic(v5_ckpt, shape):
+def test_chunked_encoder_deterministic(current_ckpt, shape):
     rng = np.random.RandomState(3)
     x = rng.rand(*shape).astype(np.float32)
-    codec = _codec(v5_ckpt, chunk_size=STRIDE)
+    codec = _codec(current_ckpt, chunk_size=STRIDE)
 
     a = codec.compress(x)
     b = codec.compress(x)
@@ -129,15 +129,15 @@ def test_chunked_encoder_deterministic(v5_ckpt, shape):
 
 # --- chunked vs whole -------------------------------------------------------
 
-def test_chunked_matches_whole_bound(v5_ckpt):
+def test_chunked_matches_whole_bound(current_ckpt):
     """Same tensor both ways: each path honours the bound; a small tensor codes
     identically small under either (sanity that the pipeline, not luck, is wired).
     """
     rng = np.random.RandomState(11)
     x = rng.rand(8, 12).astype(np.float32)
 
-    whole = _codec(v5_ckpt, chunk_size=0)   # force whole-tensor
-    chunk = _codec(v5_ckpt, chunk_size=STRIDE)  # force chunked
+    whole = _codec(current_ckpt, chunk_size=0)   # force whole-tensor
+    chunk = _codec(current_ckpt, chunk_size=STRIDE)  # force chunked
 
     yw = whole.uncompress(whole.compress(x))
     yc = chunk.uncompress(chunk.compress(x))
@@ -146,10 +146,10 @@ def test_chunked_matches_whole_bound(v5_ckpt):
     assert _maxerr(yc, x) <= chunk.error_bound
 
 
-def test_auto_chunk_selection(v5_ckpt):
+def test_auto_chunk_selection(current_ckpt):
     """chunk_size=None: whole-tensor for small inputs, chunked past the
     threshold; forced int must be a multiple of anchor_stride."""
-    codec = _codec(v5_ckpt, chunk_size=None)
+    codec = _codec(current_ckpt, chunk_size=None)
     assert codec._chunk_edges((16, 16)) is None            # small -> whole
     big = (1 << 12, 1 << 12)                                # 16.7M points -> chunked
     edges = codec._chunk_edges(big)
@@ -162,7 +162,7 @@ def test_auto_chunk_selection(v5_ckpt):
     assert elongated[1] >= 16
     assert elongated[0] > edges[0]  # short axis leaves room for a longer chunk
 
-    bad = _codec(v5_ckpt, chunk_size=STRIDE + 1)            # not a multiple
+    bad = _codec(current_ckpt, chunk_size=STRIDE + 1)            # not a multiple
     with pytest.raises(ValueError):
         bad.compress(np.zeros((8, 8), np.float32))
 
@@ -247,9 +247,9 @@ def test_chunk_geometry_uses_query_only_search_and_reports_progress(monkeypatch)
     assert sum(cached_updates) == len(geom.geoms)
 
 
-def test_field_budget_estimate_warns_instead_of_aborting(v5_ckpt):
+def test_field_budget_estimate_warns_instead_of_aborting(current_ckpt):
     predictor = ChunkedGNNPredictor(
-        v5_ckpt, 0.0, 1.0, levels=LEVELS, anchor_stride=STRIDE)
+        current_ckpt, 0.0, 1.0, levels=LEVELS, anchor_stride=STRIDE)
     predictor.shape = (8, 8)
     predictor.edges = (8, 8)
     predictor.d = 1 << 30  # force the static estimate beyond the CPU budget
@@ -279,7 +279,7 @@ def test_cuda_budget_includes_reusable_allocator_cache():
     assert gp._cuda_working_budget(FakeTorch(), "cuda") == 4_800
 
 
-def test_fp16_flag_roundtrips_and_persists(v5_ckpt):
+def test_fp16_flag_roundtrips_and_persists(current_ckpt):
     """fp16=True round-trips within the bound and the flag rides in the stream so
     decode replays the same float path. (autocast only bites on cuda; on cpu this
     checks the plumbing + that enabling it doesn't break the closed loop.)"""
@@ -288,7 +288,7 @@ def test_fp16_flag_roundtrips_and_persists(v5_ckpt):
     rng = np.random.RandomState(9)
     x = rng.rand(8, 8).astype(np.float32)
     codec = GNNCompressorCodec(
-        v5_ckpt, error_bound=0.02, levels=LEVELS,
+        current_ckpt, error_bound=0.02, levels=LEVELS,
         chunk_size=STRIDE, fp16=True,
         compile=False)
 
@@ -298,7 +298,7 @@ def test_fp16_flag_roundtrips_and_persists(v5_ckpt):
     assert _maxerr(codec.uncompress(stream), x) <= 0.02
 
 
-def test_compile_flag_roundtrips_and_persists(v5_ckpt, monkeypatch):
+def test_compile_flag_roundtrips_and_persists(current_ckpt, monkeypatch):
     """compile=True round-trips within the bound and the flag rides in the stream
     so decode replays the same compiled float path. Small workloads skip compile
     (dynamo warmup never amortizes) and record compiled=False."""
@@ -308,7 +308,7 @@ def test_compile_flag_roundtrips_and_persists(v5_ckpt, monkeypatch):
     rng = np.random.RandomState(11)
     x = rng.rand(8, 8).astype(np.float32)
     codec = GNNCompressorCodec(
-        v5_ckpt, error_bound=0.02, levels=LEVELS,
+        current_ckpt, error_bound=0.02, levels=LEVELS,
         chunk_size=STRIDE, fp16=False,
         compile=True)
 

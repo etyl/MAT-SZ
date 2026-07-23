@@ -3,7 +3,7 @@ whole-tensor path can handle.
 
     /usr/bin/time -v python scripts/check_chunked_memory.py --shape 256 256 256
 
-Compresses + decompresses a synthetic tensor with a random v5 checkpoint (the
+Compresses + decompresses a synthetic tensor with a random v6 checkpoint (the
 error-bound guarantee and the memory profile are independent of the weights),
 checks |x - recon| <= eb, and prints the process peak RSS. On hosts without
 ``constriction`` a bit-exact raw stand-in is patched in for the rANS backend —
@@ -90,8 +90,7 @@ def main():
 
     codec = GNNCompressorCodec(
         ckpt, error_bound=args.eb, levels=args.levels,
-        chunk_size=args.chunk_size,
-        strict_checkpoint=False)
+        chunk_size=args.chunk_size)
 
     t0 = time.time()
     stream = codec.compress(x)

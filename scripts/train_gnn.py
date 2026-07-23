@@ -465,7 +465,6 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
         error_bound=eb,
         levels=(args.levels or 4),
         device=str(device),
-        agg_level=args.agg_level,
         fp16=args.fp16,
         compile=False,
     )

@@ -30,7 +30,7 @@ from deepsz.quantizer import dequantize, quantize
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--checkpoint", required=True, help="v2 GNN checkpoint")
+    ap.add_argument("--checkpoint", required=True, help="versioned GNN checkpoint")
     ap.add_argument("--input", type=Path, help="image or .npy input")
     ap.add_argument("--shape", type=int, nargs="+", default=(128, 128),
                     help="synthetic spatial shape when --input is omitted")

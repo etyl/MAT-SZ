@@ -12,7 +12,7 @@
 #SBATCH --error=%x-%j.out
 
 
-# Per-level bpp + MSE breakdown, interp vs chunked GNN (vs skel), in fp32.
+# Per-level bpp + MSE breakdown, interpolation vs chunked GNN, in fp32.
 #
 # fp32 on this workstation (TITAN Xp, driver 450) hits a hard torch assert:
 #   "Can't find nvmlDeviceGetNvLinkRemoteDeviceType" -- torch 2.6 was built
@@ -35,7 +35,6 @@ export LEVELS=${LEVELS:-5}
 export STRIDE=${STRIDE:-32}
 export BLOCK=${BLOCK:-1}
 export CHUNK=${CHUNK:-32}
-export AGG=${AGG:-2}
 export TUNE=${TUNE:-fast}
 export FP16=${FP16:-0}                 # 1 = fp16 (no shim needed), 0 = fp32
 export CODECS=${CODECS:-interp,gnn}

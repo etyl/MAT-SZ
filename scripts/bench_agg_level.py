@@ -197,7 +197,7 @@ def main(argv=None):
         predictor = GNNPredictor(
             ckpt_for_level(lvl), vmin, vmax, max_radius=64, device=device,
             levels=args.levels, anchor_stride=anchor_stride,
-            anchor_block=1, agg_level=lvl)
+            anchor_block=1)
         for _ in range(args.warmup):
             closed_loop_ms(values, predictor, masks, ebs, args.radius, device)
         samples = [closed_loop_ms(values, predictor, masks, ebs, args.radius, device)
@@ -227,7 +227,7 @@ def main(argv=None):
         return
 
     # Correctness: encode + decode once per level with the tensor codec and check
-    # the error bound. Encoder and decoder share agg_level (frozen in the stream),
+    # the error bound. Encoder and decoder load agg_level from the checkpoint,
     # so the reconstruction must satisfy |x - recon| <= eb at every level.
     print("\nCodec roundtrip error-bound check (whole-tensor path):")
     from deepsz.gnn_codec import GNNCompressorCodec
@@ -235,8 +235,7 @@ def main(argv=None):
     for lvl in sorted(set(tested) | {ref_level}):
         codec = GNNCompressorCodec(
             ckpt_for_level(lvl), error_bound=args.eb, levels=args.levels,
-            agg_level=lvl, radius=args.radius, chunk_size=0,
-            strict_checkpoint=False, device=device)
+            radius=args.radius, chunk_size=0, device=device)
         stream = codec.compress(x)
         rec = codec.uncompress(stream).numpy().reshape(x.shape)
         max_err = float(np.abs(x.astype(np.float64) - rec.astype(np.float64)).max())

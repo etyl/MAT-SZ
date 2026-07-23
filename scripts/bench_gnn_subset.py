@@ -11,7 +11,7 @@ the 32^4 local ``rti_normal.npy`` and on the full-size Jean Zay tensor.
 
     python scripts/bench_gnn_subset.py data/rti_normal.npy \
         --gnn-checkpoint checkpoints/d64.pt --eb 1e-4 --normalize \
-        --levels 5 --chunk-size 32 --agg-level 1
+        --levels 5 --chunk-size 32
 
 Each run prints one report (config + git commit + every metric) to stdout;
 tag it with ``--label`` and re-run before/after an optimisation to compare.
@@ -335,8 +335,8 @@ def main(argv=None):
     print(f"{'input':<{w}} {args.input} {tuple(sub.shape)} "
           f"({sub.size} voxels, {orig_bytes} B)")
     print(f"{'eb':<{w}} {eb:g}   device {device}")
-    print(f"{'levels/stride':<{w}} {args.levels}/{args.anchor_stride}"
-          f"   chunk {args.chunk_size} batch {args.chunk_batch} "
+    print(f"{'levels/stride':<{w}} {args.levels}/{anchor_stride}"
+          f"   chunk {args.chunk_size} "
           f"tune {args.tune} fp16 {args.fp16} compile {args.compile}")
     print("-" * 60)
     print(f"{'PSNR':<{w}} {psnr:8.3f} dB")

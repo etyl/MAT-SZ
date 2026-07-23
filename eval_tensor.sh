@@ -37,7 +37,6 @@ python scripts/eval_tensor.py "$DATA" \
     --predictor gnn \
     --eb "$EB" \
     --levels 5 \
-    --agg-level 1 \
     --tune "$TUNE" \
     --tune-size-slack "$TUNE_SIZE_SLACK" \
     --normalize \

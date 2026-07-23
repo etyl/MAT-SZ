@@ -42,7 +42,7 @@ def test_defaults_match_eval_tensor(tiny_checkpoint):
     assert codec.anchor_stride == 32
     assert not hasattr(codec, "max_radius")
     assert not hasattr(codec, "anchor_block")
-    assert codec.agg_level == 2
+    assert not hasattr(codec, "agg_level")
     assert codec.chunk_size is None
     assert not hasattr(codec, "chunk_batch")
     assert codec.fp16 is True
@@ -76,7 +76,7 @@ def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):
     assert meta["dtype"] == x.dtype.str
     for redundant in (
         "codec", "coded_shape", "anchor_stride", "anchor_block",
-        "max_radius", "entropy_coder", "chunk_batch",
+        "max_radius", "agg_level", "entropy_coder", "chunk_batch",
     ):
         assert redundant not in meta
     assert isinstance(stream, bytes)

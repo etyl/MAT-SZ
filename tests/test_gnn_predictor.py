@@ -112,9 +112,9 @@ def test_init_embed_uses_value_only():
     assert model.init.net[0].in_features == 1
 
 
-def test_legacy_stage_forward_accepts_predict_idx():
-    """Older trainer/eval code passes a compact prediction index; keep that
-    call form working while the codec uses precomputed stage geometry."""
+def test_mask_stage_forward_accepts_predict_idx():
+    """Training can pass a compact prediction index while the codec uses
+    precomputed stage geometry."""
     model = build_model(d=16).eval()
     known = np.zeros((16, 16), bool)
     known[::4, ::4] = True

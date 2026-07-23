@@ -16,7 +16,7 @@ from .codec import _compress_region
 from . import gnn_predictor as _gp
 from .gnn_predictor import ChunkedGNNPredictor, GNNPredictor
 from .levels import stage_ebs, stage_masks, stage_plan
-from .predictor import _interp_axis_at, default_interp_center
+from .predictor import default_interp_center
 from .quantizer import dequantize, quantize
 from .bitstream import pack_stage, unpack_stage
 from .rans import SCALE_HI_MULT, SCALE_LO_DIV, build_laplace_tables, scale_to_level
@@ -89,12 +89,6 @@ def _as_numpy(x: Any) -> np.ndarray:
     if numpy is not None:
         return x.numpy()
     return np.asarray(x)
-
-
-def _meta_agg_level(meta: dict[str, Any]) -> int | None:
-    """Neighbourhood aggregation level recorded in a stream."""
-    v = meta["agg_level"]
-    return None if v is None else int(v)
 
 
 def _restore_dtype(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
@@ -309,75 +303,7 @@ _GATE_T = np.array([2, 3, 4, 5, 6, 7, 8], np.float64)
 _GATE_SHIFTS = (0, 2, 4, 6)
 
 
-def _laplace_bits(absr, b, eb):
-    """Ideal discretized-Laplace bits/pt at coded scale b (clipped to the rANS
-    grid), capped at 32 = the raw-f32 outlier escape. Model cost, not stream
-    cost — used only to rank gate settings against each other."""
-    b = np.clip(np.asarray(b, np.float64), eb / SCALE_LO_DIV, eb * SCALE_HI_MULT)
-    k = np.rint(np.abs(absr).astype(np.float64) / (2 * eb))
-    with np.errstate(over="ignore", under="ignore", divide="ignore"):
-        p = np.where(
-            k == 0,
-            -np.expm1(-eb / b),
-            0.5 * np.exp(-((2 * k - 1) * eb / b)) * -np.expm1(-2 * eb / b),
-        )
-        bits = -np.log2(p)
-    return np.minimum(bits, 32.0)
-
-
-def _interp_stage_pred(recon, sls, plan_entry):
-    """Chunk-local cubic-interp prediction of one stage's points from the
-    causal recon (the InterpPredictor fast-mode scheme). Sub-stages are coded
-    sequentially, so the ±stride neighbours are already reconstructed on both
-    sides — decoder-reproducible bit for bit."""
-    mask, stride, axes = plan_entry
-    cshape = mask.shape
-    coords = np.nonzero(mask)
-    W = recon[(slice(None), *sls)].astype(np.float64)
-    center = default_interp_center(len(cshape))
-    if center == 0 or len(axes) == 1:
-        ip = sum(
-            _interp_axis_at(W, coords, a, stride, "cubic", cshape) for a in axes
-        ) / len(axes)
-    else:
-        ip = _interp_axis_at(
-            W, coords, axes[0] if center == 1 else axes[-1], stride, "cubic", cshape
-        )
-    return ip.astype(np.float32)  # (C, n)
-
-
-def _gate_select(r_g, r_i, b, eb):
-    """Best (T, shift) for one chunk-stage under the model cost; (0, 0) = off.
-    Gating at T captures exactly the points with b < eb*2^T, so every grid
-    cell is a bucket prefix sum — ~|_GATE_SHIFTS| passes over the points."""
-    nb = _GATE_T.size + 1
-    bucket = np.digitize(b, eb * np.exp2(_GATE_T))
-
-    def bits(r, bb):
-        w = _laplace_bits(r, bb, eb).sum(0)
-        return np.cumsum(np.bincount(bucket, weights=w, minlength=nb))
-
-    base = bits(r_g, b)
-    best_bits, best = base[-1], (0, 0)
-    for sh in _GATE_SHIFTS:
-        ib = bits(r_i, b * 2.0**-sh)
-        for j in range(_GATE_T.size):
-            cost = base[-1] - base[j] + ib[j]
-            if cost < best_bits:
-                best_bits, best = cost, (int(_GATE_T[j]), sh)
-    return best
-
-
-def _gate_apply(pred_bi, scale_bi, ip, eb, gate_t, gate_sh):
-    """Shared encode/decode gate application: (pred, coded scale) after the
-    fallback. Must stay bit-identical on both sides."""
-    m = scale_bi < eb * 2.0**gate_t
-    p = np.where(m[None], ip, pred_bi[None]).astype(np.float32)
-    sc = np.where(m, scale_bi * 2.0**-gate_sh, scale_bi).astype(np.float32)
-    return p, sc
-
-
-# --- device twins of the inner-loop primitives ----------------------------
+# --- device inner-loop primitives -----------------------------------------
 # The chunked encode/decode inner loop runs entirely on the GPU: recon stays
 # resident on the device and quantize / dequantize / gate all execute in torch,
 # so the per-stage critical path never syncs to host. Only the rANS pack/unpack
@@ -389,9 +315,11 @@ def _gate_apply(pred_bi, scale_bi, ip, eb, gate_t, gate_sh):
 
 
 def _interp_axis_at_t(torch, W, coords, axis, s, shape):
-    """Device twin of ``_interp_axis_at`` (cubic). ``W`` (C, *S) float64;
-    ``coords`` a tuple of (M,) long tensors. Basic fp64 arithmetic + edge
-    clamping, so bit-identical to the numpy form (verified)."""
+    """Cubic interpolation on device.
+
+    ``W`` is ``(C, *S)`` float64 and ``coords`` is a tuple of ``(M,)`` long
+    tensors.
+    """
     def gather(off):
         ca = coords[axis] + off
         valid = (ca >= 0) & (ca < shape[axis])
@@ -412,8 +340,7 @@ def _interp_axis_at_t(torch, W, coords, axis, s, shape):
 
 
 def _interp_stage_pred_t(torch, recon_t, sls, coords_t, stride, axes, center):
-    """Device twin of ``_interp_stage_pred``: chunk-local cubic-interp prediction
-    of a stage's points from causal recon, on the GPU. Bit-identical to numpy."""
+    """Chunk-local cubic interpolation from the causal device reconstruction."""
     W = recon_t[(slice(None), *sls)].double()
     shape = tuple(W.shape[1:])
     if center == 0 or len(axes) == 1:
@@ -426,7 +353,7 @@ def _interp_stage_pred_t(torch, recon_t, sls, coords_t, stride, axes, center):
 
 
 def _laplace_bits_t(torch, absr, b, eb):
-    """Device twin of ``_laplace_bits`` (model cost, ranking only)."""
+    """Ideal discretized-Laplace model cost used to rank gate settings."""
     b = b.double().clamp(eb / SCALE_LO_DIV, eb * SCALE_HI_MULT)
     k = torch.round(absr.double().abs() / (2 * eb))
     p = torch.where(
@@ -1116,7 +1043,6 @@ class GNNCompressorCodec:
     ) -> ChunkedGNNPredictor:
         levels = self.levels if meta is None else int(meta["levels"])
         anchor_stride = 1 << levels
-        agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
         predictor = ChunkedGNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -1125,7 +1051,6 @@ class GNNCompressorCodec:
             levels=levels,
             anchor_stride=anchor_stride,
             anchor_block=_ANCHOR_BLOCK,
-            agg_level=agg_level,
         )
         # encode: from the codec flag; decode: replay the stream's float path
         predictor.fp16 = self.fp16 if meta is None else bool(meta["fp16"])
@@ -1142,7 +1067,6 @@ class GNNCompressorCodec:
     ) -> GNNPredictor:
         levels = self.levels if meta is None else int(meta["levels"])
         anchor_stride = 1 << levels
-        agg_level = self.agg_level if meta is None else _meta_agg_level(meta)
         return GNNPredictor(
             self.checkpoint_path,
             vmin,
@@ -1152,7 +1076,6 @@ class GNNCompressorCodec:
             levels=levels,
             anchor_stride=anchor_stride,
             anchor_block=_ANCHOR_BLOCK,
-            agg_level=agg_level,
         )
 
     def _checkpoint_hash(self) -> bytes:

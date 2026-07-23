@@ -821,11 +821,11 @@ def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
 def stage_forward(model, E, *args, **kwargs):
     """One codec stage of the propagating GNN.
 
-    Supports both APIs:
+    Supports both execution APIs:
     - optimized geometry API:
       ``stage_forward(model, E, geom_prev, geom_head, finalize_vals, torch,
       finalize_ctx=None, eb=...) -> ((mu, log_b), E, head_ctx)``
-    - legacy mask API:
+    - dynamic mask API used while training:
       ``stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch,
       predict_idx=None) -> (values, E)``
     """
@@ -843,9 +843,9 @@ def stage_forward(model, E, *args, **kwargs):
         return _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals,
                                     torch, finalize_ctx=finalize_ctx, eb=eb)
 
-    # Legacy path used by older training/eval code.
+    # Dynamic-mask path used by training, where stage geometry changes per batch.
     if len(args) < 5:
-        raise TypeError("legacy stage_forward needs max_radius and torch")
+        raise TypeError("mask stage_forward needs max_radius and torch")
     prev_mask, known_mask, norm, max_radius, torch = args[:5]
     predict_idx = kwargs.pop("predict_idx", None)
     eb = kwargs.pop("eb", 0.01)
@@ -1388,7 +1388,7 @@ class ChunkedGNNPredictor:
                 if progress is not None:
                     progress(len(ids))
 
-    # ---- chunk path (legacy streams may still decode several chunks at once) --
+    # ---- chunk-wave path ----------------------------------------------------
 
     def _amp(self):
         self._maybe_compile()
