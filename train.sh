@@ -15,7 +15,6 @@ module purge
 module load pytorch-gpu
 
 python scripts/train_gnn.py \
-    --data /lustre/fswork/projects/rech/lzs/uhq13gg/data/div2k \
     --out data/gnn_predictor.pt \
     --steps 10000 \
     --batch 16 \
@@ -23,7 +22,9 @@ python scripts/train_gnn.py \
     --d 128 \
     --lr 0.0005 \
     --noise-range 0.0001 0.05 \
-    --eval-image /lustre/fswork/projects/rech/lzs/uhq13gg/data/kodak/17.png \
+    --synthetic-turbulence-frac 0.5 \
+    --synthetic-discontinuities 3 \
+    --eval-shape 256 256 \
     --eval-eb 0.01 \
     --eval-every 100 \
     --img-every 500 \

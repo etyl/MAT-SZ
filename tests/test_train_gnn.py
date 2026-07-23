@@ -13,6 +13,8 @@ from scripts.train_gnn import (
     normalize_tensor,
     training_autocast,
     run_chunked_scene,
+    _warp,
+    _turbulent_advect,
 )
 from deepsz.gnn_predictor import build_model
 
@@ -118,20 +120,152 @@ def test_synthetic_fields_randomly_permute_correlation_axes():
     assert len(set(smoothest_axes)) > 1
 
 
+def test_synthetic_batch_is_2d_normalized():
+    shape = (48, 40)
+    a = sample_synthetic_batch(
+        4,
+        shape,
+        (2.0, 32.0),
+        np.random.default_rng(5),
+        turbulence_frac=0.5,
+        max_discontinuities=3,
+    )
+    assert a.shape == (4, np.prod(shape))
+    assert torch.isfinite(a).all()
+    assert float(a.min()) >= 0.0
+    assert float(a.max()) <= 1.0
+
+
+def test_discontinuities_inject_sharp_jumps():
+    """Forced hyperplane cuts concentrate variation into single-cell steps, so
+    the adjacent-difference distribution is far more peaked (max/mean) than the
+    smooth field's gently varying gradient — the signature of a sharp front."""
+    shape = (64, 64)
+
+    def peakedness(fields):
+        vals = []
+        for f in fields:
+            d = torch.cat(
+                [torch.diff(f, dim=0).abs().reshape(-1), torch.diff(f, dim=1).abs().reshape(-1)]
+            )
+            vals.append(float(d.max() / (d.mean() + 1e-9)))
+        return float(np.mean(vals))
+
+    smooth = sample_synthetic_batch(
+        8, shape, (8.0, 8.0), np.random.default_rng(11), turbulence_frac=0.0,
+        max_discontinuities=0,
+    ).reshape(8, *shape)
+    cut = sample_synthetic_batch(
+        8, shape, (8.0, 8.0), np.random.default_rng(11), turbulence_frac=0.0,
+        max_discontinuities=6,
+    ).reshape(8, *shape)
+
+    assert peakedness(cut) > 1.2 * peakedness(smooth)
+
+
+def test_discontinuities_disabled_matches_no_cut_arg():
+    shape = (32, 32)
+    a = sample_synthetic_batch(
+        3, shape, (4.0, 16.0), np.random.default_rng(3), max_discontinuities=0
+    )
+    assert torch.isfinite(a).all()
+    assert float(a.min()) >= 0.0 and float(a.max()) <= 1.0
+
+
+def test_turbulent_spectrum_is_reproducible_and_bounded():
+    shape = (40, 40)
+    a = sample_synthetic_batch(
+        3, shape, (2.0, 32.0), np.random.default_rng(21), turbulence_frac=1.0
+    )
+    b = sample_synthetic_batch(
+        3, shape, (2.0, 32.0), np.random.default_rng(21), turbulence_frac=1.0
+    )
+    assert torch.equal(a, b)
+    assert float(a.min()) >= 0.0 and float(a.max()) <= 1.0
+
+
+def test_warp_with_zero_displacement_is_identity():
+    shape = (12, 10)
+    field = torch.rand(3, *shape)
+    disp = torch.zeros(3, 2, *shape)
+    out = _warp(field, disp, shape, "cpu")
+    assert torch.allclose(out, field, atol=1e-5)
+
+
+def test_warp_shift_advects_content():
+    """A constant unit displacement backward-samples the neighbour, so the field
+    shifts by one cell (reflecting at the boundary) rather than staying put."""
+    shape = (1, 8)
+    field = torch.arange(8, dtype=torch.float32).reshape(1, *shape)
+    disp = torch.zeros(1, 2, *shape)
+    disp[:, 1] = 1.0  # sample one cell further along the last axis
+    out = _warp(field, disp, shape, "cpu").reshape(-1)
+    assert torch.allclose(out[:-1], field.reshape(-1)[1:])
+
+
+def test_turbulent_advection_only_moves_turbulent_rows():
+    torch.manual_seed(0)
+    field = torch.rand(4, 32, 32)
+    is_turb = [False, True, False, True]
+    out = _turbulent_advect(
+        field.clone(), is_turb, np.random.default_rng(1), (32, 32), "cpu"
+    )
+    moved = [float((out[i] - field[i]).abs().mean()) for i in range(4)]
+    assert moved[0] == 0.0 and moved[2] == 0.0  # smooth rows untouched
+    assert moved[1] > 1e-3 and moved[3] > 1e-3  # turbulent rows advected
+
+
+def test_advection_raises_local_anisotropy():
+    """Advected turbulent fields have more elongated (streaky/filamentary) local
+    structure than the phase-random spectrum-only field, measured by the mean
+    anisotropy of the gradient structure tensor."""
+    import scripts.train_gnn as gnn
+
+    shape = (96, 96)
+
+    def anisotropy(fields):
+        vals = []
+        for f in fields:
+            gy = torch.diff(f, dim=0)[:, :-1]
+            gx = torch.diff(f, dim=1)[:-1, :]
+            jxx, jyy, jxy = (gx * gx).mean(), (gy * gy).mean(), (gx * gy).mean()
+            tr, det = jxx + jyy, jxx * jyy - jxy * jxy
+            disc = torch.clamp(tr * tr / 4 - det, min=0.0).sqrt()
+            l1, l2 = tr / 2 + disc, tr / 2 - disc
+            vals.append(float((l1 - l2) / (l1 + l2 + 1e-9)))
+        return float(np.mean(vals))
+
+    orig = gnn._turbulent_advect
+    try:
+        gnn._turbulent_advect = lambda f, *a, **k: f  # spectrum only
+        spectral = gnn.sample_synthetic_batch(
+            8, shape, (2.0, 32.0), np.random.default_rng(4), turbulence_frac=1.0,
+            max_discontinuities=0,
+        ).reshape(8, *shape)
+    finally:
+        gnn._turbulent_advect = orig
+    advected = gnn.sample_synthetic_batch(
+        8, shape, (2.0, 32.0), np.random.default_rng(4), turbulence_frac=1.0,
+        max_discontinuities=0,
+    ).reshape(8, *shape)
+
+    assert anisotropy(advected) > anisotropy(spectral)
+
+
 def test_mixed_batch_fraction_counts_scalar_points():
-    image_batch, synthetic_batch, actual = mixed_batch_sizes(
+    field2d_batch, synthetic_batch, actual = mixed_batch_sizes(
         crop=128,
         synthetic_shape=(16, 16, 16, 16),
         synthetic_fraction=0.25,
-        image_batch=8,
+        field2d_batch=8,
         synthetic_batch=1,
     )
 
-    assert image_batch == 12
+    assert field2d_batch == 12
     assert synthetic_batch == 1
-    image_points = image_batch * 128**2
+    field2d_points = field2d_batch * 128**2
     synthetic_points = synthetic_batch * 16**4
-    assert synthetic_points / (image_points + synthetic_points) == 0.25
+    assert synthetic_points / (field2d_points + synthetic_points) == 0.25
     assert actual == 0.25
 
 

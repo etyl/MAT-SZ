@@ -64,14 +64,19 @@ tests several coarse-stage error schedules and retains the smallest stream.
 
 ## GNN Training and Evaluation
 
-The trainer can mix image crops with smooth synthetic n-D fields:
+The trainer runs entirely on synthetic data — no natural images or external
+datasets required. It mixes 2-D fields with anisotropic n-D fields drawn from
+one generator that spans smooth Gaussian random fields, power-law turbulence,
+and sharp random-hyperplane discontinuities (shocks / interfaces):
 
 ```bash
 python scripts/train_gnn.py \
-    --data /path/to/images \
     --synthetic-frac 0.5 \
     --synthetic-shape 16 16 16 16 \
-    --synthetic-correlation 6 3 1.5 0.75 \
+    --synthetic-correlation 1 8 \
+    --synthetic-2d-correlation 2 32 \
+    --synthetic-turbulence-frac 0.5 \
+    --synthetic-discontinuities 3 \
     --synthetic-stride 8 \
     --agg-level 2
 ```

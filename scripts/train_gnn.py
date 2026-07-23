@@ -1,15 +1,17 @@
-"""Train the lightweight GNN predictor (deepsz/gnn_predictor.py) on natural
-images mixed with anisotropic synthetic 4-D fields. CPU-friendly: the model is
-~20k params, a few thousand steps suffice.
+"""Train the lightweight GNN predictor (deepsz/gnn_predictor.py) purely on
+synthetic scientific-like fields: 2-D fields mixed with anisotropic 4-D fields,
+both from the same generator (smooth Gaussian random fields *and* power-law
+turbulence, with random-hyperplane discontinuities). No natural images or
+external data are needed. CPU-friendly: the model is ~20k params, a few thousand
+steps suffice.
 
-    conda run -n nf python scripts/train_gnn.py --data /path/to/images
+    conda run -n nf python scripts/train_gnn.py
 
-Each step crops random 128x128 patches, picks a random colour plane
-(R / G / B / grayscale luma) so the net trains on grayscale as well as single
-colour channels, teacher-forces the hierarchical stage schedule (levels.py)
-with true values (+ quantization-like noise at the sampled error bound) and
-minimises discretized-Laplacian NLL over the hole positions of every refinement
-stage. Checkpoint -> data/gnn_predictor.pt.
+Each step generates fresh 2-D fields (shape --crop x --crop) and/or 4-D fields
+(--synthetic-shape) directly on the device, teacher-forces the hierarchical
+stage schedule (levels.py) with true values (+ quantization-like noise at the
+sampled error bound) and minimises discretized-Laplacian NLL over the hole
+positions of every refinement stage. Checkpoint -> data/gnn_predictor.pt.
 """
 
 from __future__ import annotations
@@ -23,9 +25,6 @@ import os
 import random
 import threading
 import time
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -46,12 +45,6 @@ from deepsz.gnn_predictor import (
     stage_forward,
 )
 from deepsz.levels import stage_masks
-
-IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".ppm", ".pgm"}
-
-
-def list_images(root):
-    return [p for p in Path(root).rglob("*") if p.suffix.lower() in IMG_EXT]
 
 
 def load_tensor(path: str) -> np.ndarray:
@@ -78,45 +71,135 @@ def normalize_tensor(tensor: np.ndarray) -> np.ndarray:
     return (tensor - lo) / (hi - lo)
 
 
-@lru_cache(maxsize=1024)
-def _decode_rgb(path):
-    """Decode the whole image once and keep it in RAM (uint8 RGB). Random crops
-    then slice from memory instead of re-decoding megapixels every sample — the
-    decode was ~half the training-step CPU time.
-    ponytail: 1024-image LRU (covers DIV2K's 800; ~8 GB at 2K uint8). Lower
-    maxsize if the node is RAM-tight, raise/drop it to cache a bigger set."""
-    from PIL import Image
-
-    return np.asarray(Image.open(path).convert("RGB"), np.uint8)  # (H, W, 3)
-
-
-def load_plane(path, crop):
-    """Random `crop`x`crop` patch from a random plane (R/G/B/gray), in [0,1]."""
-    a = _decode_rgb(path)  # cached uint8; never mutated (we only slice + copy)
-    if min(a.shape[:2]) < crop:
-        from PIL import Image
-
-        im = Image.fromarray(a).resize((max(crop, a.shape[1]), max(crop, a.shape[0])))
-        a = np.asarray(im, np.uint8)
-    h, w, _ = a.shape
-    y = random.randint(0, h - crop)
-    x = random.randint(0, w - crop)
-    patch = a[y : y + crop, x : x + crop].astype(np.float32) / 255.0
-    ch = random.randint(0, 3)
-    if ch < 3:
-        return patch[..., ch]
-    return patch @ np.array([0.299, 0.587, 0.114], np.float32)  # luma
+def _gaussian_smooth(x, sigma, shape, device):
+    """Isotropic Gaussian blur of ``x`` (B, *shape) via the same mirror-doubled
+    FFT product used for the base fields (exact reflect boundary, no seam)."""
+    ndim = len(shape)
+    dims = tuple(range(1, ndim + 1))
+    for ax in dims:
+        x = torch.cat([x, x.flip(ax)], dim=ax)
+    spec = torch.fft.rfftn(x, dim=dims)
+    for k, n in enumerate(shape):
+        f = (torch.fft.rfftfreq if k == ndim - 1 else torch.fft.fftfreq)(
+            2 * n, device=device
+        )
+        g = torch.exp(-2.0 * (math.pi * f) ** 2 * sigma**2)
+        spec = spec * g.reshape(1, *(len(f) if a == k else 1 for a in range(ndim)))
+    x = torch.fft.irfftn(spec, s=x.shape[1:], dim=dims)
+    return x[(slice(None),) + tuple(slice(n) for n in shape)]
 
 
-def sample_batch(paths, batch, crop):
-    planes = [load_plane(random.choice(paths), crop) for _ in range(batch)]
-    return torch.from_numpy(np.stack(planes)).reshape(batch, -1)  # (B, N)
+def _warp(field, disp, shape, device):
+    """Backward-sample ``field`` (B, *shape) at ``grid + disp`` with n-D
+    multilinear interpolation and a reflecting boundary. ``disp`` is (B, ndim,
+    *shape) in cell units. Applied iteratively this advects the field along the
+    (frozen) displacement flow — the mechanism that turns a phase-random field
+    into one with coherent swirls and filaments."""
+    B = field.shape[0]
+    ndim = len(shape)
+    strides = []
+    s = 1
+    for n in reversed(shape):
+        strides.insert(0, s)
+        s *= n
+    base = torch.meshgrid(
+        *[torch.arange(n, device=device, dtype=torch.float32) for n in shape],
+        indexing="ij",
+    )
+    src = torch.stack(base)[None] + disp  # (B, ndim, *shape)
+    lo = torch.floor(src)
+    frac = src - lo
+    lo = lo.long()
+    flat = field.reshape(B, -1)
+    out = torch.zeros_like(field)
+    for corner in range(1 << ndim):  # 2**ndim interpolation corners
+        w = torch.ones_like(field)
+        flat_idx = torch.zeros(field.shape, dtype=torch.long, device=device)
+        for k in range(ndim):
+            bit = (corner >> k) & 1
+            n = shape[k]
+            ck = torch.remainder(lo[:, k] + bit, 2 * n)  # reflect into [0, n)
+            ck = torch.where(ck >= n, 2 * n - 1 - ck, ck)
+            w = w * (frac[:, k] if bit else 1.0 - frac[:, k])
+            flat_idx = flat_idx + ck * strides[k]
+        gathered = torch.gather(flat, 1, flat_idx.reshape(B, -1)).reshape(field.shape)
+        out = out + w * gathered
+    return out
+
+
+def _turbulent_advect(field, is_turb, rng, shape, device, iters=3):
+    """Give the ``is_turb`` rows of ``field`` coherent turbulent structure by
+    advecting them through a smooth random flow (iterated domain warping).
+
+    A power-law spectrum alone only makes a field *rougher* — its Fourier phases
+    are still independent, so it has no eddies, filaments, or roll-ups. Warping
+    the field along a smooth divergence-carrying displacement, repeated a few
+    times, correlates those phases into the swirling, stretched, filamentary
+    patterns turbulence actually produces. Non-turbulent rows get zero
+    displacement (an exact identity warp), so they pass through unchanged."""
+    B = field.shape[0]
+    ndim = len(shape)
+    mn = min(shape)
+    amp = np.array(
+        [float(rng.uniform(0.06, 0.16)) * mn if t else 0.0 for t in is_turb],
+        dtype=np.float32,
+    )
+    if not amp.any():
+        return field
+    # One smooth vector flow per field: ndim components, correlation a sizable
+    # fraction of the domain so the swirls are large-scale coherent structures.
+    flow_sigma = float(rng.uniform(0.12, 0.28) * mn)
+    white = torch.from_numpy(
+        rng.standard_normal((B * ndim, *shape)).astype(np.float32)
+    ).to(device)
+    flow = _gaussian_smooth(white, flow_sigma, shape, device).reshape(B, ndim, *shape)
+    std = flow.reshape(B, ndim, -1).std(dim=2).clamp_min(1e-6)
+    disp = flow / std.reshape(B, ndim, *([1] * ndim))
+    disp = disp * torch.from_numpy(amp).to(device).reshape(B, 1, *([1] * ndim))
+    for _ in range(iters):
+        field = _warp(field, disp, shape, device)
+    return field
+
+
+def _add_discontinuities(fi, n_cuts, coords, rng, device):
+    """Overlay ``n_cuts`` piecewise-constant jumps on the field ``fi`` (shape
+    ``shape``) to inject sharp fronts — the shocks, material interfaces, and
+    contact discontinuities that smooth Gaussian fields never contain but that
+    dominate the residual (and the bit budget) in real scientific data.
+
+    Each cut is a random hyperplane ``v · x = t``: one side gets a constant
+    offset added, so the field steps discontinuously across an (n-1)-D face.
+    ``coords`` holds the per-axis normalized [0, 1] coordinate grids (broadcast
+    shape) so a single dot product gives the signed distance field. Jump sizes
+    scale with the field's own spread so the fronts stay comparable in amplitude
+    to the smooth variation regardless of the marginal warp."""
+    if n_cuts <= 0:
+        return fi
+    ndim = len(coords)
+    scale = float(fi.std()) or 1.0
+    for _ in range(n_cuts):
+        v = rng.standard_normal(ndim)
+        v = v / (np.linalg.norm(v) + 1e-12)
+        proj = sum(float(v[k]) * coords[k] for k in range(ndim))
+        # Threshold at a random interior quantile so both sides carry area.
+        q = float(rng.uniform(0.25, 0.75))
+        t = torch.quantile(proj.reshape(-1), q)
+        jump = float(rng.choice((-1.0, 1.0))) * float(rng.uniform(0.4, 1.5)) * scale
+        fi = fi + jump * (proj > t).to(fi.dtype)
+    return fi
 
 
 def sample_synthetic_batch(
-    batch, shape, correlation, rng=None, randomize=True, device="cpu"
+    batch,
+    shape,
+    correlation,
+    rng=None,
+    randomize=True,
+    device="cpu",
+    turbulence_frac=0.5,
+    max_discontinuities=3,
 ):
-    """Return smooth scientific-like random fields in ``[0, 1]``.
+    """Return scientific-like random fields in ``[0, 1]``.
 
     Instead of one fixed texture, each field randomizes its generative knobs so
     the training distribution *covers* the variety real scientific fields show,
@@ -124,27 +207,38 @@ def sample_synthetic_batch(
     high-capacity model overfits (it then generalizes worse on out-of-domain
     eval even as train/in-domain loss improves). Per field we randomize:
 
-      * smoothness & anisotropy: a per-field base sigma is drawn log-uniformly
-        within the band set by ``correlation`` (its min/max); each axis then
-        jitters off it by a per-field random spread, so the axis-ratio itself
+      * spectrum & structure: with probability ``turbulence_frac`` the field is
+        *turbulent* — a power-law (fractal / fBm-like) amplitude spectrum
+        ``|k|**-p`` for the multi-scale energy cascade, then advected through a
+        smooth random flow (iterated domain warping) to correlate its Fourier
+        phases into coherent swirls, filaments, and roll-ups. The spectrum alone
+        only makes a field rougher; the advection is what produces actual
+        turbulent *patterns*. Otherwise the field is a *smooth* two-scale
+        Gaussian random field (a fine scale plus a 2x-coarser one);
+      * smoothness & anisotropy (smooth fields): a per-field base sigma drawn
+        log-uniformly within the band set by ``correlation`` (its min/max); each
+        axis then jitters off it by a per-field random spread, so the axis-ratio
         ranges from near-isotropic (spread~0) to strongly anisotropic;
-      * spectrum: a fine scale plus a 2x-coarser one, keeping two-scale content;
       * value marginal: a random monotone warp (identity / signed power / tanh)
-        yields unimodal, skewed, or bimodal histograms.
+        yields unimodal, skewed, or bimodal histograms;
+      * discontinuities: 0..``max_discontinuities`` random hyperplane fronts add
+        piecewise-constant jumps (shocks / material interfaces), so the model
+        also trains on the sharp edges smooth GRFs lack.
 
     Filtering runs as an FFT product on ``device`` (mirror-doubling each axis
     gives an exact 'reflect' boundary, avoiding an artificial periodic seam),
     so generation is GPU-fast and its cost is independent of sigma. Random
     knobs and the raw noise come from the numpy ``rng``, keeping seeded runs
     reproducible. ``randomize=False`` is the deterministic single-texture path
-    (exact ``correlation`` per axis, Gaussian marginal) for diagnostics.
+    (exact ``correlation`` per axis, smooth Gaussian marginal, no turbulence or
+    discontinuities) for diagnostics.
     """
     shape = tuple(int(n) for n in shape)
     correlation = tuple(float(s) for s in correlation)
     rng = np.random.default_rng() if rng is None else rng
     ndim = len(shape)
     lo_s, hi_s = min(correlation) * 0.5, max(correlation)
-    sigmas, warps = [], []
+    sigmas, warps, turb, exps, cuts = [], [], [], [], []
     for _ in range(batch):
         if randomize:
             base = float(np.exp(rng.uniform(np.log(lo_s), np.log(hi_s))))
@@ -162,16 +256,26 @@ def sample_synthetic_batch(
                 else float(rng.uniform(1.5, 4.0))
             )  # tanh gain
             warps.append((kind, param))
+            turb.append(bool(rng.random() < turbulence_frac))
+            exps.append(float(rng.uniform(0.7, 1.6)))  # |k|**-p amplitude falloff
+            cuts.append(int(rng.integers(0, int(max_discontinuities) + 1)))
         else:
             sigmas.append(list(correlation))
             warps.append((0, 0.0))
+            turb.append(False)
+            exps.append(1.0)
+            cuts.append(0)
     # Fine noise plus an independent 2x-coarser realization, filtered in one
     # batched FFT: rows [0, B) are fine, rows [B, 2B) their coarse partners.
+    # Each row's filter is either its anisotropic Gaussian (smooth fields) or a
+    # radial power law (turbulent fields), selected per row below.
     sig = torch.tensor(
         sigmas + [[2.0 * s for s in row] for row in sigmas],
         dtype=torch.float32,
         device=device,
     )
+    is_turb = torch.tensor(turb + turb, dtype=torch.bool, device=device)
+    p = torch.tensor(exps + exps, dtype=torch.float32, device=device)
     x = torch.from_numpy(
         rng.standard_normal((2 * batch, *shape)).astype(np.float32)
     ).to(device)
@@ -179,17 +283,40 @@ def sample_synthetic_batch(
     for ax in dims:  # even extension -> exact 'reflect'
         x = torch.cat([x, x.flip(ax)], dim=ax)
     spec = torch.fft.rfftn(x, dim=dims)
+    # Build the per-row filter over the full rfft grid: gaussian exponent
+    # (separable sum) and radial |k|^2 accumulate axis by axis.
+    gauss_exp = torch.zeros((2 * batch,) + spec.shape[1:], device=device)
+    kmag2 = torch.zeros(spec.shape[1:], device=device)
     for k, n in enumerate(shape):
         f = (torch.fft.rfftfreq if k == ndim - 1 else torch.fft.fftfreq)(
             2 * n, device=device
         )
-        g = torch.exp(-2.0 * (math.pi * f) ** 2 * sig[:, k, None] ** 2)
-        spec = spec * g.reshape(
-            2 * batch, *(len(f) if a == k else 1 for a in range(ndim))
-        )
+        bshape = tuple(len(f) if a == k else 1 for a in range(ndim))
+        f2 = (f**2).reshape(bshape)
+        gauss_exp = gauss_exp + f2[None] * sig[:, k].reshape(-1, *([1] * ndim)) ** 2
+        kmag2 = kmag2 + f2
+    gauss = torch.exp(-2.0 * math.pi**2 * gauss_exp)
+    # Radial power law amplitude; DC (k=0) forced to 0 so the field is centred.
+    turb_filt = (kmag2[None] + 1e-8) ** (-0.5 * p.reshape(-1, *([1] * ndim)))
+    turb_filt = torch.where(
+        kmag2[None] > 0, turb_filt, torch.zeros_like(turb_filt)
+    )
+    filt = torch.where(is_turb.reshape(-1, *([1] * ndim)), turb_filt, gauss)
+    spec = spec * filt
     x = torch.fft.irfftn(spec, s=x.shape[1:], dim=dims)
     x = x[(slice(None),) + tuple(slice(n) for n in shape)]
     field = x[:batch] + 0.5 * x[batch:]
+    # Advect the turbulent rows along a smooth flow so they gain coherent
+    # swirl/filament structure rather than just a rougher spectrum.
+    if randomize:
+        field = _turbulent_advect(field, turb, rng, shape, device)
+    # Normalized [0, 1] coordinate grids, broadcast-shaped, for hyperplane cuts.
+    coords = [
+        torch.linspace(0.0, 1.0, n, device=device).reshape(
+            tuple(n if a == k else 1 for a in range(ndim))
+        )
+        for k, n in enumerate(shape)
+    ]
     fields = []
     for i in range(batch):
         fi = field[i]
@@ -202,8 +329,9 @@ def sample_synthetic_batch(
             elif kind == 2:  # push toward two phases
                 z = torch.tanh(param * z)
             fi = z
+        fi = _add_discontinuities(fi, cuts[i], coords, rng, device)
         # Robust scaling retains local variation when one realization contains
-        # a rare extreme. Values match the normalized image training range.
+        # a rare extreme. Values match the normalized [0, 1] training range.
         lo, hi = torch.quantile(
             fi.reshape(-1), torch.tensor([0.01, 0.99], device=device)
         )
@@ -216,62 +344,30 @@ def sample_synthetic_batch(
 
 
 def mixed_batch_sizes(
-    crop, synthetic_shape, synthetic_fraction, image_batch, synthetic_batch
+    crop, synthetic_shape, synthetic_fraction, field2d_batch, synthetic_batch
 ):
     """Choose source batch sizes and return their actual point fraction.
 
     A 2-D crop and a 4-D field are indivisible training examples, so arbitrary
     fractions can only be approximated at that granularity. ``synthetic_batch``
-    fixes the number of fields; the image batch is derived to make the fraction
-    of scalar points as close as possible to ``synthetic_fraction``. At the two
-    endpoints the explicitly configured batch size for the active source is
-    retained.
+    fixes the number of 4-D fields; the 2-D-field batch is derived to make the
+    fraction of scalar points as close as possible to ``synthetic_fraction``. At
+    the two endpoints the explicitly configured batch size for the active source
+    is retained.
     """
     fraction = float(synthetic_fraction)
     if fraction == 0.0:
-        return int(image_batch), 0, 0.0
+        return int(field2d_batch), 0, 0.0
     if fraction == 1.0:
         return 0, int(synthetic_batch), 1.0
-    image_points = int(crop) ** 2
+    field2d_points = int(crop) ** 2
     field_points = math.prod(int(n) for n in synthetic_shape)
     synthetic_batch = int(synthetic_batch)
-    target_image_points = synthetic_batch * field_points * (1.0 - fraction) / fraction
-    image_batch = max(1, round(target_image_points / image_points))
+    target_2d_points = synthetic_batch * field_points * (1.0 - fraction) / fraction
+    field2d_batch = max(1, round(target_2d_points / field2d_points))
     ns = synthetic_batch * field_points
-    ni = image_batch * image_points
-    return image_batch, synthetic_batch, ns / (ni + ns)
-
-
-def prefetch_batches(paths, batch, crop, steps, workers):
-    """Yield `steps` CPU batches, decoding on `workers` background threads so
-    image I/O overlaps the GPU step (PIL/numpy release the GIL, so threads
-    decode in parallel). Keeps ~2*workers batches in flight.
-
-    ponytail: workers==0 is the plain synchronous path — use it for a bit-
-    reproducible seeded run, since parallel workers race on the global RNG and
-    make the *content* of each batch non-deterministic (consumption order is
-    still FIFO). Overlap matters most while the decode cache is cold or the set
-    is larger than the cache; a fully-cached set barely needs it."""
-    if workers <= 0:
-        for _ in range(steps):
-            yield sample_batch(paths, batch, crop)
-        return
-    ahead = max(2 * workers, 2)
-    ex = ThreadPoolExecutor(max_workers=workers)
-    futs = deque()
-    submitted = 0
-    try:
-        while submitted < min(ahead, steps):
-            futs.append(ex.submit(sample_batch, paths, batch, crop))
-            submitted += 1
-        for _ in range(steps):
-            b = futs.popleft().result()
-            if submitted < steps:
-                futs.append(ex.submit(sample_batch, paths, batch, crop))
-                submitted += 1
-            yield b
-    finally:
-        ex.shutdown(wait=False, cancel_futures=True)
+    ni = field2d_batch * field2d_points
+    return field2d_batch, synthetic_batch, ns / (ni + ns)
 
 
 def qz(pred, truth, eb):
@@ -318,10 +414,10 @@ def interp_eval(x, masks, eb, order):
 def residual_rgb(res):
     """Signed residual -> RGB via a diverging colormap symmetric about zero
     (blue = under-predicted, red = over-predicted, white = exact)."""
-    import matplotlib.cm as cm
+    import matplotlib
 
     m = float(np.abs(res).max()) or 1.0
-    return cm.get_cmap("seismic")((res / m + 1) / 2)[..., :3]
+    return matplotlib.colormaps["seismic"]((res / m + 1) / 2)[..., :3]
 
 
 def _batch_scalar(value, batch, device):
@@ -697,19 +793,30 @@ def run_chunked_scene(
     return nll, npix, {"abs_err": abs_err}
 
 
-def load_eval_plane(path, device):
-    """Whole-image luma plane from the eval image as ((1, N), (h, w))."""
-    from PIL import Image
+def make_eval_field(shape, device, correlation, turbulence_frac, max_disc, seed=12345):
+    """Fixed held-out 2-D synthetic field as ((1, N), (h, w)).
 
-    a = np.asarray(Image.open(path).convert("RGB"), np.float32) / 255.0
-    h, w, _ = a.shape
-    luma = a @ np.array([0.299, 0.587, 0.114], np.float32)
-    return torch.from_numpy(luma.reshape(1, -1)).to(device), (h, w)
+    Drawn from the same generator as the training data (turbulence +
+    discontinuities included), but from a dedicated fixed-seed RNG so the eval
+    field is identical across steps and across runs — a stable yardstick that is
+    still representative of the training distribution rather than a single
+    natural image.
+    """
+    eval_rng = np.random.default_rng(seed)
+    x = sample_synthetic_batch(
+        1,
+        shape,
+        correlation,
+        eval_rng,
+        device=device,
+        turbulence_frac=turbulence_frac,
+        max_discontinuities=max_disc,
+    )
+    return x, tuple(int(n) for n in shape)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="folder of natural images")
     ap.add_argument(
         "--out",
         default=str(
@@ -724,15 +831,47 @@ def main():
         help="save a numbered checkpoint every N steps "
         "(0 disables periodic checkpoints)",
     )
-    ap.add_argument("--batch", type=int, default=8)
-    ap.add_argument("--crop", type=int, default=128)
+    ap.add_argument(
+        "--batch",
+        type=int,
+        default=8,
+        help="number of 2-D synthetic fields per optimizer step",
+    )
+    ap.add_argument(
+        "--crop", type=int, default=128, help="side length of each 2-D synthetic field"
+    )
     ap.add_argument(
         "--synthetic-frac",
         type=float,
         default=0.5,
         help="target fraction of scalar training points from 4-D "
-        "fields in every optimizer step; the image batch size "
+        "fields in every optimizer step; the 2-D-field batch size "
         "is derived to approach this fraction",
+    )
+    ap.add_argument(
+        "--synthetic-2d-correlation",
+        type=float,
+        nargs=2,
+        default=(2.0, 32.0),
+        metavar=("MIN", "MAX"),
+        help="correlation-length band (grid cells) for the 2-D "
+        "synthetic fields (larger than the 4-D band to match the "
+        "larger crop); see --synthetic-correlation",
+    )
+    ap.add_argument(
+        "--synthetic-turbulence-frac",
+        type=float,
+        default=0.5,
+        help="per-field probability the spectrum is turbulent "
+        "(power-law / fractal) rather than a smooth Gaussian field",
+    )
+    ap.add_argument(
+        "--synthetic-discontinuities",
+        type=int,
+        default=3,
+        help="maximum number of random-hyperplane jump fronts "
+        "(shocks / interfaces) added per field; each field draws "
+        "0..N cuts (0 disables discontinuities)",
     )
     ap.add_argument(
         "--synthetic-shape",
@@ -806,17 +945,18 @@ def main():
         help="SZ-style interpolation used for the reference line",
     )
     ap.add_argument(
-        "--eval-image",
-        default=str(
-            Path(__file__).resolve().parent.parent / "data" / "kodak" / "kodim17.png"
-        ),
-        help="held-out image the model + baseline are evaluated on",
+        "--eval-shape",
+        type=int,
+        nargs=2,
+        default=(256, 256),
+        metavar=("H", "W"),
+        help="shape of the fixed held-out 2-D synthetic eval field",
     )
     ap.add_argument(
         "--eval-every",
         type=int,
         default=50,
-        help="evaluate model bpp on the eval image every N steps",
+        help="evaluate model bpp on the eval field every N steps",
     )
     ap.add_argument(
         "--img-every",
@@ -871,13 +1011,6 @@ def main():
         help="fix the anchor stride (default: random 8/16/32)",
     )
     ap.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        help="background image-decode threads (0 = synchronous, "
-        "bit-reproducible; >0 overlaps I/O with the GPU step)",
-    )
-    ap.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="cpu | cuda | cuda:N",
@@ -921,6 +1054,14 @@ def main():
         raise SystemExit("--synthetic-shape entries must all be >= 2")
     if any(s <= 0 for s in args.synthetic_correlation):
         raise SystemExit("--synthetic-correlation entries must all be > 0")
+    if any(s <= 0 for s in args.synthetic_2d_correlation):
+        raise SystemExit("--synthetic-2d-correlation entries must all be > 0")
+    if not 0.0 <= args.synthetic_turbulence_frac <= 1.0:
+        raise SystemExit("--synthetic-turbulence-frac must be in [0, 1]")
+    if args.synthetic_discontinuities < 0:
+        raise SystemExit("--synthetic-discontinuities must be >= 0")
+    if any(n < 2 for n in args.eval_shape):
+        raise SystemExit("--eval-shape entries must all be >= 2")
     if args.synthetic_batch < 1:
         raise SystemExit("--synthetic-batch must be >= 1")
     if args.synthetic_stride < 2 or args.synthetic_stride & (args.synthetic_stride - 1):
@@ -966,11 +1107,8 @@ def main():
     amp_enabled = args.fp16 and device.type == "cuda"
     if args.fp16 and not amp_enabled:
         print(f"NOTE: --fp16 only engages on CUDA; using FP32 on device={device}")
-    paths = list_images(args.data)
-    if not paths:
-        raise SystemExit(f"no images found under {args.data}")
-    print(f"{len(paths)} images, device={device}")
-    image_batch, synthetic_batch, synthetic_point_fraction = mixed_batch_sizes(
+    print(f"device={device}")
+    field2d_batch, synthetic_batch, synthetic_point_fraction = mixed_batch_sizes(
         args.crop,
         args.synthetic_shape,
         args.synthetic_frac,
@@ -978,16 +1116,19 @@ def main():
         args.synthetic_batch,
     )
     if args.synthetic_frac:
-        image_points = image_batch * args.crop**2
+        field2d_points = field2d_batch * args.crop**2
         synthetic_points = synthetic_batch * math.prod(args.synthetic_shape)
         print(
             "synthetic mix: "
             f"target={args.synthetic_frac:g}, "
             f"actual point fraction={synthetic_point_fraction:.6g}, "
-            f"image={image_batch}x{args.crop}^2={image_points} points, "
-            f"synthetic={synthetic_batch}x{tuple(args.synthetic_shape)}="
+            f"2d={field2d_batch}x{args.crop}^2={field2d_points} points, "
+            f"4d={synthetic_batch}x{tuple(args.synthetic_shape)}="
             f"{synthetic_points} points, "
-            f"correlation={tuple(args.synthetic_correlation)}, "
+            f"2d-correlation={tuple(args.synthetic_2d_correlation)}, "
+            f"4d-correlation={tuple(args.synthetic_correlation)}, "
+            f"turbulence-frac={args.synthetic_turbulence_frac:g}, "
+            f"max-discontinuities={args.synthetic_discontinuities}, "
             f"stride={args.synthetic_stride}"
         )
 
@@ -1024,13 +1165,19 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model: {n_params} params, d={args.d}")
 
-    # Fixed held-out eval: one Kodak luma patch, fixed masks. Both the model and
-    # the interp baseline run a real closed-loop inference with linear
-    # quantisation at --eval-eb (predictions fed the *quantised* recon of earlier
-    # stages, never the truth), so the reported MAE is the prediction error the
-    # codec pays. The interp baseline is model-independent -> compute it once and
-    # draw it as a reference line.
-    eval_x, (eh, ew) = load_eval_plane(args.eval_image, device)
+    # Fixed held-out eval: one fixed-seed 2-D synthetic field, fixed masks. Both
+    # the model and the interp baseline run a real closed-loop inference with
+    # linear quantisation at --eval-eb (predictions fed the *quantised* recon of
+    # earlier stages, never the truth), so the reported MAE is the prediction
+    # error the codec pays. The interp baseline is model-independent -> compute
+    # it once and draw it as a reference line.
+    eval_x, (eh, ew) = make_eval_field(
+        tuple(args.eval_shape),
+        device,
+        tuple(args.synthetic_2d_correlation),
+        args.synthetic_turbulence_frac,
+        args.synthetic_discontinuities,
+    )
     eval_masks = stage_masks((eh, ew), 4, 16, anchor_block=1)  # interp baseline
     eval_geoms, _ = build_stage_geoms(
         (eh, ew), 4, 16, 1, args.max_radius, torch, device, args.agg_level
@@ -1038,7 +1185,7 @@ def main():
 
     be, bn = interp_eval(eval_x, eval_masks, args.eval_eb, args.baseline)
     baseline_mae = be / max(bn, 1)
-    eval_name = Path(args.eval_image).name
+    eval_name = f"synthetic-{eh}x{ew}"
     print(
         f"{args.baseline} interp baseline on "
         f"{eval_name}: MAE={baseline_mae:.5f} (eb={args.eval_eb})"
@@ -1078,12 +1225,11 @@ def main():
         )
         args.steps = args.profile + 1  # warmup + 1 recorded step
 
-    # These weights are constant for the run. The image generator maintains
-    # CPU decode work ahead of the training loop; synthetic fields are FFT-
-    # generated directly on the device, so they need no prefetch.
-    image_weight = 1.0 - synthetic_point_fraction
+    # These weights are constant for the run. Both the 2-D and 4-D fields are
+    # FFT-generated directly on the device from the synthetic generator, so
+    # neither source needs a CPU prefetch pipeline.
+    field2d_weight = 1.0 - synthetic_point_fraction
     synthetic_weight = synthetic_point_fraction
-    batches = prefetch_batches(paths, image_batch, args.crop, args.steps, args.workers)
     bar = tqdm(range(1, args.steps + 1), desc="train")
     for step in bar:
         if prof is not None and step == args.steps:
@@ -1094,8 +1240,16 @@ def main():
         # The 2-D and 4-D examples cannot share a rectangular tensor batch.
         # Run them sequentially and backward immediately so their gradients
         # accumulate without retaining both computation graphs in GPU memory.
-        if image_weight:
-            x = next(batches).to(device)  # decoded on a worker thread
+        if field2d_weight:
+            x = sample_synthetic_batch(
+                field2d_batch,
+                (args.crop, args.crop),
+                tuple(args.synthetic_2d_correlation),
+                synthetic_rng,
+                device=device,
+                turbulence_frac=args.synthetic_turbulence_frac,
+                max_discontinuities=args.synthetic_discontinuities,
+            )
             stride = args.stride or random.choice((8, 16, 32))
             levels = args.levels or stride.bit_length() - 1
             eb = sample_noise(x.shape[0], args, device)
@@ -1130,11 +1284,14 @@ def main():
                     nll, npix, _, _, aux = run_stages(
                         model, x, geoms, args.d, device, eb=eb, teacher_force=True
                     )
-            image_loss = nll / max(npix, 1)
-            image_mae = aux["abs_err"].detach() / max(npix, 1)
-            scaler.scale(image_weight * image_loss).backward()
+            field2d_loss = nll / max(npix, 1)
+            field2d_mae = aux["abs_err"].detach() / max(npix, 1)
+            scaler.scale(field2d_weight * field2d_loss).backward()
             metric_tensors.update(
-                {"train/image_bpp": image_loss.detach(), "train/image_mae": image_mae}
+                {
+                    "train/field2d_bpp": field2d_loss.detach(),
+                    "train/field2d_mae": field2d_mae,
+                }
             )
 
         if synthetic_weight:
@@ -1145,6 +1302,8 @@ def main():
                 tuple(args.synthetic_correlation),
                 synthetic_rng,
                 device=device,
+                turbulence_frac=args.synthetic_turbulence_frac,
+                max_discontinuities=args.synthetic_discontinuities,
             )
             stride = args.synthetic_stride
             levels = args.levels or stride.bit_length() - 1
@@ -1179,7 +1338,7 @@ def main():
         combined_loss = sum(
             weight * metric_tensors[key]
             for weight, key in (
-                (image_weight, "train/image_bpp"),
+                (field2d_weight, "train/field2d_bpp"),
                 (synthetic_weight, "train/synthetic_bpp"),
             )
             if weight
@@ -1187,15 +1346,15 @@ def main():
         combined_mae = sum(
             weight * metric_tensors[key]
             for weight, key in (
-                (image_weight, "train/image_mae"),
+                (field2d_weight, "train/field2d_mae"),
                 (synthetic_weight, "train/synthetic_mae"),
             )
             if weight
         )
         metric_tensors.update({"train/bpp": combined_loss, "train/mae": combined_mae})
-        # Transfer all scalar metrics together.  Calling .item() for the image
-        # metrics before launching the synthetic pass introduced several host
-        # synchronizations and exposed the CPU field-generation latency.
+        # Transfer all scalar metrics together.  Calling .item() for the 2-D
+        # metrics before launching the 4-D pass introduced several host
+        # synchronizations and exposed the field-generation latency.
         names = tuple(metric_tensors)
         values = (
             torch.stack([metric_tensors[name].float() for name in names]).cpu().tolist()
