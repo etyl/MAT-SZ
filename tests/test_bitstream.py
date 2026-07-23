@@ -1,16 +1,26 @@
 import numpy as np
 import pytest
 
-from deepsz.bitstream import (Header, pack_stage, read_stream, unpack_stage,
-                             write_stream)
+from deepsz.bitstream import Header, pack_stage, read_stream, unpack_stage, write_stream
 
 
 def make_header(**kw):
-    base = dict(channels=3, src_dtype=0, spatial=(100, 130), eb=2.0,
-                levels=3, anchor_stride=8, anchor_block=4,
-                radius=1 << 15, max_radius=64, agg_level=2,
-                vmin=0.0, vmax=255.0,
-                ckpt_hash=bytes(range(16)), flags=1)
+    base = dict(
+        channels=3,
+        src_dtype=0,
+        spatial=(100, 130),
+        eb=2.0,
+        levels=3,
+        anchor_stride=8,
+        anchor_block=4,
+        radius=1 << 15,
+        max_radius=64,
+        agg_level=2,
+        vmin=0.0,
+        vmax=255.0,
+        ckpt_hash=bytes(range(16)),
+        flags=1,
+    )
     base.update(kw)
     return Header(**base)
 
@@ -54,7 +64,8 @@ def test_stage_roundtrip():
     codes[::17] = 0
     outliers = rng.randn(int((codes == 0).sum())).astype(np.float32)
     buf = pack_stage(codes, outliers) + pack_stage(
-        np.zeros(0, np.uint32), np.zeros(0, np.float32))
+        np.zeros(0, np.uint32), np.zeros(0, np.float32)
+    )
     c2, o2, off = unpack_stage(buf, 0)
     assert np.array_equal(c2, codes)
     assert np.array_equal(o2, outliers)

@@ -26,8 +26,11 @@ def _sz3_pysz(channel: np.ndarray, eb: float) -> tuple[int, np.ndarray] | None:
         from pysz import sz, szAlgorithm, szConfig, szErrorBoundMode
     except ImportError as exc:
         if not _pysz_warned:  # ponytail: warn once, not once per channel
-            print(f"[sz3] pysz unavailable ({exc}); `pip install pysz` or "
-                  "build tools/sz3/bin/sz3", file=sys.stderr)
+            print(
+                f"[sz3] pysz unavailable ({exc}); `pip install pysz` or "
+                "build tools/sz3/bin/sz3",
+                file=sys.stderr,
+            )
             _pysz_warned = True
         return None
     config = szConfig()
@@ -65,9 +68,25 @@ def _sz3_cli(channel: np.ndarray, eb: float) -> tuple[int, np.ndarray] | None:
         raw, comp, dec = td / "in.f32", td / "out.sz", td / "out.f32"
         channel.tofile(raw)
         subprocess.run(
-            [exe, "-f", "-i", str(raw), "-z", str(comp), "-o", str(dec),
-             "-2", str(w), str(h), "-M", "ABS", str(eb)],
-            check=True, capture_output=True)
+            [
+                exe,
+                "-f",
+                "-i",
+                str(raw),
+                "-z",
+                str(comp),
+                "-o",
+                str(dec),
+                "-2",
+                str(w),
+                str(h),
+                "-M",
+                "ABS",
+                str(eb),
+            ],
+            check=True,
+            capture_output=True,
+        )
         return comp.stat().st_size, np.fromfile(dec, np.float32).reshape(h, w)
 
 

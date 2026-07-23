@@ -6,6 +6,12 @@ Core library code lives in `deepsz/`. Compression orchestration is in `codec.py`
 
 `tests/` contains pytest tests organized by component, such as `test_quantizer.py` and `test_gnn_codec.py`. `scripts/` holds training, evaluation, profiling, and plotting programs. Root-level `train*.sh`, `eval*.sh`, and `profile*.sh` files are Slurm-oriented launchers with cluster-specific defaults.
 
+## Development Compatibility Policy
+
+This codebase is under active development. Backward compatibility with previously generated compressed binaries or bitstreams is not required; prefer keeping the current format simple over retaining legacy decoding branches, migrations, or obsolete header fields unless explicitly requested.
+
+Trained model and checkpoint versioning remains important. Explicitly version checkpoint formats, bump the version whenever the model architecture, stored schema, or interpretation of checkpoint state changes, and keep checkpoint writers and loaders synchronized. Reject incompatible checkpoint versions with a clear error, and update the relevant tests when the checkpoint format changes.
+
 ## Jean Zay Job Safety
 
 Agents must not submit large or long-running jobs on Jean Zay. They may inspect launchers and prepare or validate `sbatch` commands, but the user must execute those commands directly. Editing, testing, or reviewing a launcher never grants permission to enqueue it. If the current machine has a GPU, agents may run small local tests.

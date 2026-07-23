@@ -12,9 +12,20 @@ import time
 
 import numpy as np
 
-from .bitstream import (DTYPE_CODES, DTYPE_IDS, FLAG_COMPILED, FLAG_CUBIC,
-                        FLAG_FP16, FLAG_INTERP, FLAG_RANS, Header,
-                        pack_stage, read_stream, unpack_stage, write_stream)
+from .bitstream import (
+    DTYPE_CODES,
+    DTYPE_IDS,
+    FLAG_COMPILED,
+    FLAG_CUBIC,
+    FLAG_FP16,
+    FLAG_INTERP,
+    FLAG_RANS,
+    Header,
+    pack_stage,
+    read_stream,
+    unpack_stage,
+    write_stream,
+)
 from .levels import stage_ebs, stage_masks
 from .predictor import InterpPredictor, default_interp_center
 from .quantizer import dequantize, quantize
@@ -73,8 +84,11 @@ def compress(
 
     # A predictor with its own schedule (interp) must agree with the header
     # params, or encoder masks and the decoder's rebuilt masks silently diverge.
-    for name, val in (("levels", levels), ("anchor_stride", anchor_stride),
-                      ("anchor_block", anchor_block)):
+    for name, val in (
+        ("levels", levels),
+        ("anchor_stride", anchor_stride),
+        ("anchor_block", anchor_block),
+    ):
         got = getattr(predictor, name, val)
         if got != val:
             raise ValueError(f"predictor {name}={got} != compress {name}={val}")
@@ -93,36 +107,55 @@ def compress(
     round_output = np.issubdtype(np.dtype(img.dtype), np.integer)
 
     def new_stats():
-        return {"predict_s": 0.0, "quantize_s": 0.0, "entropy_s": 0.0,
-                "outliers": 0, "stage_codes": [0] * len(masks),
-                "stage_outliers": [0] * len(masks),
-                "stage_payload_bytes": [0] * len(masks),
-                "stage_model_bits": [0.0] * len(masks),
-                "stage_pred_sae": [0.0] * len(masks),
-                "stage_pred_sse": [0.0] * len(masks),
-                "stage_recon_sae": [0.0] * len(masks),
-                "stage_recon_sse": [0.0] * len(masks),
-                "stage_recon_max": [0.0] * len(masks)}
+        return {
+            "predict_s": 0.0,
+            "quantize_s": 0.0,
+            "entropy_s": 0.0,
+            "outliers": 0,
+            "stage_codes": [0] * len(masks),
+            "stage_outliers": [0] * len(masks),
+            "stage_payload_bytes": [0] * len(masks),
+            "stage_model_bits": [0.0] * len(masks),
+            "stage_pred_sae": [0.0] * len(masks),
+            "stage_pred_sse": [0.0] * len(masks),
+            "stage_recon_sae": [0.0] * len(masks),
+            "stage_recon_sse": [0.0] * len(masks),
+            "stage_recon_max": [0.0] * len(masks),
+        }
 
     def encode(ebs):
         st = new_stats()
         payload, recon = _compress_region(
-            field, masks, ebs, predictor, radius, round_output, st)
+            field, masks, ebs, predictor, radius, round_output, st
+        )
         return payload, recon, len(payload), st
 
     def ebs_for(ratio):
         return stage_ebs(region_shape, levels, anchor_stride, anchor_block, eb, ratio)
 
     def make_header(center, ratio):
-        return Header(channels=c, src_dtype=src_dtype, spatial=tuple(spatial),
-                      eb=float(eb), levels=levels, anchor_stride=anchor_stride,
-                      anchor_block=anchor_block, radius=radius,
-                      max_radius=getattr(predictor, "max_radius", 0),
-                      agg_level=(-1 if getattr(predictor, "agg_level", None) is None
-                                 else int(predictor.agg_level)),
-                      vmin=vmin, vmax=vmax,
-                      ckpt_hash=getattr(predictor, "checkpoint_hash", b"\0" * 16),
-                      flags=flags, interp_center=center, eb_ratio=ratio)
+        return Header(
+            channels=c,
+            src_dtype=src_dtype,
+            spatial=tuple(spatial),
+            eb=float(eb),
+            levels=levels,
+            anchor_stride=anchor_stride,
+            anchor_block=anchor_block,
+            radius=radius,
+            max_radius=getattr(predictor, "max_radius", 0),
+            agg_level=(
+                -1
+                if getattr(predictor, "agg_level", None) is None
+                else int(predictor.agg_level)
+            ),
+            vmin=vmin,
+            vmax=vmax,
+            ckpt_hash=getattr(predictor, "checkpoint_hash", b"\0" * 16),
+            flags=flags,
+            interp_center=center,
+            eb_ratio=ratio,
+        )
 
     if tune not in ("fast", "size", "rd"):
         raise ValueError("tune must be 'fast', 'size', or 'rd'")
@@ -160,8 +193,9 @@ def compress(
             st["raw_payload_bytes"] = raw_bytes
             st["compressed_bytes"] = len(stream)
             st["recon_sse"] = float(sum(st["stage_recon_sse"]))
-            candidates.append((len(stream), st["recon_sse"], ratio, center,
-                               stream, rc, st))
+            candidates.append(
+                (len(stream), st["recon_sse"], ratio, center, stream, rc, st)
+            )
 
     if tune == "rd" and eb_ratio is None and tunable and len(candidates) > 1:
         min_size = min(c[0] for c in candidates)
@@ -181,12 +215,15 @@ def compress(
     stats["eb_ratio"] = chosen_ratio
     stats["interp_center"] = chosen_center
     stats["tune"] = tune
-    stats["tune_size_slack"] = (tune_size_slack if tune == "rd"
-                                and eb_ratio is None and tunable else 1.0)
+    stats["tune_size_slack"] = (
+        tune_size_slack if tune == "rd" and eb_ratio is None and tunable else 1.0
+    )
     if verbose:
-        print(f"tuned: eb_ratio={chosen_ratio} center={chosen_center} "
-              f"compressed={len(stream)} bytes raw={stats['raw_payload_bytes']} bytes "
-              f"sse={stats['recon_sse']:.6g}")
+        print(
+            f"tuned: eb_ratio={chosen_ratio} center={chosen_center} "
+            f"compressed={len(stream)} bytes raw={stats['raw_payload_bytes']} bytes "
+            f"sse={stats['recon_sse']:.6g}"
+        )
 
     stats["recon"] = _finalize(recon_canvas, make_header(chosen_center, chosen_ratio))
     stats["original_bytes"] = img.nbytes
@@ -202,8 +239,11 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
     if predictor_factory is None:
         if header.flags & FLAG_INTERP:
             predictor_factory = lambda hdr: InterpPredictor(
-                "cubic" if hdr.flags & FLAG_CUBIC else "linear", hdr.levels,
-                hdr.anchor_stride, hdr.anchor_block)
+                "cubic" if hdr.flags & FLAG_CUBIC else "linear",
+                hdr.levels,
+                hdr.anchor_stride,
+                hdr.anchor_block,
+            )
         else:
             raise ValueError("stream needs a predictor_factory (GNN checkpoint)")
     predictor = predictor_factory(header)
@@ -212,10 +252,17 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
 
     make_masks = getattr(predictor, "stage_masks", stage_masks)
     spatial = tuple(header.spatial)
-    masks = make_masks(spatial, header.levels, header.anchor_stride,
-                       header.anchor_block)
-    ebs = stage_ebs(spatial, header.levels, header.anchor_stride,
-                    header.anchor_block, header.eb, header.eb_ratio)
+    masks = make_masks(
+        spatial, header.levels, header.anchor_stride, header.anchor_block
+    )
+    ebs = stage_ebs(
+        spatial,
+        header.levels,
+        header.anchor_stride,
+        header.anchor_block,
+        header.eb,
+        header.eb_ratio,
+    )
     canvas = _decompress_region(payload, masks, ebs, header, predictor)
     return _finalize(canvas, header)
 
@@ -231,12 +278,18 @@ def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
         if n == 0:
             if use_rans:
                 tables = build_laplace_tables(ebs[stage_idx], radius)
-                parts.append(pack_stage(
-                    np.zeros(0, np.uint32), np.zeros(0, np.float32),
-                    rans_levels=np.zeros(0, np.uint8), rans_tables=tables))
+                parts.append(
+                    pack_stage(
+                        np.zeros(0, np.uint32),
+                        np.zeros(0, np.float32),
+                        rans_levels=np.zeros(0, np.uint8),
+                        rans_tables=tables,
+                    )
+                )
             else:
-                parts.append(pack_stage(np.zeros(0, np.uint32),
-                                        np.zeros(0, np.float32)))
+                parts.append(
+                    pack_stage(np.zeros(0, np.uint32), np.zeros(0, np.float32))
+                )
             continue
         eb = ebs[stage_idx]
         scale = None
@@ -253,8 +306,7 @@ def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
             stats["predict_s"] += time.time() - t0
         t0 = time.time()
         values = field[:, pos]
-        codes, outliers = quantize(values, pred, eb, radius,
-                                   round_output=round_output)
+        codes, outliers = quantize(values, pred, eb, radius, round_output=round_output)
         recon[:, pos] = dequantize(pred, codes, outliers, eb, radius).reshape(c, n)
         x_stage = values.astype(np.float64)
         pred_err = x_stage - pred.astype(np.float64)
@@ -264,8 +316,8 @@ def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
         stats["stage_recon_sae"][stage_idx] += float(np.abs(recon_err).sum())
         stats["stage_recon_sse"][stage_idx] += float(np.square(recon_err).sum())
         stats["stage_recon_max"][stage_idx] = max(
-            stats["stage_recon_max"][stage_idx],
-            float(np.abs(recon_err).max()))
+            stats["stage_recon_max"][stage_idx], float(np.abs(recon_err).max())
+        )
         stats["quantize_s"] += time.time() - t0
         known |= pos
         stats["outliers"] += len(outliers)
@@ -276,8 +328,7 @@ def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
             tables = build_laplace_tables(eb, radius)
             levels64 = scale_to_level(scale, eb).reshape(-1)
             stats["stage_model_bits"][stage_idx] += model_bits(codes, levels64, tables)
-            part = pack_stage(codes, outliers, rans_levels=levels64,
-                              rans_tables=tables)
+            part = pack_stage(codes, outliers, rans_levels=levels64, rans_tables=tables)
         else:
             part = pack_stage(codes, outliers)
         stats["stage_payload_bytes"][stage_idx] += len(part)
@@ -299,8 +350,8 @@ def _decompress_region(payload, masks, ebs, header, predictor):
             if use_rans:
                 tables = build_laplace_tables(ebs[stage_idx], header.radius)
                 codes, outliers, off = unpack_stage(
-                    payload, off, rans_levels=np.zeros(0, np.uint8),
-                    rans_tables=tables)
+                    payload, off, rans_levels=np.zeros(0, np.uint8), rans_tables=tables
+                )
             else:
                 codes, outliers, off = unpack_stage(payload, off)
             continue
@@ -309,11 +360,9 @@ def _decompress_region(payload, masks, ebs, header, predictor):
             scale = np.full((c, n), ebs[stage_idx], np.float32)
         else:
             if use_rans:
-                pred, scale = predictor.predict(recon, known, pos,
-                                                eb=ebs[stage_idx])
+                pred, scale = predictor.predict(recon, known, pos, eb=ebs[stage_idx])
             elif getattr(predictor, "provides_scale", False):
-                pred, _scale = predictor.predict(recon, known, pos,
-                                                 eb=ebs[stage_idx])
+                pred, _scale = predictor.predict(recon, known, pos, eb=ebs[stage_idx])
                 scale = None
             else:
                 pred = predictor.predict(recon, known, pos)
@@ -322,11 +371,13 @@ def _decompress_region(payload, masks, ebs, header, predictor):
             tables = build_laplace_tables(ebs[stage_idx], header.radius)
             levels64 = scale_to_level(scale, ebs[stage_idx]).reshape(-1)
             codes, outliers, off = unpack_stage(
-                payload, off, rans_levels=levels64, rans_tables=tables)
+                payload, off, rans_levels=levels64, rans_tables=tables
+            )
         else:
             codes, outliers, off = unpack_stage(payload, off)
-        recon[:, pos] = dequantize(pred, codes, outliers, ebs[stage_idx],
-                                   header.radius).reshape(c, n)
+        recon[:, pos] = dequantize(
+            pred, codes, outliers, ebs[stage_idx], header.radius
+        ).reshape(c, n)
         known |= pos
     return recon
 

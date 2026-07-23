@@ -14,12 +14,15 @@ def tiny_checkpoint(tmp_path):
     torch.manual_seed(0)
     model = build_model(d=8).eval()
     path = tmp_path / "gnn.pt"
-    torch.save({
-        "d": model.d,
-        "agg_level": 2,
-        "state_dict": model.state_dict(),
-        "version": CKPT_VERSION,
-    }, path)
+    torch.save(
+        {
+            "d": model.d,
+            "agg_level": 2,
+            "state_dict": model.state_dict(),
+            "version": CKPT_VERSION,
+        },
+        path,
+    )
     return path
 
 
@@ -28,9 +31,6 @@ def _codec(path, eb=1e-3):
         path,
         error_bound=eb,
         levels=2,
-        anchor_stride=4,
-        anchor_block=1,
-        max_radius=4,
         chunk_size=0,
         fp16=False,
         compile=False,
@@ -43,14 +43,30 @@ def test_defaults_match_eval_tensor(tiny_checkpoint):
     assert codec.error_bound == 0.01
     assert codec.levels == 5
     assert codec.anchor_stride == 32
-    assert codec.anchor_block == 1
+    assert not hasattr(codec, "max_radius")
+    assert not hasattr(codec, "anchor_block")
+    assert not hasattr(codec, "agg_level")
     assert codec.chunk_size is None
-    assert codec.chunk_batch is None
-    assert codec.fp16 is False
+    assert not hasattr(codec, "chunk_batch")
+    assert codec.fp16 is True
     assert codec.compile is True
 
 
+@pytest.mark.parametrize("levels", [1, 2, 4, 6])
+def test_anchor_stride_is_derived_from_levels(tiny_checkpoint, levels):
+    codec = GNNCompressorCodec(tiny_checkpoint, levels=levels)
+
+    assert codec.anchor_stride == 1 << levels
+
+
+def test_levels_must_be_positive(tiny_checkpoint):
+    with pytest.raises(ValueError, match="levels must be >= 1"):
+        GNNCompressorCodec(tiny_checkpoint, levels=0)
+
+
 def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):
+    from deepsz.gnn_codec import _read_stream
+
     rng = np.random.RandomState(0)
     x = rng.rand(5, 6, 4).astype(np.float32)
     codec = _codec(tiny_checkpoint, eb=0.01)
@@ -58,6 +74,20 @@ def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):
     stream = codec.compress(x)
     y = codec.uncompress(stream)
 
+    meta = _read_stream(stream)[0]
+    assert meta["shape"] == list(x.shape)
+    assert meta["dtype"] == x.dtype.str
+    for redundant in (
+        "codec",
+        "coded_shape",
+        "anchor_stride",
+        "anchor_block",
+        "max_radius",
+        "agg_level",
+        "entropy_coder",
+        "chunk_batch",
+    ):
+        assert redundant not in meta
     assert isinstance(stream, bytes)
     assert isinstance(y, torch.Tensor)
     assert tuple(y.shape) == x.shape

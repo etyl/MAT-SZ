@@ -5,19 +5,27 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from deepsz.gnn_predictor import (CKPT_VERSION, GNNPredictor, build_model,
-                                  build_stage_geoms, half_directions,
-                                  stage_forward)
+from deepsz.gnn_predictor import (
+    CKPT_VERSION,
+    GNNPredictor,
+    build_model,
+    build_stage_geoms,
+    half_directions,
+    stage_forward,
+)
 from deepsz.gnn_predictor import _LegacyGeom
 from deepsz.levels import stage_masks
 
 
-@pytest.mark.parametrize("shape,levels,stride,block,max_radius", [
-    ((64, 64), 4, 16, 4, 64),
-    ((64, 64), 4, 16, 1, 8),      # small radius exercises the `<= limit` gate
-    ((70, 90), 3, 8, 1, 64),      # non-multiple-of-stride shape (edge clamping)
-    ((16, 16, 16), 2, 4, 1, 16),  # 3-D
-])
+@pytest.mark.parametrize(
+    "shape,levels,stride,block,max_radius",
+    [
+        ((64, 64), 4, 16, 4, 64),
+        ((64, 64), 4, 16, 1, 8),  # small radius exercises the `<= limit` gate
+        ((70, 90), 3, 8, 1, 64),  # non-multiple-of-stride shape (edge clamping)
+        ((16, 16, 16), 2, 4, 1, 16),  # 3-D
+    ],
+)
 def test_geometry_matches_scan(shape, levels, stride, block, max_radius):
     """The load-bearing test: the closed-form lattice geometry must reproduce,
     bit for bit, the old step-by-step neighbour scan (`_LegacyGeom`) it replaced
@@ -33,8 +41,10 @@ def test_geometry_matches_scan(shape, levels, stride, block, max_radius):
             ref = _LegacyGeom(cum, max_radius, torch, query_idx=qidx)
             assert np.array_equal(g.query_idx.numpy(), qidx)
             for k in ("ip", "in_", "dp", "dn", "vp", "vn"):
-                assert np.array_equal(
-                    getattr(g, k).numpy(), getattr(ref, k).numpy()), (k, gi)
+                assert np.array_equal(getattr(g, k).numpy(), getattr(ref, k).numpy()), (
+                    k,
+                    gi,
+                )
             dirs = np.asarray(half_directions(len(shape)), np.float32)
             nnz = np.count_nonzero(dirs, axis=1).astype(np.float32)
             expected_cos = dirs / np.sqrt(nnz)[:, None]
@@ -62,8 +72,9 @@ def _run(model, recon, known, max_radius=64):
     E = torch.zeros(c, N, known.ndim, model.d)
     prev = np.zeros(known.shape, bool)
     with torch.no_grad():
-        (values, log_b), _ = stage_forward(model, E, prev, known, x, max_radius,
-                                           torch, eb=0.01)
+        (values, log_b), _ = stage_forward(
+            model, E, prev, known, x, max_radius, torch, eb=0.01
+        )
     assert log_b.shape == values.shape
     return values.numpy().reshape(recon.shape)
 
@@ -112,9 +123,9 @@ def test_init_embed_uses_value_only():
     assert model.init.net[0].in_features == 1
 
 
-def test_legacy_stage_forward_accepts_predict_idx():
-    """Older trainer/eval code passes a compact prediction index; keep that
-    call form working while the codec uses precomputed stage geometry."""
+def test_mask_stage_forward_accepts_predict_idx():
+    """Training can pass a compact prediction index while the codec uses
+    precomputed stage geometry."""
     model = build_model(d=16).eval()
     known = np.zeros((16, 16), bool)
     known[::4, ::4] = True
@@ -122,12 +133,15 @@ def test_legacy_stage_forward_accepts_predict_idx():
     pos = np.zeros_like(known)
     pos[2::4, ::4] = True
     idx = torch.from_numpy(np.nonzero(pos.reshape(-1))[0])
-    x = torch.from_numpy(np.random.RandomState(2).rand(1, known.size).astype(np.float32))
+    x = torch.from_numpy(
+        np.random.RandomState(2).rand(1, known.size).astype(np.float32)
+    )
     E = torch.zeros(1, known.size, known.ndim, model.d)
 
     with torch.no_grad():
-        (values, log_b), E2 = stage_forward(model, E, prev, known, x, 16, torch,
-                                            predict_idx=idx, eb=0.01)
+        (values, log_b), E2 = stage_forward(
+            model, E, prev, known, x, 16, torch, predict_idx=idx, eb=0.01
+        )
 
     assert values.shape == (1, int(pos.sum()))
     assert log_b.shape == values.shape
@@ -150,17 +164,18 @@ def test_gnn_predictor_rejects_old_checkpoint(tmp_path, version):
 
 def test_gnn_predictors_share_loaded_inference_model(tmp_path):
     path = tmp_path / "v3.pt"
-    torch.save({
-        "version": CKPT_VERSION,
-        "d": 8,
-        "agg_level": 2,
-        "state_dict": build_model(8).state_dict(),
-    }, path)
+    torch.save(
+        {
+            "version": CKPT_VERSION,
+            "d": 8,
+            "agg_level": 2,
+            "state_dict": build_model(8).state_dict(),
+        },
+        path,
+    )
 
-    first = GNNPredictor(
-        path, 0.0, 1.0, levels=2, anchor_stride=4, anchor_block=1)
-    second = GNNPredictor(
-        path, 0.0, 2.0, levels=2, anchor_stride=4, anchor_block=1)
+    first = GNNPredictor(path, 0.0, 1.0, levels=2, anchor_stride=4, anchor_block=1)
+    second = GNNPredictor(path, 0.0, 2.0, levels=2, anchor_stride=4, anchor_block=1)
 
     assert first.model is second.model
 
@@ -176,9 +191,11 @@ def test_finalize_ctx_reuse_equivalence():
     with torch.no_grad():
         finalize_ctx = model.embed(E, gp)
         implicit, E_implicit, head_implicit = stage_forward(
-            model, E, gp, gh, vals, torch, eb=0.01)
+            model, E, gp, gh, vals, torch, eb=0.01
+        )
         explicit, E_explicit, head_explicit = stage_forward(
-            model, E, gp, gh, vals, torch, finalize_ctx=finalize_ctx, eb=0.01)
+            model, E, gp, gh, vals, torch, finalize_ctx=finalize_ctx, eb=0.01
+        )
 
     assert finalize_ctx.shape == (2, gp.M, gp.ndim, model.d)
     assert torch.equal(E_implicit, E_explicit)
@@ -194,17 +211,17 @@ def test_dir_state_axis_symmetry():
     torch.manual_seed(0)
     model = build_model(d=8).eval()
     geoms, _ = build_stage_geoms((16, 16), 2, 4, 1, 16, torch)
-    gp = geoms[1]                                # a stage with valid neighbours
+    gp = geoms[1]  # a stage with valid neighbours
     # Field identical across the axis dim, as it is in the real loop.
     E = torch.randn(2, 16 * 16, 1, model.d).expand(-1, -1, gp.ndim, -1)
     E = E.contiguous()
 
     with torch.no_grad():
         _, valid = model._line_messages(E, gp)
-        assert bool(valid.any())                 # guard: the test is meaningful
+        assert bool(valid.any())  # guard: the test is meaningful
 
         model.dir_state.table.zero_()
-        ctx = model.embed(E, gp)                 # (B, M, ndim, d)
+        ctx = model.embed(E, gp)  # (B, M, ndim, d)
         assert torch.allclose(ctx[..., 0, :], ctx[..., 1, :])
 
         model.dir_state.table.copy_(build_model(d=8).dir_state.table)

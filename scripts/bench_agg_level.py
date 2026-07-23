@@ -44,6 +44,7 @@ def _ensure_rans_backend():
     hosts. Mirrors scripts/check_chunked_memory.py."""
     try:
         import constriction  # noqa: F401
+
         return "constriction"
     except ImportError:
         import deepsz.bitstream as bitstream
@@ -97,10 +98,10 @@ def closed_loop_ms(values, predictor, masks, ebs, radius, device):
             pred = np.zeros((values.shape[0], n), np.float32)
         else:
             pred, _scale = predictor.predict(recon, known, pos, eb=eb)
-        codes, outliers = quantize(values[:, pos], pred, eb, radius,
-                                   round_output=False)
+        codes, outliers = quantize(values[:, pos], pred, eb, radius, round_output=False)
         recon[:, pos] = dequantize(pred, codes, outliers, eb, radius).reshape(
-            values.shape[0], n)
+            values.shape[0], n
+        )
         known |= pos
     sync()
     return (time.perf_counter() - t0) * 1e3
@@ -108,28 +109,42 @@ def closed_loop_ms(values, predictor, masks, ebs, radius, device):
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--shape", type=int, nargs="+", default=(32, 32, 32, 32))
     ap.add_argument("--eb", type=float, default=1e-2)
     ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
-    ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--d", type=int, default=32, help="model width (random ckpt)")
-    ap.add_argument("--checkpoint", default=None,
-                    help="real checkpoint; benched only at its baked agg level "
-                         "(default: per-level random weights)")
+    ap.add_argument(
+        "--checkpoint",
+        default=None,
+        help="real checkpoint; benched only at its baked agg level "
+        "(default: per-level random weights)",
+    )
     ap.add_argument("--device", default=None)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--levels-to-test", type=int, nargs="+", default=None,
-                    help="aggregation levels to sweep (default 1..ndim)")
-    ap.add_argument("--m-tile", type=int, default=16384,
-                    help="cap the per-stage query tile so the whole-tensor path "
-                         "fits in RAM (set before importing deepsz)")
+    ap.add_argument(
+        "--levels-to-test",
+        type=int,
+        nargs="+",
+        default=None,
+        help="aggregation levels to sweep (default 1..ndim)",
+    )
+    ap.add_argument(
+        "--m-tile",
+        type=int,
+        default=16384,
+        help="cap the per-stage query tile so the whole-tensor path "
+        "fits in RAM (set before importing deepsz)",
+    )
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--no-roundtrip", action="store_true",
-                    help="skip the codec error-bound check (timing only)")
+    ap.add_argument(
+        "--no-roundtrip",
+        action="store_true",
+        help="skip the codec error-bound check (timing only)",
+    )
     return ap.parse_args(argv)
 
 
@@ -142,8 +157,12 @@ def main(argv=None):
     backend = _ensure_rans_backend()
     import torch
 
-    from deepsz.gnn_predictor import (CKPT_VERSION, GNNPredictor, build_model,
-                                      half_directions)
+    from deepsz.gnn_predictor import (
+        CKPT_VERSION,
+        GNNPredictor,
+        build_model,
+        half_directions,
+    )
     from deepsz.levels import stage_ebs, stage_masks
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -163,88 +182,128 @@ def main(argv=None):
         if path is None:
             model = build_model(d=args.d, agg_level=lvl).eval()
             path = str(Path(tmpdir) / f"gnn_random_agg{lvl}.pt")
-            torch.save({"d": args.d, "agg_level": lvl,
-                        "state_dict": model.state_dict(),
-                        "version": CKPT_VERSION}, path)
+            torch.save(
+                {
+                    "d": args.d,
+                    "agg_level": lvl,
+                    "state_dict": model.state_dict(),
+                    "version": CKPT_VERSION,
+                },
+                path,
+            )
             ckpt_for[lvl] = path
         return path
 
     x = synth_field(shape, args.seed)
     values = x[None, ...].astype(np.float32)
     vmin, vmax = float(values.min()), float(values.max())
-    masks = stage_masks(shape, args.levels, args.anchor_stride, args.anchor_block)
-    ebs = stage_ebs(shape, args.levels, args.anchor_stride, args.anchor_block,
-                    args.eb, 1.0)
+    anchor_stride = 1 << args.levels
+    masks = stage_masks(shape, args.levels, anchor_stride, 1)
+    ebs = stage_ebs(shape, args.levels, anchor_stride, 1, args.eb, 1.0)
 
     tested = args.levels_to_test or list(range(1, ndim + 1))
-    ref_level = ndim                            # full neighbourhood
+    ref_level = ndim  # full neighbourhood
     if args.checkpoint is not None:
         # A trained checkpoint bakes exactly one aggregation level, so a real
         # checkpoint can only be benched at its own level.
-        baked = int(torch.load(args.checkpoint, map_location="cpu",
-                               weights_only=True)["agg_level"])
+        baked = int(
+            torch.load(args.checkpoint, map_location="cpu", weights_only=True)[
+                "agg_level"
+            ]
+        )
         ckpt_for[baked] = args.checkpoint
         tested = [baked]
         ref_level = baked
     full_lines = len(half_directions(ndim, ref_level))
-    print(f"tensor {shape} ({x.size/1e6:.2f}M points) | ndim={ndim} | device={device} "
-          f"| eb={args.eb} | rANS: {backend}")
-    print(f"reference (agg {ref_level}) = {full_lines} lines per point; "
-          f"m_tile={args.m_tile}\n")
+    print(
+        f"tensor {shape} ({x.size / 1e6:.2f}M points) | ndim={ndim} | device={device} "
+        f"| eb={args.eb} | rANS: {backend}"
+    )
+    print(
+        f"reference (agg {ref_level}) = {full_lines} lines per point; "
+        f"m_tile={args.m_tile}\n"
+    )
 
     rows = []
     for lvl in tested:
         n_lines = len(half_directions(ndim, lvl))
         predictor = GNNPredictor(
-            ckpt_for_level(lvl), vmin, vmax, max_radius=64, device=device,
-            levels=args.levels, anchor_stride=args.anchor_stride,
-            anchor_block=args.anchor_block)
+            ckpt_for_level(lvl),
+            vmin,
+            vmax,
+            max_radius=64,
+            device=device,
+            levels=args.levels,
+            anchor_stride=anchor_stride,
+            anchor_block=1,
+        )
         for _ in range(args.warmup):
             closed_loop_ms(values, predictor, masks, ebs, args.radius, device)
-        samples = [closed_loop_ms(values, predictor, masks, ebs, args.radius, device)
-                   for _ in range(args.repeats)]
+        samples = [
+            closed_loop_ms(values, predictor, masks, ebs, args.radius, device)
+            for _ in range(args.repeats)
+        ]
         rows.append((lvl, n_lines, statistics.median(samples), min(samples)))
 
     # Reference: the full neighbourhood (agg_level == ndim).
     ref_predictor = GNNPredictor(
-        ckpt_for_level(ref_level), vmin, vmax, max_radius=64, device=device,
-        levels=args.levels, anchor_stride=args.anchor_stride,
-        anchor_block=args.anchor_block)
+        ckpt_for_level(ref_level),
+        vmin,
+        vmax,
+        max_radius=64,
+        device=device,
+        levels=args.levels,
+        anchor_stride=args.anchor_stride,
+        anchor_block=args.anchor_block,
+    )
     for _ in range(args.warmup):
         closed_loop_ms(values, ref_predictor, masks, ebs, args.radius, device)
-    ref_samples = [closed_loop_ms(values, ref_predictor, masks, ebs, args.radius, device)
-                   for _ in range(args.repeats)]
+    ref_samples = [
+        closed_loop_ms(values, ref_predictor, masks, ebs, args.radius, device)
+        for _ in range(args.repeats)
+    ]
     ref_ms = statistics.median(ref_samples)
 
-    print(f"{'agg_level':>10} {'lines':>7} {'lines%':>7} {'infer p50':>12} "
-          f"{'infer min':>12} {'speedup':>9}")
+    print(
+        f"{'agg_level':>10} {'lines':>7} {'lines%':>7} {'infer p50':>12} "
+        f"{'infer min':>12} {'speedup':>9}"
+    )
     for lvl, n_lines, med, mn in rows:
-        print(f"{lvl:>10} {n_lines:>7} {100*n_lines/full_lines:>6.0f}% "
-              f"{med:>10.1f}ms {mn:>10.1f}ms {ref_ms/med:>8.2f}x")
-    print(f"{f'ref/{ref_level}':>10} {full_lines:>7} {'100%':>7} "
-          f"{ref_ms:>10.1f}ms {min(ref_samples):>10.1f}ms {1.0:>8.2f}x")
+        print(
+            f"{lvl:>10} {n_lines:>7} {100 * n_lines / full_lines:>6.0f}% "
+            f"{med:>10.1f}ms {mn:>10.1f}ms {ref_ms / med:>8.2f}x"
+        )
+    print(
+        f"{f'ref/{ref_level}':>10} {full_lines:>7} {'100%':>7} "
+        f"{ref_ms:>10.1f}ms {min(ref_samples):>10.1f}ms {1.0:>8.2f}x"
+    )
 
     if args.no_roundtrip:
         return
 
     # Correctness: encode + decode once per level with the tensor codec and check
-    # the error bound. Encoder and decoder share agg_level (frozen in the stream),
+    # the error bound. Encoder and decoder load agg_level from the checkpoint,
     # so the reconstruction must satisfy |x - recon| <= eb at every level.
     print("\nCodec roundtrip error-bound check (whole-tensor path):")
     from deepsz.gnn_codec import GNNCompressorCodec
 
     for lvl in sorted(set(tested) | {ref_level}):
         codec = GNNCompressorCodec(
-            ckpt_for_level(lvl), error_bound=args.eb, levels=args.levels,
-            anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
-            radius=args.radius, chunk_size=0,
-            strict_checkpoint=False, device=device)
+            ckpt_for_level(lvl),
+            error_bound=args.eb,
+            levels=args.levels,
+            radius=args.radius,
+            chunk_size=0,
+            device=device,
+        )
         stream = codec.compress(x)
         rec = codec.uncompress(stream).numpy().reshape(x.shape)
         max_err = float(np.abs(x.astype(np.float64) - rec.astype(np.float64)).max())
         tag = f"level {lvl}"
-        print(f"  {tag:>8}: max|err| = {max_err:.3e}  "
-              f"({'PASS' if max_err <= args.eb + 1e-6 else 'FAIL'} <= {args.eb})")
+        print(
+            f"  {tag:>8}: max|err| = {max_err:.3e}  "
+            f"({'PASS' if max_err <= args.eb + 1e-6 else 'FAIL'} <= {args.eb})"
+        )
 
 
 if __name__ == "__main__":

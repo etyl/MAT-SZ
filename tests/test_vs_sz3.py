@@ -31,6 +31,6 @@ def test_matches_sz3(shape, eb):
     rec = decompress(stream)
 
     err = lambda r: np.abs(img.astype(np.int64) - r.astype(np.int64)).max()
-    assert err(rec) <= eb           # our bound holds
-    assert err(sz3_rec) <= eb       # SZ3's bound holds (sanity)
+    assert err(rec) <= eb  # our bound holds
+    assert err(sz3_rec) <= eb  # SZ3's bound holds (sanity)
     assert len(stream) <= 1.3 * sz3_bytes  # rate competitive with SZ3

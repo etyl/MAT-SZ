@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=gnn-sz
-#SBATCH --qos=qos_gpu_h100-t3
-#SBATCH --time=10:00:00
+#SBATCH --qos=qos_gpu_h100-dev
+#SBATCH --time=1:00:00
 #SBATCH --constraint=h100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -53,7 +53,7 @@ python scripts/train_gnn.py \
     --synthetic-batch 4 \
     --synthetic-stride 8 \
     --workers 4 \
-    --agg-level 1 \
+    --agg-level 2 \
     --d 64 \
     --lr 0.0003 \
     --noise-range 0.000001 0.01 \

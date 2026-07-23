@@ -24,8 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from deepsz.baselines import sz3_roundtrip
-from deepsz.bitstream import (FLAG_COMPILED, FLAG_CUBIC, FLAG_FP16, FLAG_GNN,
-                              Header)
+from deepsz.bitstream import FLAG_COMPILED, FLAG_CUBIC, FLAG_FP16, FLAG_GNN, Header
 from deepsz.codec import compress, decompress
 from deepsz.predictor import InterpPredictor
 
@@ -40,6 +39,7 @@ def default_error_bounds() -> list[float]:
 def load_image(path: Path) -> np.ndarray:
     """Grayscale, [0,1]-normalised float32 (2D)."""
     from PIL import Image
+
     im = Image.open(path).convert("L")
     return np.asarray(im, np.float32) / 255.0
 
@@ -48,48 +48,66 @@ def make_predictor(method: str, img: np.ndarray, args):
     """Encoder-side predictor for a DeepSZ closed-loop method."""
     if method in ("gnn", "gnn-rans"):
         from deepsz.gnn_predictor import GNNPredictor
-        p = GNNPredictor(args.gnn_checkpoint, float(img.min()), float(img.max()),
-                         max_radius=args.max_radius,
-                         device=args.device, levels=args.levels,
-                         anchor_stride=args.anchor_stride,
-                         anchor_block=args.anchor_block)
+
+        p = GNNPredictor(
+            args.gnn_checkpoint,
+            float(img.min()),
+            float(img.max()),
+            max_radius=args.max_radius,
+            device=args.device,
+            levels=args.levels,
+            anchor_stride=args.anchor_stride,
+            anchor_block=args.anchor_block,
+        )
         p.fp16 = args.fp16
         p.compile = args.compile
         return p
     order = "linear" if method == "interp-linear" else "cubic"
-    return InterpPredictor(order, args.levels,
-                           args.anchor_stride, args.anchor_block)
+    return InterpPredictor(order, args.levels, args.anchor_stride, args.anchor_block)
 
 
 def build_predictor_for_decompress(method: str, hdr: Header, args):
     """Decoder-side predictor; params come from the stream header."""
     if hdr.flags & FLAG_GNN:
         from deepsz.gnn_predictor import GNNPredictor
-        p = GNNPredictor(args.gnn_checkpoint, hdr.vmin, hdr.vmax,
-                         max_radius=hdr.max_radius,
-                         device=args.device, levels=hdr.levels,
-                         anchor_stride=hdr.anchor_stride,
-                         anchor_block=hdr.anchor_block)
+
+        p = GNNPredictor(
+            args.gnn_checkpoint,
+            hdr.vmin,
+            hdr.vmax,
+            max_radius=hdr.max_radius,
+            device=args.device,
+            levels=hdr.levels,
+            anchor_stride=hdr.anchor_stride,
+            anchor_block=hdr.anchor_block,
+        )
         p.fp16 = bool(hdr.flags & FLAG_FP16)
         p.compile = bool(hdr.flags & FLAG_COMPILED)
         return p
-    return InterpPredictor("cubic" if hdr.flags & FLAG_CUBIC else "linear",
-                           hdr.levels, hdr.anchor_stride, hdr.anchor_block)
+    return InterpPredictor(
+        "cubic" if hdr.flags & FLAG_CUBIC else "linear",
+        hdr.levels,
+        hdr.anchor_stride,
+        hdr.anchor_block,
+    )
 
 
 def _quality(img: np.ndarray, rec: np.ndarray, n_bytes: int, eb: float) -> dict:
     rec2d = rec if rec.ndim == img.ndim else rec[..., None]
     diff = img.astype(np.float64) - rec2d.astype(np.float64)
     max_err = float(np.abs(diff).max())
-    mse = float(np.mean(diff ** 2))
-    peak = 255.0 if img.dtype == np.uint8 else max(float(img.max()) - float(img.min()), 1.0)
-    psnr = 10 * np.log10(peak ** 2 / mse) if mse > 0 else float("inf")
+    mse = float(np.mean(diff**2))
+    peak = (
+        255.0
+        if img.dtype == np.uint8
+        else max(float(img.max()) - float(img.min()), 1.0)
+    )
+    psnr = 10 * np.log10(peak**2 / mse) if mse > 0 else float("inf")
     bpp = 8 * n_bytes / (img.shape[0] * img.shape[1])
     # Quantization is performed in float32 and enforces float32(eb). Comparing
     # against the narrower Python float (e.g. 0.2) can report a false failure.
     bound_ok = max_err <= float(np.float32(eb))
-    return dict(n_bytes=n_bytes, bpp=bpp, psnr=psnr, max_err=max_err,
-                bound_ok=bound_ok)
+    return dict(n_bytes=n_bytes, bpp=bpp, psnr=psnr, max_err=max_err, bound_ok=bound_ok)
 
 
 def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
@@ -98,14 +116,20 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
     supported there; it degrades to fast (run both arms with --tune fast for
     a fair chunked-vs-unchunked comparison)."""
     from deepsz.gnn_codec import GNNCompressorCodec
+
     codec = GNNCompressorCodec(
-        args.gnn_checkpoint, error_bound=eb, levels=args.levels,
-        anchor_stride=args.anchor_stride, anchor_block=args.anchor_block,
-        radius=args.radius, zstd_level=args.zstd_level,
+        args.gnn_checkpoint,
+        error_bound=eb,
+        levels=args.levels,
+        radius=args.radius,
+        zstd_level=args.zstd_level,
         eb_ratio=args.eb_ratio,
         tune=args.tune if args.tune in ("fast", "size") else "fast",
-        device=args.device, chunk_size=args.chunk_size,
-        fp16=args.fp16, compile=args.compile)
+        device=args.device,
+        chunk_size=args.chunk_size,
+        fp16=args.fp16,
+        compile=args.compile,
+    )
     t0 = time.time()
     stream = codec.compress(img)
     t_comp = time.time() - t0
@@ -113,8 +137,16 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
     rec = codec.uncompress(stream).numpy()
     t_dec = time.time() - t0
     r = _quality(img, rec, len(stream), eb)
-    r.update(t_comp=t_comp, t_dec=t_dec, t_encode_setup=0.0, t_decode_setup=0.0,
-             tune_candidates=1, t_predict=0.0, t_quantize=0.0, t_entropy=0.0)
+    r.update(
+        t_comp=t_comp,
+        t_dec=t_dec,
+        t_encode_setup=0.0,
+        t_decode_setup=0.0,
+        tune_candidates=1,
+        t_predict=0.0,
+        t_quantize=0.0,
+        t_entropy=0.0,
+    )
     return r
 
 
@@ -125,13 +157,19 @@ def eval_deepsz(img: np.ndarray, eb: float, method: str, args) -> dict:
     pred = make_predictor(method, img, args)
     t_encode_setup = time.time() - t0
     t0 = time.time()
-    stream, stats = compress(img, eb, pred, levels=args.levels,
-                             anchor_stride=args.anchor_stride,
-                             anchor_block=args.anchor_block, radius=args.radius,
-                             zstd_level=args.zstd_level,
-                             eb_ratio=args.eb_ratio,
-                             tune=args.tune,
-                             tune_size_slack=args.tune_size_slack)
+    stream, stats = compress(
+        img,
+        eb,
+        pred,
+        levels=args.levels,
+        anchor_stride=args.anchor_stride,
+        anchor_block=args.anchor_block,
+        radius=args.radius,
+        zstd_level=args.zstd_level,
+        eb_ratio=args.eb_ratio,
+        tune=args.tune,
+        tune_size_slack=args.tune_size_slack,
+    )
     t_comp = time.time() - t0
     del pred  # drop the encoder-side embedding field before decode builds its own
     decode_setup = [0.0]
@@ -179,19 +217,25 @@ def print_tables(rows: list[dict], methods: list[str]) -> None:
     ebs = sorted({r["eb"] for r in rows})
 
     print("\n=== Per-image results ===")
-    hdr = (f"{'image':<12} {'eb':>6} {'method':<13} "
-           f"{'bpp':>7} {'PSNR':>8} {'maxErr':>9} {'ok':>4} {'tComp':>7}")
+    hdr = (
+        f"{'image':<12} {'eb':>6} {'method':<13} "
+        f"{'bpp':>7} {'PSNR':>8} {'maxErr':>9} {'ok':>4} {'tComp':>7}"
+    )
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         ok = "PASS" if r["bound_ok"] else "FAIL"
-        print(f"{r['image']:<12} {r['eb']:>6g} {r['method']:<13} "
-              f"{r['bpp']:>7.3f} {r['psnr']:>8.2f} {r['max_err']:>9.5f} "
-              f"{ok:>4} {r['t_comp']:>7.2f}")
+        print(
+            f"{r['image']:<12} {r['eb']:>6g} {r['method']:<13} "
+            f"{r['bpp']:>7.3f} {r['psnr']:>8.2f} {r['max_err']:>9.5f} "
+            f"{ok:>4} {r['t_comp']:>7.2f}"
+        )
 
     print("\n=== Averages over dataset (per method / eb) ===")
-    hdr2 = (f"{'method':<13} {'eb':>6} {'bpp':>7} {'PSNR':>8} "
-            f"{'PASS%':>6} {'tComp':>7} {'vs sz3 bpp':>11}")
+    hdr2 = (
+        f"{'method':<13} {'eb':>6} {'bpp':>7} {'PSNR':>8} "
+        f"{'PASS%':>6} {'tComp':>7} {'vs sz3 bpp':>11}"
+    )
     print(hdr2)
     print("-" * len(hdr2))
     # sz3 average bpp per eb for the relative column
@@ -209,13 +253,19 @@ def print_tables(rows: list[dict], methods: list[str]) -> None:
             pass_pct = 100 * sum(r["bound_ok"] for r in sub) / len(sub)
             avg_tcomp = np.mean([r["t_comp"] for r in sub])
             ref = sz3_bpp.get(eb, float("nan"))
-            rel = 100 * (avg_bpp / ref - 1) if ref and np.isfinite(ref) else float("nan")
+            rel = (
+                100 * (avg_bpp / ref - 1) if ref and np.isfinite(ref) else float("nan")
+            )
             rel_str = "—" if method == "sz3" else fmt(rel, "+10.1f")
-            print(f"{method:<13} {eb:>6g} {avg_bpp:>7.3f} {avg_psnr:>8.2f} "
-                  f"{pass_pct:>6.1f} {avg_tcomp:>7.2f} {rel_str:>11}")
+            print(
+                f"{method:<13} {eb:>6g} {avg_bpp:>7.3f} {avg_psnr:>8.2f} "
+                f"{pass_pct:>6.1f} {avg_tcomp:>7.2f} {rel_str:>11}"
+            )
 
 
-def _rd_points(rows: list[dict], method: str) -> tuple[list[float], list[float], list[float]]:
+def _rd_points(
+    rows: list[dict], method: str
+) -> tuple[list[float], list[float], list[float]]:
     """Dataset-averaged (bpp, PSNR) per error bound for one method, sorted by
     bpp so the polyline runs low-rate -> high-rate."""
     ebs = sorted({r["eb"] for r in rows if r["method"] == method})
@@ -236,6 +286,7 @@ def plot_rd(rows: list[dict], methods: list[str], path: str) -> None:
     annotated with their error bound. Saved to ``path``."""
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -249,8 +300,13 @@ def plot_rd(rows: list[dict], methods: list[str], path: str) -> None:
             continue
         ax.plot(bpp, psnr, marker="o", label=method)
         for x, y, eb in zip(bpp, psnr, ebs):
-            ax.annotate(f"eb={eb:g}", (x, y), textcoords="offset points",
-                        xytext=(4, 4), fontsize=7)
+            ax.annotate(
+                f"eb={eb:g}",
+                (x, y),
+                textcoords="offset points",
+                xytext=(4, 4),
+                fontsize=7,
+            )
     ax.set_xlabel("rate (bits per pixel)")
     ax.set_ylabel("PSNR (dB)")
     ax.set_title("Rate-distortion on Kodak")
@@ -263,9 +319,25 @@ def plot_rd(rows: list[dict], methods: list[str], path: str) -> None:
 
 def save_csv(rows: list[dict], path: str) -> None:
     import csv
-    fields = ["image", "method", "eb", "n_bytes", "bpp", "psnr", "max_err",
-              "bound_ok", "t_encode_setup", "t_comp", "t_decode_setup", "t_dec",
-              "tune_candidates", "t_predict", "t_quantize", "t_entropy"]
+
+    fields = [
+        "image",
+        "method",
+        "eb",
+        "n_bytes",
+        "bpp",
+        "psnr",
+        "max_err",
+        "bound_ok",
+        "t_encode_setup",
+        "t_comp",
+        "t_decode_setup",
+        "t_dec",
+        "tune_candidates",
+        "t_predict",
+        "t_quantize",
+        "t_entropy",
+    ]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -274,51 +346,100 @@ def save_csv(rows: list[dict], path: str) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", required=True,
-                    help="directory of Kodak images (kodim*.png)")
-    ap.add_argument("--gnn-checkpoint", default=str(ROOT / "data" / "gnn_predictor.pt"),
-                    help="GNN checkpoint (.pt) for the gnn method")
-    ap.add_argument("--methods", nargs="+", default=["gnn-rans", "interp", "sz3"],
-                    choices=METHODS, help="predictors to evaluate")
-    ap.add_argument("--eb", type=float, nargs="+",
-                    default=default_error_bounds(),
-                    help="absolute error bounds to sweep in the normalized "
-                         "[0,1] image units (defaults: 1, 2, 4 gray levels)")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--data", required=True, help="directory of Kodak images (kodim*.png)"
+    )
+    ap.add_argument(
+        "--gnn-checkpoint",
+        default=str(ROOT / "data" / "gnn_predictor.pt"),
+        help="GNN checkpoint (.pt) for the gnn method",
+    )
+    ap.add_argument(
+        "--methods",
+        nargs="+",
+        default=["gnn-rans", "interp", "sz3"],
+        choices=METHODS,
+        help="predictors to evaluate",
+    )
+    ap.add_argument(
+        "--eb",
+        type=float,
+        nargs="+",
+        default=default_error_bounds(),
+        help="absolute error bounds to sweep in the normalized "
+        "[0,1] image units (defaults: 1, 2, 4 gray levels)",
+    )
     ap.add_argument("--levels", type=int, default=4)
     ap.add_argument("--anchor-stride", type=int, default=16)
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--zstd-level", type=int, default=9)
-    ap.add_argument("--eb-ratio", type=float, default=None,
-                    help="per-level eb decay (coarse tighter); default: interp "
-                         "uses --tune, 1.0 forces flat classic SZ")
-    ap.add_argument("--tune", choices=("fast", "size", "rd"), default="fast",
-                    help="auto search when --eb-ratio is omitted: fast=one "
-                         "candidate, size=min bytes, rd=lowest SSE within slack")
-    ap.add_argument("--tune-size-slack", type=float, default=1.05,
-                    help="for --tune rd, choose the lowest-SSE candidate within "
-                         "this factor of the smallest stream")
-    ap.add_argument("--chunk-size", type=int, default=None,
-                    help="gnn: route through the chunked codec with this chunk "
-                         "edge (multiple of anchor-stride; 0 = whole-tensor via "
-                         "the chunked codec). Omit = original unchunked path")
-    ap.add_argument("--max-radius", type=int, default=64,
-                    help="GNN neighbour search radius")
+    ap.add_argument(
+        "--eb-ratio",
+        type=float,
+        default=None,
+        help="per-level eb decay (coarse tighter); default: interp "
+        "uses --tune, 1.0 forces flat classic SZ",
+    )
+    ap.add_argument(
+        "--tune",
+        choices=("fast", "size", "rd"),
+        default="fast",
+        help="auto search when --eb-ratio is omitted: fast=one "
+        "candidate, size=min bytes, rd=lowest SSE within slack",
+    )
+    ap.add_argument(
+        "--tune-size-slack",
+        type=float,
+        default=1.05,
+        help="for --tune rd, choose the lowest-SSE candidate within "
+        "this factor of the smallest stream",
+    )
+    ap.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="gnn: route through the chunked codec with this chunk "
+        "edge (multiple of anchor-stride; 0 = whole-tensor via "
+        "the chunked codec). Omit = original unchunked path",
+    )
+    ap.add_argument(
+        "--max-radius", type=int, default=64, help="GNN neighbour search radius"
+    )
     ap.add_argument("--device", default="cpu", help="torch device for the GNN")
-    ap.add_argument("--fp16", action="store_true",
-                    help="fp16 autocast on the GNN message pass (cuda; readout "
-                         "stays fp32). Measures the ratio cost vs fp32 across eb")
-    ap.add_argument("--compile", action="store_true",
-                    help="torch.compile the GNN message-pass embed (same float "
-                         "path replayed at decode; eval runs enc+dec in-process)")
-    ap.add_argument("--images", nargs="*", default=None,
-                    help="specific image filenames (default: all in --data)")
-    ap.add_argument("--csv", default="eval.csv",
-                    help="per-image CSV filename (bare name -> run dir)")
-    ap.add_argument("--plot", nargs="?", const="eval_rd.png", default="eval_rd.png",
-                    help="RD-curve PNG filename (bare name -> run dir)")
+    ap.add_argument(
+        "--fp16",
+        action="store_true",
+        help="fp16 autocast on the GNN message pass (cuda; readout "
+        "stays fp32). Measures the ratio cost vs fp32 across eb",
+    )
+    ap.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the GNN message-pass embed (same float "
+        "path replayed at decode; eval runs enc+dec in-process)",
+    )
+    ap.add_argument(
+        "--images",
+        nargs="*",
+        default=None,
+        help="specific image filenames (default: all in --data)",
+    )
+    ap.add_argument(
+        "--csv",
+        default="eval.csv",
+        help="per-image CSV filename (bare name -> run dir)",
+    )
+    ap.add_argument(
+        "--plot",
+        nargs="?",
+        const="eval_rd.png",
+        default="eval_rd.png",
+        help="RD-curve PNG filename (bare name -> run dir)",
+    )
     ap.add_argument("--no-plot", action="store_true", help="disable the RD plot")
     args = ap.parse_args()
 
@@ -326,6 +447,7 @@ def main():
     # and a config.json snapshot, mirroring train_gnn's runs/ layout.
     import hashlib
     import json
+
     cfg_hash = hashlib.sha1(repr(sorted(vars(args).items())).encode()).hexdigest()[:6]
     run_dir = ROOT / "outputs" / "eval" / f"{time.strftime('%Y%m%d-%H%M%S')}-{cfg_hash}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -348,17 +470,24 @@ def main():
         sys.exit(f"GNN checkpoint not found: {args.gnn_checkpoint}")
 
     print(f"Evaluating {args.methods} on {len(images)} images from {data_dir}")
-    print(f"Error bounds: {args.eb}  |  levels={args.levels} "
-          f"anchor_stride={args.anchor_stride} anchor_block={args.anchor_block}")
+    print(
+        f"Error bounds: {args.eb}  |  levels={args.levels} "
+        f"anchor_stride={args.anchor_stride} anchor_block={args.anchor_block}"
+    )
     if uses_gnn:
-        print(f"GNN checkpoint: {args.gnn_checkpoint}  "
-              f"(device={args.device}, fp16={'ON' if args.fp16 else 'off'})")
+        print(
+            f"GNN checkpoint: {args.gnn_checkpoint}  "
+            f"(device={args.device}, fp16={'ON' if args.fp16 else 'off'})"
+        )
         if args.fp16 and not str(args.device).startswith("cuda"):
-            print("  NOTE: fp16 autocast only engages on cuda; device is "
-                  f"{args.device!r} -> running fp32")
+            print(
+                "  NOTE: fp16 autocast only engages on cuda; device is "
+                f"{args.device!r} -> running fp32"
+            )
         print()
 
     from tqdm import tqdm
+
     rows: list[dict] = []
     total = len(images) * len(args.eb) * len(args.methods)
     pbar = tqdm(total=total, unit="job")
@@ -368,36 +497,46 @@ def main():
             for method in args.methods:
                 pbar.set_description(f"{img_path.name} eb={eb:g} {method}")
                 try:
-                    r = eval_sz3(img, eb) if method == "sz3" else \
-                        eval_deepsz(img, eb, method, args)
+                    r = (
+                        eval_sz3(img, eb)
+                        if method == "sz3"
+                        else eval_deepsz(img, eb, method, args)
+                    )
                 except Exception as exc:
                     tqdm.write(f"{img_path.name} eb={eb:g} {method}: ERROR: {exc}")
                     pbar.update(1)
                     continue
                 if r is None:
-                    tqdm.write(f"{img_path.name} eb={eb:g} {method}: skipped (SZ3 unavailable)")
+                    tqdm.write(
+                        f"{img_path.name} eb={eb:g} {method}: skipped (SZ3 unavailable)"
+                    )
                     pbar.update(1)
                     continue
                 r.update(image=img_path.name, method=method, eb=eb)
                 rows.append(r)
                 ok = "PASS" if r["bound_ok"] else "FAIL"
-                tqdm.write(f"{img_path.name} eb={eb:g} {method}: "
-                           f"bpp={r['bpp']:.3f} PSNR={r['psnr']:.2f}dB "
-                           f"maxErr={r['max_err']:.1f} [{ok}] {r['t_comp']:.2f}s")
+                tqdm.write(
+                    f"{img_path.name} eb={eb:g} {method}: "
+                    f"bpp={r['bpp']:.3f} PSNR={r['psnr']:.2f}dB "
+                    f"maxErr={r['max_err']:.1f} [{ok}] {r['t_comp']:.2f}s"
+                )
                 if method in ("gnn", "gnn-rans"):
-                    tqdm.write(f"    GNN search: {r['tune_candidates']} candidate(s), "
-                               f"setup={r['t_encode_setup']:.2f}s, "
-                               f"predict={r['t_predict']:.2f}s "
-                               f"quantize={r['t_quantize']:.2f}s "
-                               f"entropy={r['t_entropy']:.2f}s; "
-                               f"decode={r['t_dec']:.2f}s "
-                               f"(setup={r['t_decode_setup']:.2f}s)")
+                    tqdm.write(
+                        f"    GNN search: {r['tune_candidates']} candidate(s), "
+                        f"setup={r['t_encode_setup']:.2f}s, "
+                        f"predict={r['t_predict']:.2f}s "
+                        f"quantize={r['t_quantize']:.2f}s "
+                        f"entropy={r['t_entropy']:.2f}s; "
+                        f"decode={r['t_dec']:.2f}s "
+                        f"(setup={r['t_decode_setup']:.2f}s)"
+                    )
                 # GNN runs untiled (whole image = one region), so its embedding
                 # field is O(image size) instead of O(tile size); release it
                 # and any cached CUDA blocks before the next image/eb.
                 if method in ("gnn", "gnn-rans") and args.device.startswith("cuda"):
                     import gc
                     import torch
+
                     gc.collect()
                     torch.cuda.empty_cache()
                 pbar.update(1)

@@ -1,8 +1,13 @@
 import numpy as np
 import pytest
 
-from deepsz.rans import (build_laplace_tables, model_bits, rans_decode,
-                         rans_encode, scale_to_level)
+from deepsz.rans import (
+    build_laplace_tables,
+    model_bits,
+    rans_decode,
+    rans_encode,
+    scale_to_level,
+)
 
 
 def _roundtrip(codes, levels, tables):

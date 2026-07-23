@@ -60,9 +60,9 @@ CKPT_VERSION = 6
 # GPU peak scales with _M_TILE, not the stage's full M (line_pool is per-query,
 # so tiling is math-identical within a stream). Off by default: a fixed tile
 # shreds the whole-tensor path (a big 2D stage has M~150k -> ~150 tiny blocks,
-# ~2x slower/image) and isn't needed now that batch=1 fits (batching is
-# saturated) and fp16 halves the buffers. Set DEEPSZ_M_TILE=1024 only when
-# running big chunk_batch on tight VRAM. Stored in meta so decode replays it.
+# ~2x slower/image) and is normally unnecessary with one chunk at a time and
+# fp16 buffers. Set DEEPSZ_M_TILE=1024 only when a large chunk is tight on VRAM.
+# Stored in meta so decode replays it.
 _M_TILE = int(os.environ.get("DEEPSZ_M_TILE", 1 << 30))  # effectively no tiling
 
 
@@ -111,8 +111,8 @@ def _nearest_steps(pat: np.ndarray, dvec, P: int, res=None) -> np.ndarray:
     only at those M query residues -> O(P*M); without it, at every residue of the
     P^ndim tile -> O(P^(ndim+1)). Query points are all we ever index, so pass res."""
     if res is None:
-        res = np.indices(pat.shape)                     # every residue: (ndim, P, ...)
-    t0 = np.zeros(res[0].shape, np.int64)               # 0 == no hit yet
+        res = np.indices(pat.shape)  # every residue: (ndim, P, ...)
+    t0 = np.zeros(res[0].shape, np.int64)  # 0 == no hit yet
     for t in range(1, P + 1):
         r = tuple((res[k] + t * dvec[k]) % P for k in range(pat.ndim))
         take = (t0 == 0) & pat[r]
@@ -125,8 +125,9 @@ def _nearest_steps(pat: np.ndarray, dvec, P: int, res=None) -> np.ndarray:
 _NEAREST_TILE_CACHE: dict = {}
 
 
-def _nearest_steps_at(pat: np.ndarray, dvec, P: int, res, *,
-                      query_only: bool = False) -> np.ndarray:
+def _nearest_steps_at(
+    pat: np.ndarray, dvec, P: int, res, *, query_only: bool = False
+) -> np.ndarray:
     """`_nearest_steps` evaluated at the query residues ``res``, via a cached
     full period tile when that is cheaper: the tile costs O(P^(ndim+1)) once
     per (pat, dvec) and O(M) per lookup, vs O(P*M) per call for the direct
@@ -157,9 +158,11 @@ def _shift(arr: np.ndarray, offset, fill):
     src, dst = [], []
     for o, n in zip(offset, arr.shape):
         if o >= 0:
-            src.append(slice(o, n)); dst.append(slice(0, n - o))
+            src.append(slice(o, n))
+            dst.append(slice(0, n - o))
         else:
-            src.append(slice(0, n + o)); dst.append(slice(-o, n))
+            src.append(slice(0, n + o))
+            dst.append(slice(-o, n))
     out[tuple(dst)] = arr[tuple(src)]
     return out
 
@@ -197,20 +200,46 @@ class _StageGeom:
     validity as torch tensors of length M. Query points only — no full-grid
     tensors — so memory scales with the stage, not the image."""
 
-    __slots__ = ("ip", "in_", "dp", "dn", "vp", "vn", "cos", "lognnz",
-                 "query_idx", "idx_np", "M", "ndim", "message_blocks")
+    __slots__ = (
+        "ip",
+        "in_",
+        "dp",
+        "dn",
+        "vp",
+        "vn",
+        "cos",
+        "lognnz",
+        "query_idx",
+        "idx_np",
+        "M",
+        "ndim",
+        "message_blocks",
+    )
 
-    def __init__(self, pat, query_coords, shape, max_radius, torch, device,
-                 agg_level=None, query_only=False, precompute_messages=True):
+    def __init__(
+        self,
+        pat,
+        query_coords,
+        shape,
+        max_radius,
+        torch,
+        device,
+        agg_level=None,
+        query_only=False,
+        precompute_messages=True,
+    ):
         ndim = len(shape)
         self.ndim = ndim
         P = pat.shape[0]
         shp = np.asarray(shape)
         limit = min(max_radius, int(shp.max()))
-        Q = query_coords                                # (M, ndim)
+        Q = query_coords  # (M, ndim)
         self.M = int(len(Q))
-        self.idx_np = (np.ravel_multi_index([Q[:, k] for k in range(ndim)], shape)
-                       if self.M else np.zeros(0, np.int64))
+        self.idx_np = (
+            np.ravel_multi_index([Q[:, k] for k in range(ndim)], shape)
+            if self.M
+            else np.zeros(0, np.int64)
+        )
 
         def t(a):
             x = torch.from_numpy(np.ascontiguousarray(a))
@@ -229,10 +258,13 @@ class _StageGeom:
                     ln["v" + side] = t(np.zeros(0, bool))
                     continue
                 step = _nearest_steps_at(
-                    pat, sd, P, res, query_only=query_only)     # (M,) at query residues
-                nb = Q + step[:, None] * sd                     # neighbour coords
+                    pat, sd, P, res, query_only=query_only
+                )  # (M,) at query residues
+                nb = Q + step[:, None] * sd  # neighbour coords
                 inb = np.all((nb >= 0) & (nb < shp), axis=1)
-                valid = (step >= 1) & (step <= limit) & inb     # legacy: in-bounds & <=limit
+                valid = (
+                    (step >= 1) & (step <= limit) & inb
+                )  # legacy: in-bounds & <=limit
                 nbc = np.clip(nb, 0, shp - 1)
                 flat = np.ravel_multi_index([nbc[:, k] for k in range(ndim)], shape)
                 # legacy defaults where no neighbour: idx 0, dist 1.0 (finite, so
@@ -262,11 +294,25 @@ class _LegacyGeom:
     """Mask-based geometry for the old stage_forward API. Slower than the
     schedule-aware `_StageGeom`, but keeps older trainer/eval callers working."""
 
-    __slots__ = ("ip", "in_", "dp", "dn", "vp", "vn", "cos", "lognnz",
-                 "query_idx", "idx_np", "M", "ndim", "message_blocks")
+    __slots__ = (
+        "ip",
+        "in_",
+        "dp",
+        "dn",
+        "vp",
+        "vn",
+        "cos",
+        "lognnz",
+        "query_idx",
+        "idx_np",
+        "M",
+        "ndim",
+        "message_blocks",
+    )
 
-    def __init__(self, known, max_radius, torch, device=None, query_idx=None,
-                 agg_level=None):
+    def __init__(
+        self, known, max_radius, torch, device=None, query_idx=None, agg_level=None
+    ):
         n = known.size
         self.ndim = known.ndim
         flat = np.arange(n, dtype=np.int64).reshape(known.shape)
@@ -308,8 +354,19 @@ class _MessageBlock:
     """Static selections for one tiled block of a geometry's message pass."""
 
     __slots__ = (
-        "valid", "live_idx", "ip", "in_", "cos", "logdp", "logdn",
-        "side_idx", "side_positive", "n_live", "n_side", "L", "M",
+        "valid",
+        "live_idx",
+        "ip",
+        "in_",
+        "cos",
+        "logdp",
+        "logdn",
+        "side_idx",
+        "side_positive",
+        "n_live",
+        "n_side",
+        "L",
+        "M",
     )
 
 
@@ -365,7 +422,7 @@ def _period_prefixes(shape, levels, stride, block):
     tile = (P,) * len(shape)
     pats, cum = [], np.zeros(tile, bool)
     for mask in stage_masks(tile, levels, stride, block):
-        pats.append(cum.copy())                         # known BEFORE this stage
+        pats.append(cum.copy())  # known BEFORE this stage
         cum |= mask
     return pats
 
@@ -374,8 +431,9 @@ _GEOM_CACHE: dict = {}
 _MODEL_CACHE: dict = {}
 
 
-def build_stage_geoms(shape, levels, stride, block, max_radius, torch, device=None,
-                      agg_level=None):
+def build_stage_geoms(
+    shape, levels, stride, block, max_radius, torch, device=None, agg_level=None
+):
     """Per-stage `_StageGeom` list (empty stages dropped) plus a
     ``|known|-before-stage -> list index`` map, for the whole schedule of one
     region shape. Closed-form lattice geometry, computed at the query points
@@ -387,8 +445,15 @@ def build_stage_geoms(shape, levels, stride, block, max_radius, torch, device=No
 
     ponytail: unbounded cache, bounded in practice (a handful of shapes/configs);
     add an LRU cap only if a caller feeds unboundedly many distinct configs."""
-    key = (tuple(int(n) for n in shape), levels, stride, block, max_radius,
-           agg_level, str(device))
+    key = (
+        tuple(int(n) for n in shape),
+        levels,
+        stride,
+        block,
+        max_radius,
+        agg_level,
+        str(device),
+    )
     hit = _GEOM_CACHE.get(key)
     if hit is not None:
         return hit
@@ -401,8 +466,9 @@ def build_stage_geoms(shape, levels, stride, block, max_radius, torch, device=No
         if n:  # empty stages get no predict call; skipping keeps counts unique
             Q = np.stack(np.nonzero(mask), axis=1)
             count_to_i[cum] = len(geoms)
-            geoms.append(_StageGeom(pats[s], Q, shape, max_radius, torch, device,
-                                    agg_level))
+            geoms.append(
+                _StageGeom(pats[s], Q, shape, max_radius, torch, device, agg_level)
+            )
         cum += n
     out = (geoms, count_to_i)
     _GEOM_CACHE[key] = out
@@ -411,6 +477,7 @@ def build_stage_geoms(shape, levels, stride, block, max_radius, torch, device=No
 
 def _mlp(torch, sizes):
     import torch.nn as nn
+
     layers = []
     for a, b in zip(sizes[:-1], sizes[1:]):
         layers += [nn.Linear(a, b), nn.GELU()]
@@ -430,13 +497,14 @@ def build_model(d: int = 32, agg_level: int = 2):
     it from the checkpoint)."""
     import torch
     import torch.nn as nn
+
     F = nn.functional
 
     assert d % 2 == 0, "d must be even for the paired axis embeddings"
     L = int(agg_level)
     if L < 1:
         raise ValueError("agg_level must be >= 1")
-    n_states = 2 * L + 1                # signed cosines {+-1/sqrt(j)} u {0}
+    n_states = 2 * L + 1  # signed cosines {+-1/sqrt(j)} u {0}
 
     # Hidden width of the message/fusion/readout MLPs. Decoupled from d so the
     # per-axis field (memory ~ ndim * d) stays cheap while these functions keep
@@ -487,24 +555,26 @@ def build_model(d: int = 32, agg_level: int = 2):
 
         def __init__(self):
             super().__init__()
-            self.table = nn.Parameter(torch.randn(n_states, ds) * ds ** -0.5)
+            self.table = nn.Parameter(torch.randn(n_states, ds) * ds**-0.5)
 
         def _index(self, cos, sign):
             # Bucket in fp32 for a stable index even when the message pass runs
             # in fp16 (round() tolerates the noise, but keep cos out of half).
-            v = (sign * cos.float())
-            nnz = v.square().reciprocal().round()   # 1..L for v!=0; inf at v==0
-            idx = torch.where(v > 0, 2 * L - nnz + 1,
-                              torch.where(v < 0, nnz - 1,
-                                          v.new_full((), float(L))))
+            v = sign * cos.float()
+            nnz = v.square().reciprocal().round()  # 1..L for v!=0; inf at v==0
+            idx = torch.where(
+                v > 0,
+                2 * L - nnz + 1,
+                torch.where(v < 0, nnz - 1, v.new_full((), float(L))),
+            )
             return idx.clamp_(0, 2 * L).long()
 
         def forward_flat(self, e, cos, sign):
             # Flat pair layout for the live-pair message pass: e (B, N, K, d),
             # cos (N, K) -> (B, N, K, d + ds), one direction state per gathered
             # (line, point) pair, broadcast over the batch dim.
-            idx = self._index(cos, sign)                  # (N, K)
-            state = self.table[idx].to(e.dtype)           # (N, K, ds)
+            idx = self._index(cos, sign)  # (N, K)
+            state = self.table[idx].to(e.dtype)  # (N, K, ds)
             state = state.unsqueeze(0).expand(e.shape[0], *state.shape)
             return torch.cat([e, state], dim=-1)
 
@@ -518,9 +588,10 @@ def build_model(d: int = 32, agg_level: int = 2):
             # e (B,L,M,K,de) with the two scalar columns — avoids materializing the
             # big (…,de+2) buffer (the `cat` was ~14% of GPU time). ``e`` already
             # carries the concatenated direction state (width de = d + ds).
-            w = self.net[0].weight                       # (h, de+2)
-            x = F.linear(e, w[:, :de], self.net[0].bias) \
-                + F.linear(torch.cat([sign, logd], -1), w[:, de:])
+            w = self.net[0].weight  # (h, de+2)
+            x = F.linear(e, w[:, :de], self.net[0].bias) + F.linear(
+                torch.cat([sign, logd], -1), w[:, de:]
+            )
             for layer in self.net[1:]:
                 x = layer(x)
             return x
@@ -531,10 +602,12 @@ def build_model(d: int = 32, agg_level: int = 2):
             self.net = _mlp(torch, [2 * de + 2, h, d])
 
         def forward(self, e_neg, e_pos, logd_neg, logd_pos):
-            w = self.net[0].weight                       # (h, 2de+2)
-            x = F.linear(e_neg, w[:, :de]) \
-                + F.linear(e_pos, w[:, de:2 * de], self.net[0].bias) \
-                + F.linear(torch.cat([logd_neg, logd_pos], -1), w[:, 2 * de:])
+            w = self.net[0].weight  # (h, 2de+2)
+            x = (
+                F.linear(e_neg, w[:, :de])
+                + F.linear(e_pos, w[:, de : 2 * de], self.net[0].bias)
+                + F.linear(torch.cat([logd_neg, logd_pos], -1), w[:, 2 * de :])
+            )
             for layer in self.net[1:]:
                 x = layer(x)
             return x
@@ -549,13 +622,13 @@ def build_model(d: int = 32, agg_level: int = 2):
             # linear fusion.
             self.wk = _mlp(torch, [d, d, 1])
             self.wv = nn.Linear(d, d)
-            self.null_k = nn.Parameter(torch.randn(()) * d ** -0.5)
+            self.null_k = nn.Parameter(torch.randn(()) * d**-0.5)
             self.null_v = nn.Parameter(torch.zeros(d))
 
         def forward(self, msgs, valid):
             # msgs: (L, B, N, d); valid: (L, N) bool
             v = self.wv(msgs)
-            scale = self.wv.in_features ** -0.5
+            scale = self.wv.in_features**-0.5
             scores = self.wk(msgs).squeeze(-1) * scale  # (L, B, N)
             scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
             L, B, N, dd = msgs.shape
@@ -673,11 +746,9 @@ def build_model(d: int = 32, agg_level: int = 2):
             B = E.shape[0]
             K, d = E.shape[2], self.d
             L, m, Nl = block.L, block.M, block.n_live
-            if not Nl:                                      # no neighbours anywhere
+            if not Nl:  # no neighbours anywhere
                 msg = E.new_zeros(B, L, m, K, d)
-                return (
-                    msg.permute(1, 0, 2, 3, 4).contiguous(), block.valid
-                )
+                return (msg.permute(1, 0, 2, 3, 4).contiguous(), block.valid)
             # Distances are precomputed in fp32; match model dtype so the
             # dir/bidir MLPs get fp16 inputs under true-half.
             lp = block.logdp.to(E.dtype)
@@ -691,7 +762,7 @@ def build_model(d: int = 32, agg_level: int = 2):
             # dir overwrite below discards that, exactly as the old `where` did.
             lp_e = lp.view(1, Nl, 1, 1).expand(B, Nl, K, 1)
             lnn_e = lnn.view(1, Nl, 1, 1).expand(B, Nl, K, 1)
-            msg_live = self.bidir(en, ep, lnn_e, lp_e)      # (B, Nl, K, d)
+            msg_live = self.bidir(en, ep, lnn_e, lp_e)  # (B, Nl, K, d)
             if block.n_side:
                 s_idx = block.side_idx
                 ns = block.n_side
@@ -702,21 +773,20 @@ def build_model(d: int = 32, agg_level: int = 2):
                 lp_s = lp[s_idx].view(1, ns, 1, 1).expand(B, ns, K, 1)
                 lnn_s = lnn[s_idx].view(1, ns, 1, 1).expand(B, ns, K, 1)
                 msg_live[:, s_idx] = self.dir(
-                    e_side, sign, torch.where(vpo, lp_s, lnn_s)).to(msg_live.dtype)
+                    e_side, sign, torch.where(vpo, lp_s, lnn_s)
+                ).to(msg_live.dtype)
             msg = E.new_zeros(B, L * m, K, d, dtype=msg_live.dtype)  # dead pairs stay 0
             msg[:, block.live_idx] = msg_live
             msg = msg.reshape(B, L, m, K, d)
-            return (
-                msg.permute(1, 0, 2, 3, 4).contiguous(), block.valid
-            )
+            return (msg.permute(1, 0, 2, 3, 4).contiguous(), block.valid)
 
         def _embed_block(self, E, block):
             msgs, valid = self._line_messages(E, block)  # (L,B,m,K,d),(L,m)
             L, B, m, K, _ = msgs.shape
             flat = msgs.reshape(L, B, m * K, self.d)
-            vflat = valid.repeat_interleave(K, dim=1)        # (L, m*K)
-            ctx = self.line_pool(flat, vflat)                # (B, m*K, d)
-            return ctx.reshape(B, m, K, self.d)              # (B, m, ndim, d)
+            vflat = valid.repeat_interleave(K, dim=1)  # (L, m*K)
+            ctx = self.line_pool(flat, vflat)  # (B, m*K, d)
+            return ctx.reshape(B, m, K, self.d)  # (B, m, ndim, d)
 
         def embed(self, E, geom):
             """Per-axis contexts at geom's query points: single-query attention
@@ -747,7 +817,8 @@ def build_model(d: int = 32, agg_level: int = 2):
             if ctx.dim() != 4:
                 raise ValueError(
                     f"finalize requires axial context (B, M, ndim, d), got "
-                    f"shape {tuple(ctx.shape)}")
+                    f"shape {tuple(ctx.shape)}"
+                )
             value_emb = self.init(self_val.unsqueeze(-1)).unsqueeze(2)
             return self.mix(ctx, value_emb.expand_as(ctx))
 
@@ -803,8 +874,9 @@ def _load_inference_model(checkpoint_path, torch, device):
     return out
 
 
-def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
-                         finalize_ctx=None, eb=0.01):
+def _stage_forward_geoms(
+    model, E, geom_prev, geom_head, finalize_vals, torch, finalize_ctx=None, eb=0.01
+):
     """Finalize with and return pre-axis-pool contexts for stage reuse."""
     if geom_prev is not None and geom_prev.M:
         ctx = finalize_ctx if finalize_ctx is not None else model.embed(E, geom_prev)
@@ -813,7 +885,7 @@ def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
         # mutating it between calls is safe; out-of-place clones E every stage
         # (~200ms of DtoD at chunk 32). Only unsafe if E were a CUDA-graph static
         # buffer, but reduce-overhead re-copies inputs, so eager E stays mutable.
-        E.index_copy_(1, geom_prev.query_idx, finalized)        # write newly-known
+        E.index_copy_(1, geom_prev.query_idx, finalized)  # write newly-known
     head_ctx = model.embed(E, geom_head)
     return model.head_of(head_ctx, eb), E, head_ctx
 
@@ -821,11 +893,11 @@ def _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals, torch,
 def stage_forward(model, E, *args, **kwargs):
     """One codec stage of the propagating GNN.
 
-    Supports both APIs:
+    Supports both execution APIs:
     - optimized geometry API:
       ``stage_forward(model, E, geom_prev, geom_head, finalize_vals, torch,
       finalize_ctx=None, eb=...) -> ((mu, log_b), E, head_ctx)``
-    - legacy mask API:
+    - dynamic mask API used while training:
       ``stage_forward(model, E, prev_mask, known_mask, norm, max_radius, torch,
       predict_idx=None) -> (values, E)``
     """
@@ -840,12 +912,20 @@ def stage_forward(model, E, *args, **kwargs):
         eb = kwargs.pop("eb", 0.01)
         if kwargs:
             raise TypeError(f"unexpected keyword argument {next(iter(kwargs))!r}")
-        return _stage_forward_geoms(model, E, geom_prev, geom_head, finalize_vals,
-                                    torch, finalize_ctx=finalize_ctx, eb=eb)
+        return _stage_forward_geoms(
+            model,
+            E,
+            geom_prev,
+            geom_head,
+            finalize_vals,
+            torch,
+            finalize_ctx=finalize_ctx,
+            eb=eb,
+        )
 
-    # Legacy path used by older training/eval code.
+    # Dynamic-mask path used by training, where stage geometry changes per batch.
     if len(args) < 5:
-        raise TypeError("legacy stage_forward needs max_radius and torch")
+        raise TypeError("mask stage_forward needs max_radius and torch")
     prev_mask, known_mask, norm, max_radius, torch = args[:5]
     predict_idx = kwargs.pop("predict_idx", None)
     eb = kwargs.pop("eb", 0.01)
@@ -871,13 +951,14 @@ class GNNPredictor:
     `max_radius` caps the neighbour distance (anchors always sit closer)."""
 
     from .bitstream import FLAG_GNN as _FLAG
+
     stream_flag = _FLAG
-    tunable = True    # encoder sweeps eb_ratio (no centre mode; see codec.encode)
+    tunable = True  # encoder sweeps eb_ratio (no centre mode; see codec.encode)
     fast_eb_ratio = 0.8  # single-encode (tune=fast) default; tighter coarse
-                         # levels help the learned fine-level prediction
+    # levels help the learned fine-level prediction
     provides_scale = True
-    fp16 = False      # fp16 autocast on the message pass (encode/decode must match)
-    compile = False   # torch.compile the embed pass (encode/decode must match)
+    fp16 = False  # fp16 autocast on the message pass (encode/decode must match)
+    compile = False  # torch.compile the embed pass (encode/decode must match)
 
     def _maybe_compile(self):
         # Wrap the embed pass once. It fuses the elementwise message-pass ops
@@ -891,19 +972,27 @@ class GNNPredictor:
             # recapture per new shape, so it only wins once shapes settle/repeat.
             mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
             self.model.embed = self._torch.compile(
-                self.model.embed, dynamic=True, mode=mode)
+                self.model.embed, dynamic=True, mode=mode
+            )
             self._compiled = True
 
     def _amp(self):
         self._maybe_compile()
         if self.fp16 and self.device.type == "cuda":
-            return self._torch.autocast(device_type="cuda",
-                                        dtype=self._torch.float16)
+            return self._torch.autocast(device_type="cuda", dtype=self._torch.float16)
         return contextlib.nullcontext()
 
-    def __init__(self, checkpoint_path, vmin: float, vmax: float,
-                 max_radius: int = 64, device: str = "cpu",
-                 levels: int = 4, anchor_stride: int = 16, anchor_block: int = 1):
+    def __init__(
+        self,
+        checkpoint_path,
+        vmin: float,
+        vmax: float,
+        max_radius: int = 64,
+        device: str = "cpu",
+        levels: int = 4,
+        anchor_stride: int = 16,
+        anchor_block: int = 1,
+    ):
         import torch
 
         self._torch = torch
@@ -916,30 +1005,43 @@ class GNNPredictor:
         self.anchor_block = int(anchor_block)
 
         self.d, self.model, self.checkpoint_hash, self.agg_level = (
-            _load_inference_model(checkpoint_path, torch, self.device))
+            _load_inference_model(checkpoint_path, torch, self.device)
+        )
         # Neighbourhood aggregation level: cap on the L1 length of the neighbour
         # lines (see `half_directions`), frozen into the checkpoint at training
         # time. Encoder and decoder load the same checkpoint, so they agree.
-        self._sched: dict = {}   # shape -> (stage geoms, count->index map)
+        self._sched: dict = {}  # shape -> (stage geoms, count->index map)
         self._reset()
 
     def _reset(self):
-        self._E = None           # persistent embedding field (C, N, ndim, d)
-        self._ctx = None         # last stage's head context (next finalize reuses it)
-        self._stage = None       # list index of the last predicted stage
+        self._E = None  # persistent embedding field (C, N, ndim, d)
+        self._ctx = None  # last stage's head context (next finalize reuses it)
+        self._stage = None  # list index of the last predicted stage
 
     def _schedule(self, shape):
         key = tuple(int(n) for n in shape)
         g = self._sched.get(key)
         if g is None:
-            g = build_stage_geoms(key, self.levels, self.anchor_stride,
-                                  self.anchor_block, self.max_radius,
-                                  self._torch, self.device, self.agg_level)
+            g = build_stage_geoms(
+                key,
+                self.levels,
+                self.anchor_stride,
+                self.anchor_block,
+                self.max_radius,
+                self._torch,
+                self.device,
+                self.agg_level,
+            )
             self._sched[key] = g
         return g
 
-    def predict(self, recon: np.ndarray, known: np.ndarray,
-               pos: np.ndarray | None = None, eb: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def predict(
+        self,
+        recon: np.ndarray,
+        known: np.ndarray,
+        pos: np.ndarray | None = None,
+        eb: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Predict the current stage's holes (`pos`, the codec's stage mask).
         Everything scales with the stage: geometry is precomputed at the query
         points only, values are normalized only at the just-revealed points, and
@@ -965,8 +1067,7 @@ class GNNPredictor:
         cont = self._E is not None and self._stage == i - 1
         if not cont:
             ndim = recon.ndim - 1
-            self._E = torch.zeros(
-                c, known.size, ndim, self.d, device=self.device)
+            self._E = torch.zeros(c, known.size, ndim, self.d, device=self.device)
             self._ctx = None
         geom_prev, geom_head = geoms[i - 1], geoms[i]
 
@@ -974,19 +1075,30 @@ class GNNPredictor:
         # compactly from recon — no full (C, N) clip/scatter each stage.
         vals = recon.reshape(c, -1)[:, geom_prev.idx_np]
         fvals = torch.from_numpy(
-            ((np.clip(vals, self.vmin, self.vmax) - self.vmin) / span
-             ).astype(np.float32)).to(self.device)
+            ((np.clip(vals, self.vmin, self.vmax) - self.vmin) / span).astype(
+                np.float32
+            )
+        ).to(self.device)
         finalize_ctx = self._ctx if cont else None
         with torch.no_grad(), self._amp():
             (values, log_b), self._E, self._ctx = stage_forward(
-                self.model, self._E, geom_prev, geom_head, fvals, torch,
-                finalize_ctx=finalize_ctx, eb=norm_eb)
+                self.model,
+                self._E,
+                geom_prev,
+                geom_head,
+                fvals,
+                torch,
+                finalize_ctx=finalize_ctx,
+                eb=norm_eb,
+            )
         self._stage = i
         vals_np, logb_np = torch.stack((values, log_b)).cpu().numpy()  # one D2H
         pred = vals_np.reshape(c, -1) * span + self.vmin
         scale = np.exp2(logb_np.reshape(c, -1)) * span
-        return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
-                scale.astype(np.float32))
+        return (
+            np.clip(pred, self.vmin, self.vmax).astype(np.float32),
+            scale.astype(np.float32),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1005,8 +1117,17 @@ class _ChunkGeoms:
     ones mod the pattern period and every aligned chunk of the same shape
     shares this object (cached in ``build_chunk_geoms``)."""
 
-    def __init__(self, chunk_shape, levels, stride, block, torch, device,
-                 agg_level=None, progress=None):
+    def __init__(
+        self,
+        chunk_shape,
+        levels,
+        stride,
+        block,
+        torch,
+        device,
+        agg_level=None,
+        progress=None,
+    ):
         self.chunk_shape = tuple(int(n) for n in chunk_shape)
         self.levels, self.stride, self.block = levels, stride, block
         self.agg_level = agg_level
@@ -1018,37 +1139,48 @@ class _ChunkGeoms:
 
         masks = stage_masks(self.chunk_shape, levels, stride, block)
         pats = _period_prefixes(self.chunk_shape, levels, stride, block)
-        self.geoms, self.coords = [], []   # per stage; None for empty stages
+        self.geoms, self.coords = [], []  # per stage; None for empty stages
         for s, mask in enumerate(masks):
-            Q = np.stack(np.nonzero(mask), axis=1)   # chunk-frame coords
+            Q = np.stack(np.nonzero(mask), axis=1)  # chunk-frame coords
             if not len(Q):
                 self.geoms.append(None)
                 self.coords.append(None)
                 if progress is not None:
                     progress(1)
                 continue
-            self.geoms.append(_StageGeom(pats[s], Q + stride, self.padded_shape,
-                                         stride, torch, device, agg_level,
-                                         query_only=True,
-                                         precompute_messages=False))
+            self.geoms.append(
+                _StageGeom(
+                    pats[s],
+                    Q + stride,
+                    self.padded_shape,
+                    stride,
+                    torch,
+                    device,
+                    agg_level,
+                    query_only=True,
+                    precompute_messages=False,
+                )
+            )
             self.coords.append(Q)
             if progress is not None:
                 progress(1)
         # prediction chain: stage 0 is always the base (anchors, possibly empty
         # in a ragged tail chunk -> None geom, nothing to finalize), followed by
         # every non-empty refinement stage in order.
-        self.chain = [0] + [s for s in range(1, len(self.geoms))
-                            if self.geoms[s] is not None]
+        self.chain = [0] + [
+            s for s in range(1, len(self.geoms)) if self.geoms[s] is not None
+        ]
 
         # Interior padded-flat indices, built directly (O(interior), never the
         # O(shell) full padded grid). The compact field lays interior first, so
         # interior cell i has compact index i + 1 (row 0 is a dummy the invalid
         # / not-yet-decoded neighbour lines point at).
-        idx0 = np.indices(self.chunk_shape).reshape(ndim, -1)     # chunk-frame
+        idx0 = np.indices(self.chunk_shape).reshape(ndim, -1)  # chunk-frame
         self.interior_flat = np.ravel_multi_index(idx0 + stride, self.padded_shape)
         lv = point_levels(list(idx0), levels, stride, block)
-        self.level_pos = [np.nonzero(lv == l)[0].astype(np.int64) + 1
-                          for l in range(levels + 1)]
+        self.level_pos = [
+            np.nonzero(lv == l)[0].astype(np.int64) + 1 for l in range(levels + 1)
+        ]
 
         # Padded-flat halo cells that appear as a *valid* neighbour of some
         # stage: the thin band the field must actually hold. Derived from the
@@ -1061,30 +1193,50 @@ class _ChunkGeoms:
                 continue
             seen.append(g.ip[g.vp])
             seen.append(g.in_[g.vn])
-        ref = (torch.unique(torch.cat(seen)).cpu().numpy() if seen
-               else np.zeros(0, np.int64))
+        ref = (
+            torch.unique(torch.cat(seen)).cpu().numpy()
+            if seen
+            else np.zeros(0, np.int64)
+        )
         self.ref_halo_flat = ref[~np.isin(ref, self.interior_flat)].astype(np.int64)
-        self.ref_halo_coords = (np.stack(
-            np.unravel_index(self.ref_halo_flat, self.padded_shape), 1) - stride)
+        self.ref_halo_coords = (
+            np.stack(np.unravel_index(self.ref_halo_flat, self.padded_shape), 1)
+            - stride
+        )
 
 
 _CHUNK_GEOM_CACHE: dict = {}
 
 
-def build_chunk_geoms(chunk_shape, levels, stride, block, torch, device=None,
-                      agg_level=None, progress=None):
+def build_chunk_geoms(
+    chunk_shape,
+    levels,
+    stride,
+    block,
+    torch,
+    device=None,
+    agg_level=None,
+    progress=None,
+):
     """Cached `_ChunkGeoms` per (chunk shape, schedule, agg_level, device).
     Interior chunks all share one entry; ragged edge chunks add at most a few
     shape variants (ponytail: unbounded like _GEOM_CACHE, bounded in practice).
 
     ``agg_level`` caps the neighbourhood aggregation level (see
     `half_directions`); ``None`` keeps the full neighbourhood."""
-    key = (tuple(int(n) for n in chunk_shape), levels, stride, block, agg_level,
-           str(device))
+    key = (
+        tuple(int(n) for n in chunk_shape),
+        levels,
+        stride,
+        block,
+        agg_level,
+        str(device),
+    )
     hit = _CHUNK_GEOM_CACHE.get(key)
     if hit is None:
-        hit = _ChunkGeoms(chunk_shape, levels, stride, block, torch, device,
-                          agg_level, progress)
+        hit = _ChunkGeoms(
+            chunk_shape, levels, stride, block, torch, device, agg_level, progress
+        )
         _CHUNK_GEOM_CACHE[key] = hit
     elif progress is not None:
         progress(len(hit.geoms))
@@ -1110,12 +1262,12 @@ def _build_remap(present, n_padded, torch, device):
     comp = torch.from_numpy((order + 1).astype(np.int64)).to(device)
     n = spres.numel()
 
-    def remap(flat):                 # (torch int64) -> (torch int64) compact
+    def remap(flat):  # (torch int64) -> (torch int64) compact
         if n == 0:
             return torch.zeros_like(flat)
         pos = torch.searchsorted(spres, flat).clamp_(max=n - 1)
-        return torch.where(spres[pos] == flat, comp[pos],
-                           torch.zeros_like(flat))
+        return torch.where(spres[pos] == flat, comp[pos], torch.zeros_like(flat))
+
     return remap
 
 
@@ -1144,18 +1296,27 @@ class _CompactFrame:
     (contiguous) halo row block plus the metadata to fill it from coarse+value.
     ``n_compact`` = 1 dummy + interior + usable-referenced halo."""
 
-    __slots__ = ("geoms", "n_interior", "n_compact", "halo_rows",
-                 "h_ids", "h_lv", "h_gflat")
+    __slots__ = (
+        "geoms",
+        "n_interior",
+        "n_compact",
+        "halo_rows",
+        "h_ids",
+        "h_lv",
+        "h_gflat",
+    )
 
     def __init__(self, cg, origin, shape, edges, grid, coded, torch, device):
         halo_present, h_ids, h_lv, h_gflat = chunk_halo_info(
-            cg, origin, shape, edges, grid, coded)
+            cg, origin, shape, edges, grid, coded
+        )
         self.n_interior = int(len(cg.interior_flat))
         present = np.concatenate([cg.interior_flat, halo_present])
         self.n_compact = 1 + len(present)
         remap = _build_remap(present, cg.n_padded, torch, device)
-        self.geoms = [None if g is None else _CompactGeom(g, remap, torch)
-                      for g in cg.geoms]
+        self.geoms = [
+            None if g is None else _CompactGeom(g, remap, torch) for g in cg.geoms
+        ]
         # halo cells are laid out right after interior, so their rows are a
         # contiguous slice — no remap needed to fill them.
         self.halo_rows = slice(self.n_interior + 1, self.n_compact)
@@ -1176,14 +1337,11 @@ def chunk_halo_info(cg, origin, shape, edges, grid, coded):
     shp = np.asarray(shape)
     inb = np.all((gc >= 0) & (gc < shp), axis=1)
     gci = gc[inb]
-    chunk_ids = np.ravel_multi_index(
-        [gci[:, k] // edges[k] for k in range(ndim)], grid)
-    lv = point_levels([gci[:, k] for k in range(ndim)],
-                      cg.levels, cg.stride, cg.block)
+    chunk_ids = np.ravel_multi_index([gci[:, k] // edges[k] for k in range(ndim)], grid)
+    lv = point_levels([gci[:, k] for k in range(ndim)], cg.levels, cg.stride, cg.block)
     ok = np.asarray(coded)[chunk_ids] | (lv == 0)
     halo_present = cg.ref_halo_flat[inb][ok]
-    gflat = np.ravel_multi_index(
-        [gci[ok][:, k] for k in range(ndim)], shape)
+    gflat = np.ravel_multi_index([gci[ok][:, k] for k in range(ndim)], shape)
     return halo_present, chunk_ids[ok], lv[ok], gflat
 
 
@@ -1215,8 +1373,8 @@ def chunk_coarse(model, E_pad, cg, torch):
     for l, pos in enumerate(cg.level_pos):
         if not len(pos):
             continue
-        idx = torch.from_numpy(pos).to(E_pad.device)         # compact rows
-        mean = E_pad.index_select(1, idx).mean(dim=1)        # (B, K, d)
+        idx = torch.from_numpy(pos).to(E_pad.device)  # compact rows
+        mean = E_pad.index_select(1, idx).mean(dim=1)  # (B, K, d)
         s = cg.stride if l == 0 else max(cg.stride >> l, 1)
         out[:, l] = model.coarse(mean, math.log2(s))
     return out
@@ -1245,9 +1403,8 @@ class ChunkedGNNPredictor:
     """
 
     provides_scale = True
-    chunk_batch = 1              # sub-batch size chosen by the codec, into meta
-    fp16 = False                # fp16 autocast on the message pass (codec sets it)
-    compile = False             # torch.compile the embed pass (codec sets it)
+    fp16 = False  # fp16 autocast on the message pass (codec sets it)
+    compile = False  # torch.compile the embed pass (codec sets it)
 
     def _maybe_compile(self):
         # Wrap the embed pass once (fuses the elementwise message-pass ops that
@@ -1260,12 +1417,20 @@ class ChunkedGNNPredictor:
             # recapture per new shape, so it only wins once shapes settle/repeat.
             mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
             self.model.embed = self._torch.compile(
-                self.model.embed, dynamic=True, mode=mode)
+                self.model.embed, dynamic=True, mode=mode
+            )
             self._compiled = True
 
-    def __init__(self, checkpoint_path, vmin: float, vmax: float,
-                 device: str = "cpu", levels: int = 4, anchor_stride: int = 16,
-                 anchor_block: int = 1):
+    def __init__(
+        self,
+        checkpoint_path,
+        vmin: float,
+        vmax: float,
+        device: str = "cpu",
+        levels: int = 4,
+        anchor_stride: int = 16,
+        anchor_block: int = 1,
+    ):
         import torch
 
         self._torch = torch
@@ -1280,11 +1445,11 @@ class ChunkedGNNPredictor:
         # Neighbourhood aggregation level (see GNNPredictor / half_directions),
         # frozen into the checkpoint at training time.
         self.d, self.model, self.checkpoint_hash, self.agg_level = (
-            _load_inference_model(checkpoint_path, torch, self.device))
+            _load_inference_model(checkpoint_path, torch, self.device)
+        )
 
     # -- per-tensor lifecycle -------------------------------------------------
-    def begin(self, shape, chunk_edges, channels: int = 1,
-              geometry_progress=None):
+    def begin(self, shape, chunk_edges, channels: int = 1, geometry_progress=None):
         torch = self._torch
         self.shape = tuple(int(n) for n in shape)
         self.edges = tuple(int(e) for e in chunk_edges)
@@ -1292,15 +1457,17 @@ class ChunkedGNNPredictor:
             raise ValueError("chunk_edges must have one entry per axis")
         for e in self.edges:
             if e < self.anchor_stride or e % self.anchor_stride:
-                raise ValueError("chunk edges must be positive multiples of "
-                                 "anchor_stride")
+                raise ValueError(
+                    "chunk edges must be positive multiples of anchor_stride"
+                )
         self.grid = tuple(-(-n // e) for n, e in zip(self.shape, self.edges))
         self.n_chunks = int(np.prod(self.grid))
         self.C = int(channels)
         ndim = len(self.shape)
         self._check_field_budget(ndim, channels, geometry_progress)
-        self.coarse = torch.zeros(self.C, self.n_chunks, self.levels + 1,
-                                  ndim, self.d, device=self.device)
+        self.coarse = torch.zeros(
+            self.C, self.n_chunks, self.levels + 1, ndim, self.d, device=self.device
+        )
         self.coded = np.zeros(self.n_chunks, bool)
         self._cg = None
 
@@ -1314,11 +1481,18 @@ class ChunkedGNNPredictor:
         """
         torch = self._torch
         cshape = tuple(min(e, n) for e, n in zip(self.edges, self.shape))
-        cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
-                               self.anchor_block, torch, self.device,
-                               self.agg_level, geometry_progress)
+        cg = build_chunk_geoms(
+            cshape,
+            self.levels,
+            self.anchor_stride,
+            self.anchor_block,
+            torch,
+            self.device,
+            self.agg_level,
+            geometry_progress,
+        )
         n_interior = int(len(cg.interior_flat))
-        n_band = int(len(cg.ref_halo_flat))          # upper bound (all referenced)
+        n_band = int(len(cg.ref_halo_flat))  # upper bound (all referenced)
         field_bytes = channels * (1 + n_interior + n_band) * ndim * self.d * 4
         M = max((g.M for g in cg.geoms if g is not None), default=0)
         m = min(M, _M_TILE)
@@ -1327,22 +1501,26 @@ class ChunkedGNNPredictor:
         need = field_bytes + act_bytes
         if self.device.type == "cuda":
             budget = _cuda_working_budget(torch, self.device)
-        else:                                # cpu: cap at 64 GiB, still catches it
+        else:  # cpu: cap at 64 GiB, still catches it
             budget = 64 << 30
         if need > budget:
             warnings.warn(
-                f"chunked GNN needs up to {need/1e9:.0f} GB per chunk "
-                f"(field {field_bytes/1e9:.1f} + stage activation "
-                f"{act_bytes/1e9:.1f} GB for tile={m:,} of M={M:,} queries "
-                f"x L={L} lines, budget {budget/1e9:.1f} GB). Lower "
-                f"DEEPSZ_M_TILE, or reduce both --chunk-size and "
-                f"--anchor-stride (for example 16 and 16). Continuing because "
-                f"this estimate is advisory.", RuntimeWarning, stacklevel=2)
+                f"chunked GNN needs up to {need / 1e9:.0f} GB per chunk "
+                f"(field {field_bytes / 1e9:.1f} + stage activation "
+                f"{act_bytes / 1e9:.1f} GB for tile={m:,} of M={M:,} queries "
+                f"x L={L} lines, budget {budget / 1e9:.1f} GB). Lower "
+                f"DEEPSZ_M_TILE or --chunk-size. Continuing because "
+                f"this estimate is advisory.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def chunk_slices(self, ci: int):
         cidx = np.unravel_index(ci, self.grid)
-        return tuple(slice(i * e, min((i + 1) * e, n))
-                     for i, e, n in zip(cidx, self.edges, self.shape))
+        return tuple(
+            slice(i * e, min((i + 1) * e, n))
+            for i, e, n in zip(cidx, self.edges, self.shape)
+        )
 
     def _norm(self, vals: np.ndarray):
         v = (np.clip(vals, self.vmin, self.vmax) - self.vmin) / self.span
@@ -1363,7 +1541,7 @@ class ChunkedGNNPredictor:
         torch = self._torch
         ndim = len(self.shape)
         log_s = math.log2(self.anchor_stride)
-        groups: dict = {}                         # anchor-count -> list of (ci, vals)
+        groups: dict = {}  # anchor-count -> list of (ci, vals)
         empty_chunks = 0
         for ci in range(self.n_chunks):
             axes = []
@@ -1372,8 +1550,8 @@ class ChunkedGNNPredictor:
                 axes.append(c[(c % self.anchor_stride) < self.anchor_block])
             if any(len(a) == 0 for a in axes):
                 empty_chunks += 1
-                continue                          # ragged chunk with no anchors
-            vals = recon[(slice(None), *np.ix_(*axes))].reshape(-1)   # C==1
+                continue  # ragged chunk with no anchors
+            vals = recon[(slice(None), *np.ix_(*axes))].reshape(-1)  # C==1
             groups.setdefault(len(vals), ([], []))
             groups[len(vals)][0].append(ci)
             groups[len(vals)][1].append(vals)
@@ -1381,49 +1559,23 @@ class ChunkedGNNPredictor:
             progress(empty_chunks)
         with torch.no_grad(), self._amp():
             for ids, vlist in groups.values():
-                v = np.stack(vlist)                             # (G, M_a)
+                v = np.stack(vlist)  # (G, M_a)
                 fin = anchor_finalize(self.model, self._norm(v), ndim)
                 # `coarse` persists between waves, so keep it fp32 even though
                 # its producer ran under autocast.
-                self.coarse[0, ids, 0] = self.model.coarse(
-                    fin.mean(1), log_s).to(self.coarse.dtype)
+                self.coarse[0, ids, 0] = self.model.coarse(fin.mean(1), log_s).to(
+                    self.coarse.dtype
+                )
                 if progress is not None:
                     progress(len(ids))
 
-    # ---- batched wave path (codec): many same-geometry chunks in the B dim ----
+    # ---- chunk-wave path ----------------------------------------------------
 
     def _amp(self):
         self._maybe_compile()
         if self.fp16 and self.device.type == "cuda":
-            return self._torch.autocast(device_type="cuda",
-                                        dtype=self._torch.float16)
+            return self._torch.autocast(device_type="cuda", dtype=self._torch.float16)
         return contextlib.nullcontext()
-
-    def max_batch(self, cshape):
-        """How many same-shape chunks fit in the memory budget at once. Bounded by
-        the finest stage's activation (B, L, M, K, d) plus the compact field, the
-        two terms that scale with B (see `_check_field_budget`)."""
-        torch = self._torch
-        cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
-                               self.anchor_block, torch, self.device,
-                               self.agg_level)
-        ndim = len(cshape)
-        n_field = 1 + int(len(cg.interior_flat)) + int(len(cg.ref_halo_flat))
-        M = max((g.M for g in cg.geoms if g is not None), default=1)
-        m = min(M, _M_TILE)                                   # embed tiles over M
-        # _line_messages peaks at ~ep + en + msg + one Dir/BiDir (hidden width 2d)
-        # all (B, L, m, K, d)-sized and live at once. ~8x the base buffer covers
-        # those plus the concat/where temporaries; the field E persists alongside.
-        # ponytail: this is a static estimate — the encode/decode progress line
-        # prints the *measured* GPU peak, so lower --chunk-batch if that nears VRAM.
-        per = ((n_field * ndim * self.d)                      # persistent field
-               + 8 * len(half_directions(ndim, self.agg_level))
-               * m * ndim * self.d) * 4
-        if self.device.type == "cuda":
-            budget = _cuda_working_budget(torch, self.device)
-        else:
-            budget = 8 << 30                                   # cpu: modest cap
-        return max(1, budget // max(per, 1))
 
     def start_wave(self, chunk_ids, recon):
         """Begin a batch of mutually-independent, identical-geometry chunks. One
@@ -1436,15 +1588,29 @@ class ChunkedGNNPredictor:
         torch = self._torch
         ndim = len(self.shape)
         B = len(chunk_ids)
-        origins = np.array([[sl.start for sl in self.chunk_slices(ci)]
-                            for ci in chunk_ids], np.int64)     # (B, ndim)
-        cshape = tuple(sl.stop - sl.start
-                       for sl in self.chunk_slices(chunk_ids[0]))
-        cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
-                               self.anchor_block, torch, self.device,
-                               self.agg_level)
-        frame = _CompactFrame(cg, origins[0], self.shape, self.edges, self.grid,
-                              self.coded, torch, self.device)
+        origins = np.array(
+            [[sl.start for sl in self.chunk_slices(ci)] for ci in chunk_ids], np.int64
+        )  # (B, ndim)
+        cshape = tuple(sl.stop - sl.start for sl in self.chunk_slices(chunk_ids[0]))
+        cg = build_chunk_geoms(
+            cshape,
+            self.levels,
+            self.anchor_stride,
+            self.anchor_block,
+            torch,
+            self.device,
+            self.agg_level,
+        )
+        frame = _CompactFrame(
+            cg,
+            origins[0],
+            self.shape,
+            self.edges,
+            self.grid,
+            self.coded,
+            torch,
+            self.device,
+        )
         E = torch.zeros(B, frame.n_compact, ndim, self.d, device=self.device)
         self._wave_fill_halo(E, frame, origins, recon)
         # per-chunk global flat indices per stage, for finalize reads from recon.
@@ -1452,11 +1618,15 @@ class ChunkedGNNPredictor:
         # dot per stage replaces the (B, M, ndim) ravel_multi_index. Kept as device
         # long tensors so the per-stage recon gather stays on the GPU.
         strides = np.cumprod((1,) + self.shape[:0:-1])[::-1].astype(np.int64)
-        obase = origins @ strides                              # (B,)
+        obase = origins @ strides  # (B,)
         self._wave_gidx = [
-            None if c is None else
-            torch.from_numpy((c @ strides)[None, :] + obase[:, None]).to(self.device)
-            for c in cg.coords]                                # (B, M) long
+            None
+            if c is None
+            else torch.from_numpy((c @ strides)[None, :] + obase[:, None]).to(
+                self.device
+            )
+            for c in cg.coords
+        ]  # (B, M) long
         self._cg = cg
         self._wave_ids = list(chunk_ids)
         self._E = E
@@ -1472,20 +1642,20 @@ class ChunkedGNNPredictor:
         # band chunk-frame coords are shared across the wave (rep uses origins[0]);
         # per chunk only the global positions / owning chunks shift.
         rep_gc = np.stack(np.unravel_index(frame.h_gflat, self.shape), 1)
-        band = rep_gc - origins[0]                             # (H, ndim)
+        band = rep_gc - origins[0]  # (H, ndim)
         h_lv = torch.from_numpy(frame.h_lv.astype(np.int64)).to(self.device)
-        flat = recon.reshape(-1)                               # C == 1, device
+        flat = recon.reshape(-1)  # C == 1, device
         vals_all, cvec_all = [], []
         for o in origins:
             gc = band + o
-            gflat = np.ravel_multi_index([gc[:, k] for k in range(ndim)],
-                                         self.shape)
+            gflat = np.ravel_multi_index([gc[:, k] for k in range(ndim)], self.shape)
             ids = np.ravel_multi_index(
-                [gc[:, k] // self.edges[k] for k in range(ndim)], self.grid)
+                [gc[:, k] // self.edges[k] for k in range(ndim)], self.grid
+            )
             gflat_t = torch.from_numpy(gflat).to(self.device)
-            vals_all.append(self._norm_t(flat[gflat_t])[None, :])     # (1, H)
+            vals_all.append(self._norm_t(flat[gflat_t])[None, :])  # (1, H)
             ids_t = torch.from_numpy(ids).to(self.device)
-            cvec_all.append(self.coarse[0, ids_t, h_lv])              # (H, K, d)
+            cvec_all.append(self.coarse[0, ids_t, h_lv])  # (H, K, d)
         with torch.no_grad(), self._amp():
             E[:, frame.halo_rows] = halo_embed(
                 self.model, torch.stack(cvec_all, 0), torch.cat(vals_all, 0)
@@ -1507,15 +1677,26 @@ class ChunkedGNNPredictor:
             raise ValueError(f"stage {s} out of order for this wave")
         prev = cg.chain[j - 1]
         gp, gh = self._geoms[prev], self._geoms[s]
-        fvals = None if gp is None else \
-            self._norm_t(recon.reshape(-1)[self._wave_gidx[prev]])   # (B, M)
+        fvals = (
+            None
+            if gp is None
+            else self._norm_t(recon.reshape(-1)[self._wave_gidx[prev]])
+        )  # (B, M)
         with torch.no_grad(), self._amp():
             (values, log_b), self._E, self._ctx = stage_forward(
-                self.model, self._E, gp, gh, fvals, torch,
-                finalize_ctx=self._ctx, eb=float(eb) / self.span)
+                self.model,
+                self._E,
+                gp,
+                gh,
+                fvals,
+                torch,
+                finalize_ctx=self._ctx,
+                eb=float(eb) / self.span,
+            )
         self._pos = j
         pred = (values.float() * self.span + self.vmin).clamp(
-            self.vmin, self.vmax)                                  # (B, M) f32
+            self.vmin, self.vmax
+        )  # (B, M) f32
         scale = torch.exp2(log_b.float()) * self.span
         return pred, scale
 
@@ -1530,11 +1711,12 @@ class ChunkedGNNPredictor:
         with torch.no_grad(), self._amp():
             if g is not None:
                 fvals = self._norm_t(recon.reshape(-1)[self._wave_gidx[last]])
-                ctx = self._ctx if self._ctx is not None else \
-                    self.model.embed(E, g)
+                ctx = self._ctx if self._ctx is not None else self.model.embed(E, g)
                 fin = self.model.finalize(ctx, fvals).to(E.dtype)  # fp16->E dtype
-                E.index_copy_(1, g.query_idx, fin)              # ponytail: in-place, see _stage_forward_geoms
-            cc = chunk_coarse(self.model, E, cg, torch)   # (B, levels+1, K, d)
+                E.index_copy_(
+                    1, g.query_idx, fin
+                )  # ponytail: in-place, see _stage_forward_geoms
+            cc = chunk_coarse(self.model, E, cg, torch)  # (B, levels+1, K, d)
         ids = np.array(self._wave_ids)
         self.coarse[0, ids] = cc.to(self.coarse.dtype)
         self.coded[ids] = True
@@ -1545,21 +1727,34 @@ class ChunkedGNNPredictor:
         sls = self.chunk_slices(ci)
         origin = np.array([sl.start for sl in sls], np.int64)
         cshape = tuple(sl.stop - sl.start for sl in sls)
-        cg = build_chunk_geoms(cshape, self.levels, self.anchor_stride,
-                               self.anchor_block, torch, self.device,
-                               self.agg_level)
+        cg = build_chunk_geoms(
+            cshape,
+            self.levels,
+            self.anchor_stride,
+            self.anchor_block,
+            torch,
+            self.device,
+            self.agg_level,
+        )
 
         # compact field: 1 dummy + interior + usable-referenced halo band only —
         # the dead rest of the padded shell is never allocated.
-        frame = _CompactFrame(cg, origin, self.shape, self.edges, self.grid,
-                              self.coded, torch, self.device)
-        E = torch.zeros(self.C, frame.n_compact, cg.ndim, self.d,
-                        device=self.device)
-        if len(frame.h_gflat):     # fill the halo rows from coarse + recon value
+        frame = _CompactFrame(
+            cg,
+            origin,
+            self.shape,
+            self.edges,
+            self.grid,
+            self.coded,
+            torch,
+            self.device,
+        )
+        E = torch.zeros(self.C, frame.n_compact, cg.ndim, self.d, device=self.device)
+        if len(frame.h_gflat):  # fill the halo rows from coarse + recon value
             vals = self._norm(recon.reshape(self.C, -1)[:, frame.h_gflat])
             ids = torch.from_numpy(frame.h_ids).to(self.device)
             lvs = torch.from_numpy(frame.h_lv.astype(np.int64)).to(self.device)
-            cvec = self.coarse[:, ids, lvs]                # (C, Hs, K, d)
+            cvec = self.coarse[:, ids, lvs]  # (C, Hs, K, d)
             with torch.no_grad():
                 E[:, frame.halo_rows] = halo_embed(self.model, cvec, vals)
 
@@ -1568,11 +1763,16 @@ class ChunkedGNNPredictor:
         self._E = E
         self._geoms = frame.geoms
         # global flat index per stage (finalize values are read from recon)
-        self._gidx = [None if c is None else np.ravel_multi_index(
-            [(c[:, k] + origin[k]) for k in range(len(self.shape))], self.shape)
-            for c in cg.coords]
+        self._gidx = [
+            None
+            if c is None
+            else np.ravel_multi_index(
+                [(c[:, k] + origin[k]) for k in range(len(self.shape))], self.shape
+            )
+            for c in cg.coords
+        ]
         self._ctx = None
-        self._pos = 0                                      # index into cg.chain
+        self._pos = 0  # index into cg.chain
 
     def predict_stage(self, s: int, recon: np.ndarray, eb: float):
         """Predict local stage ``s`` (must be the next non-empty stage in the
@@ -1585,18 +1785,30 @@ class ChunkedGNNPredictor:
             raise ValueError(f"stage {s} out of order for this chunk")
         prev = cg.chain[j - 1]
         gp, gh = self._geoms[prev], self._geoms[s]
-        fvals = None if gp is None else \
-            self._norm(recon.reshape(self.C, -1)[:, self._gidx[prev]])
+        fvals = (
+            None
+            if gp is None
+            else self._norm(recon.reshape(self.C, -1)[:, self._gidx[prev]])
+        )
         with torch.no_grad(), self._amp():
             (values, log_b), self._E, self._ctx = stage_forward(
-                self.model, self._E, gp, gh, fvals, torch,
-                finalize_ctx=self._ctx, eb=float(eb) / self.span)
+                self.model,
+                self._E,
+                gp,
+                gh,
+                fvals,
+                torch,
+                finalize_ctx=self._ctx,
+                eb=float(eb) / self.span,
+            )
         self._pos = j
         vals_np, logb_np = torch.stack((values, log_b)).cpu().numpy()  # one D2H
         pred = vals_np.reshape(self.C, -1) * self.span + self.vmin
         scale = np.exp2(logb_np.reshape(self.C, -1)) * self.span
-        return (np.clip(pred, self.vmin, self.vmax).astype(np.float32),
-                scale.astype(np.float32))
+        return (
+            np.clip(pred, self.vmin, self.vmax).astype(np.float32),
+            scale.astype(np.float32),
+        )
 
     def finish_chunk(self, ci: int, recon: np.ndarray):
         """Finalize the last stage's points into the field, store the chunk's
@@ -1606,19 +1818,19 @@ class ChunkedGNNPredictor:
         if ci != self._ci:
             raise ValueError("finish_chunk out of order")
         if self._pos != len(cg.chain) - 1:
-            raise ValueError("finish_chunk before all non-empty stages were "
-                             "predicted")
+            raise ValueError("finish_chunk before all non-empty stages were predicted")
         last = cg.chain[self._pos]
         g = self._geoms[last]
         E = self._E
         with torch.no_grad():
             if g is not None:
-                fvals = self._norm(recon.reshape(self.C, -1)[:,
-                                                             self._gidx[last]])
-                ctx = self._ctx if self._ctx is not None else \
-                    self.model.embed(E, g)
-                E.index_copy_(1, g.query_idx,                   # ponytail: in-place, see _stage_forward_geoms
-                              self.model.finalize(ctx, fvals))
+                fvals = self._norm(recon.reshape(self.C, -1)[:, self._gidx[last]])
+                ctx = self._ctx if self._ctx is not None else self.model.embed(E, g)
+                E.index_copy_(
+                    1,
+                    g.query_idx,  # ponytail: in-place, see _stage_forward_geoms
+                    self.model.finalize(ctx, fvals),
+                )
             self.coarse[:, ci] = chunk_coarse(self.model, E, cg, torch)
         self.coded[ci] = True
         self._E = self._ctx = self._cg = None

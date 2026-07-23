@@ -19,7 +19,9 @@ def _interp_axis_full(V, axis, s, order):
         return np.take(V, np.clip(j, 0, n - 1), axis=axis), (j >= 0) & (j < n)
 
     def bc(m):
-        sh = [1] * V.ndim; sh[axis] = m.shape[0]; return m.reshape(sh)
+        sh = [1] * V.ndim
+        sh[axis] = m.shape[0]
+        return m.reshape(sh)
 
     Lm1, vm1 = gather(-s)
     Lp1, vp1 = gather(+s)
@@ -39,7 +41,7 @@ def test_compact_gather_matches_full_grid(order, center):
     whole-grid interpolation and slicing the stage's points out — for every
     sub-stage of a non-multiple-of-stride, multi-channel region."""
     shape, levels, stride, block = (70, 90), 3, 8, 1
-    recon = (np.random.RandomState(0).rand(2, *shape).astype(np.float32) * 50)
+    recon = np.random.RandomState(0).rand(2, *shape).astype(np.float32) * 50
     pred = InterpPredictor(order, levels, stride, block, center=center)
     known = np.zeros(shape, bool)
     for mask, s, axes in stage_plan(shape, levels, stride, block):
@@ -47,7 +49,9 @@ def test_compact_gather_matches_full_grid(order, center):
             got = pred.predict(recon, known, mask)
             W = recon.astype(np.float64)
             if center == 0 or len(axes) == 1:
-                ref = sum(_interp_axis_full(W, a + 1, s, order) for a in axes) / len(axes)
+                ref = sum(_interp_axis_full(W, a + 1, s, order) for a in axes) / len(
+                    axes
+                )
             else:
                 a = axes[0] if center == 1 else axes[-1]
                 ref = _interp_axis_full(W, a + 1, s, order)
@@ -64,8 +68,9 @@ def test_roundtrip_bound(order, shape, eb):
         img = img[..., 0]
     # predictor schedule must match compress()'s levels/anchor_stride/block
     predictor = InterpPredictor(order, levels=4, anchor_stride=8, anchor_block=4)
-    stream, stats = compress(img, eb, predictor, levels=4, anchor_stride=8,
-                             anchor_block=4)
+    stream, stats = compress(
+        img, eb, predictor, levels=4, anchor_stride=8, anchor_block=4
+    )
     rec = decompress(stream)  # no factory: torch-free, decodes from flags alone
     assert rec.shape == img.shape and rec.dtype == img.dtype
     assert np.abs(img.astype(np.int64) - rec.astype(np.int64)).max() <= eb
@@ -80,10 +85,12 @@ def test_per_level_eb_and_center(eb_ratio, center):
     header (encoder recon == decoder output)."""
     img = smooth_image(80, 96, 1)[..., 0]
     eb = 3.0
-    pred = InterpPredictor("cubic", levels=4, anchor_stride=8,
-                           anchor_block=4, center=center)
-    stream, stats = compress(img, eb, pred, levels=4, anchor_stride=8,
-                             anchor_block=4, eb_ratio=eb_ratio)
+    pred = InterpPredictor(
+        "cubic", levels=4, anchor_stride=8, anchor_block=4, center=center
+    )
+    stream, stats = compress(
+        img, eb, pred, levels=4, anchor_stride=8, anchor_block=4, eb_ratio=eb_ratio
+    )
     rec = decompress(stream)
     assert np.abs(img.astype(np.int64) - rec.astype(np.int64)).max() <= eb
     assert np.array_equal(stats["recon"], rec)
@@ -95,10 +102,12 @@ def test_autotune_improves_distortion_with_bounded_size_slack():
     img = smooth_image(96, 96, 1)[..., 0]
     eb = 3.0
     kw = dict(levels=4, anchor_stride=8, anchor_block=4)
-    tuned, tuned_stats = compress(img, eb, InterpPredictor("cubic", **kw),
-                                  tune="rd", **kw)
-    flat, flat_stats = compress(img, eb, InterpPredictor("cubic", **kw),
-                                eb_ratio=1.0, **kw)
+    tuned, tuned_stats = compress(
+        img, eb, InterpPredictor("cubic", **kw), tune="rd", **kw
+    )
+    flat, flat_stats = compress(
+        img, eb, InterpPredictor("cubic", **kw), eb_ratio=1.0, **kw
+    )
     assert len(tuned) <= 1.05 * len(flat)
     assert tuned_stats["recon_sse"] <= flat_stats["recon_sse"]
 
@@ -108,8 +117,7 @@ def test_fast_tune_is_single_candidate():
     eb_ratio/center sweep. The 2-D interp default is center=0, eb_ratio=0.9."""
     img = smooth_image(96, 96, 1)[..., 0]
     kw = dict(levels=4, anchor_stride=8, anchor_block=4)
-    _, stats = compress(img, 3.0, InterpPredictor("cubic", **kw),
-                        tune="fast", **kw)
+    _, stats = compress(img, 3.0, InterpPredictor("cubic", **kw), tune="fast", **kw)
     assert stats["tune_candidates"] == 1
     assert stats["eb_ratio"] == InterpPredictor.fast_eb_ratio  # 0.9
     assert stats["interp_center"] == 0  # 2-D -> averaging centre

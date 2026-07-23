@@ -41,8 +41,10 @@ def code_lengths(freqs: np.ndarray) -> np.ndarray:
     for s, d in heap[0][2]:
         lengths[s] = d
     if lengths.max() > MAX_CODE_LEN:
-        raise ValueError(f"Huffman code length {lengths.max()} exceeds {MAX_CODE_LEN}; "
-                         "input distribution too skewed for this coder")
+        raise ValueError(
+            f"Huffman code length {lengths.max()} exceeds {MAX_CODE_LEN}; "
+            "input distribution too skewed for this coder"
+        )
     return lengths
 
 
@@ -136,9 +138,13 @@ def huffman_decode(blob: bytes) -> np.ndarray:
     return out
 
 
-def _pack_blob(n_symbols: int, lengths: np.ndarray, n_bits: int, packed: bytes) -> bytes:
+def _pack_blob(
+    n_symbols: int, lengths: np.ndarray, n_bits: int, packed: bytes
+) -> bytes:
     head = struct.pack("<QI", n_symbols, len(lengths))
-    return head + lengths.astype(np.uint8).tobytes() + struct.pack("<Q", n_bits) + packed
+    return (
+        head + lengths.astype(np.uint8).tobytes() + struct.pack("<Q", n_bits) + packed
+    )
 
 
 def _unpack_blob(blob: bytes):

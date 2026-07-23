@@ -4,8 +4,7 @@ from scripts.eval_predictors import default_error_bounds, load_image
 
 
 def test_eval_defaults_are_in_normalized_image_units():
-    assert np.allclose(default_error_bounds(),
-                       [1.0 / 255.0, 2.0 / 255.0, 4.0 / 255.0])
+    assert np.allclose(default_error_bounds(), [1.0 / 255.0, 2.0 / 255.0, 4.0 / 255.0])
 
 
 def test_eval_loader_returns_normalized_float32(tmp_path):

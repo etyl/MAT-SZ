@@ -35,12 +35,13 @@ def _interp_axis_at(W, coords, axis, s, order, shape):
     Operates only on the M query points (``W`` is (C, *S) float64), so it never
     materializes a whole-grid temporary — but is bit-identical to evaluating the
     old full-grid form and slicing these positions out."""
+
     def gather(off):  # neighbour value at coord[axis]+off (edge-clamped) + validity
         ca = coords[axis] + off
         valid = (ca >= 0) & (ca < shape[axis])
         idx = list(coords)
         idx[axis] = np.clip(ca, 0, shape[axis] - 1)
-        return W[(slice(None), *idx)], valid          # (C, M), (M,)
+        return W[(slice(None), *idx)], valid  # (C, M), (M,)
 
     Lm1, vm1 = gather(-s)
     Lp1, vp1 = gather(+s)
@@ -52,7 +53,7 @@ def _interp_axis_at(W, coords, axis, s, order, shape):
         pred = np.where((vm3 & vp3)[None], cub, pred)
     both = (vm1 & vp1)[None]
     only_left = (vm1 & ~vp1)[None]
-    return np.where(both, pred, np.where(only_left, Lm1, Lp1))     # (C, M)
+    return np.where(both, pred, np.where(only_left, Lm1, Lp1))  # (C, M)
 
 
 class InterpPredictor:
@@ -76,12 +77,17 @@ class InterpPredictor:
     whole field as a single region without padding or prediction seams.
     """
 
-    tunable = True    # encoder sweeps (eb_ratio, center) and keeps the smallest
+    tunable = True  # encoder sweeps (eb_ratio, center) and keeps the smallest
     fast_eb_ratio = 0.9  # single-encode (tune=fast) default; see codec.encode
 
-    def __init__(self, order: str = "cubic", levels: int = 4,
-                 anchor_stride: int = 16, anchor_block: int = 4,
-                 center: int | None = None):
+    def __init__(
+        self,
+        order: str = "cubic",
+        levels: int = 4,
+        anchor_stride: int = 16,
+        anchor_block: int = 4,
+        center: int | None = None,
+    ):
         if order not in ("linear", "cubic"):
             raise ValueError("order must be 'linear' or 'cubic'")
         self.order = order
@@ -112,8 +118,9 @@ class InterpPredictor:
         masks: list = []
         schedule: dict[int, tuple[int, tuple[int, ...]]] = {}
         covered = 0
-        for mask, s, axes in stage_plan(key, self.levels, self.anchor_stride,
-                                        self.anchor_block):
+        for mask, s, axes in stage_plan(
+            key, self.levels, self.anchor_stride, self.anchor_block
+        ):
             n = int(mask.sum())
             if axes and n:  # non-anchor sub-stage; predict() is keyed by prior |known|
                 schedule[covered] = (s, axes)
@@ -125,8 +132,9 @@ class InterpPredictor:
     def stage_masks(self, shape, levels, anchor_stride, anchor_block) -> list:
         return self._build(shape)[0]
 
-    def predict(self, recon: np.ndarray, known: np.ndarray,
-               pos: np.ndarray | None = None) -> np.ndarray:
+    def predict(
+        self, recon: np.ndarray, known: np.ndarray, pos: np.ndarray | None = None
+    ) -> np.ndarray:
         entry = self._build(recon.shape[1:])[1].get(int(known.sum()))
         if entry is None:
             raise ValueError("known mask does not match the interp schedule")
@@ -134,20 +142,27 @@ class InterpPredictor:
         shape = recon.shape[1:]
         W = recon.astype(np.float64)
         # Query points of this sub-stage, in the codec's recon[:, pos] order.
-        coords = np.nonzero(pos) if pos is not None else np.indices(shape).reshape(
-            len(shape), -1)
+        coords = (
+            np.nonzero(pos)
+            if pos is not None
+            else np.indices(shape).reshape(len(shape), -1)
+        )
         # Interpolate each odd axis from its ±stride neighbours (already
         # reconstructed in an earlier, lower-weight sub-stage of the same level):
         # an edge-midpoint (one odd axis) reads 2 priors, a 2-D centre (two odd
         # axes) reads 4. ``center`` picks how a multi-odd-axis point combines
         # them: averaged (0) or single-direction (1/2).
-        center = (self.center if self.center is not None
-                  else default_interp_center(len(shape)))
+        center = (
+            self.center
+            if self.center is not None
+            else default_interp_center(len(shape))
+        )
         if center == 0 or len(axes) == 1:
-            out = sum(_interp_axis_at(W, coords, a, s, self.order, shape)
-                      for a in axes) / len(axes)
+            out = sum(
+                _interp_axis_at(W, coords, a, s, self.order, shape) for a in axes
+            ) / len(axes)
         else:
             a = axes[0] if center == 1 else axes[-1]
             out = _interp_axis_at(W, coords, a, s, self.order, shape)
-        out = out.astype(np.float32)                              # (C, M)
+        out = out.astype(np.float32)  # (C, M)
         return out if pos is not None else out.reshape(recon.shape)
