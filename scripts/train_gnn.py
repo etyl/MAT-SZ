@@ -445,6 +445,47 @@ def training_autocast(fp16, device):
     return contextlib.nullcontext()
 
 
+class ModelEMA:
+    """Exponential moving average of the training weights, evaluated and saved
+    instead of the live weights.
+
+    The synthetic eval is deterministic (fixed-seed field, fixed eb, fp32), so
+    its step-to-step swings are entirely the live weights orbiting the noisy
+    optimum. Averaging the iterate (Polyak/EMA) sits nearer the centre of that
+    orbit -> a smoother, usually-lower eval curve, at no cost to the live
+    optimisation, which proceeds on the raw weights.
+
+    The shadow is kept in float32 for a numerically stable average and cast back
+    to each destination dtype on ``copy_to``. Non-floating buffers (e.g. integer
+    schedule state) are copied through, never averaged. ``decay`` is warmed up as
+    ``min(decay, (1 + step) / (10 + step))`` so the average tracks quickly while
+    the model is still moving fast and only smooths once it settles -- the fix
+    for the usual "EMA lags early training" failure mode.
+    """
+
+    def __init__(self, model, decay):
+        self.decay = decay
+        sd = model.state_dict()
+        self.shadow = {k: v.detach().clone().float() for k, v in sd.items()}
+        self._is_float = {k: v.is_floating_point() for k, v in sd.items()}
+
+    @torch.no_grad()
+    def update(self, model, step):
+        d = min(self.decay, (1.0 + step) / (10.0 + step))
+        for k, v in model.state_dict().items():
+            if self._is_float[k]:
+                self.shadow[k].mul_(d).add_(v.detach().float(), alpha=1.0 - d)
+            else:
+                self.shadow[k].copy_(v)
+
+    @torch.no_grad()
+    def copy_to(self, model):
+        dst = model.state_dict()
+        model.load_state_dict(
+            {k: self.shadow[k].to(dst[k].dtype) for k in self.shadow}
+        )
+
+
 def discretized_laplace_nll(mu, log_b, target, eb):
     """Mean code length in bits for target under a discretized Laplace cell."""
     eb = torch.as_tensor(eb, device=target.device, dtype=target.dtype).reshape(-1, 1)
@@ -905,6 +946,20 @@ def main():
         help="anchor stride for synthetic fields (power of two)",
     )
     ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument(
+        "--warmup",
+        type=int,
+        default=1000,
+        help="linearly ramp the LR from 0 to --lr over this many steps before "
+        "the flat/decay schedule (0 disables warmup)",
+    )
+    ap.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.999,
+        help="decay for the EMA of the weights used for eval and checkpoints; "
+        "0 disables EMA and evals/saves the live weights",
+    )
     ap.add_argument("--d", type=int, default=32)
     ap.add_argument(
         "--noise",
@@ -1064,6 +1119,10 @@ def main():
         raise SystemExit("--eval-shape entries must all be >= 2")
     if args.synthetic_batch < 1:
         raise SystemExit("--synthetic-batch must be >= 1")
+    if args.warmup < 0:
+        raise SystemExit("--warmup must be >= 0")
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise SystemExit("--ema-decay must be in [0, 1)")
     if args.synthetic_stride < 2 or args.synthetic_stride & (args.synthetic_stride - 1):
         raise SystemExit("--synthetic-stride must be a power of two >= 2")
     if args.agg_level < 1:
@@ -1159,11 +1218,36 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     decay_start = int(args.steps * 0.6)
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: min(1.0, (args.steps - s) / max(args.steps - decay_start, 1))
-    )
+    warmup = max(0, args.warmup)
+
+    def lr_factor(s):
+        # Linear warmup 0 -> 1 over `warmup` steps (Adam moments are cold at
+        # step 0 and the schedule is otherwise flat at full LR until 60%), then
+        # flat, then linear decay to 0 over the last 40%.
+        warm = min(1.0, (s + 1) / warmup) if warmup else 1.0
+        decay = min(1.0, (args.steps - s) / max(args.steps - decay_start, 1))
+        return warm * decay
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model: {n_params} params, d={args.d}")
+
+    # Eval and checkpoints run on an EMA of the weights, not the live ones, so
+    # the deterministic eval reflects the settled model rather than the latest
+    # noisy step. A dedicated (uncompiled) eval model receives the EMA weights
+    # before each eval; the live `model` keeps training untouched. With
+    # --ema-decay 0 both fall back to the live weights.
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay else None
+    if ema is not None:
+        eval_model = build_model(args.d, args.agg_level).to(device)
+        eval_model.eval()
+    else:
+        eval_model = model
+
+    def sync_eval_model():
+        if ema is not None:
+            ema.copy_to(eval_model)
+        return eval_model
 
     # Fixed held-out eval: one fixed-seed 2-D synthetic field, fixed masks. Both
     # the model and the interp baseline run a real closed-loop inference with
@@ -1335,6 +1419,8 @@ def main():
         scaler.step(opt)
         scaler.update()
         sched.step()
+        if ema is not None:
+            ema.update(model, step)
         combined_loss = sum(
             weight * metric_tensors[key]
             for weight, key in (
@@ -1370,10 +1456,11 @@ def main():
         wandb.log(train_log, step=step)
 
         if step % args.eval_every == 0:
-            model.eval()
+            m = sync_eval_model()
+            m.eval()
             with torch.no_grad(), training_autocast(args.fp16, device):
                 bits, en, recon, pred_only, aux = run_stages(
-                    model,
+                    m,
                     eval_x,
                     eval_geoms,
                     args.d,
@@ -1382,7 +1469,8 @@ def main():
                     collect=True,
                     collect_bins=True,
                 )
-            model.train()
+            if m is model:
+                model.train()
             # eval runs the whole image (>>train crop); free its reserved pool
             # so the next train step doesn't OOM on the fragmented remainder.
             if device.type == "cuda":
@@ -1408,10 +1496,11 @@ def main():
             wandb.log(log, step=step)
 
         if eval_tensor is not None and step % args.eval_tensor_every == 0:
-            model.eval()
+            m = sync_eval_model()
+            m.eval()
             with torch.no_grad():
                 tmetrics = eval_tensor_codec(
-                    model,
+                    m,
                     args.d,
                     args,
                     eval_tensor,
@@ -1419,7 +1508,8 @@ def main():
                     device,
                     eval_tensor_ckpt,
                 )
-            model.train()
+            if m is model:
+                model.train()
             wandb.log(tmetrics, step=step)
             last_tensor_metrics = tmetrics
 
@@ -1427,7 +1517,7 @@ def main():
             checkpoint = run_dir / f"{out.stem}-step-{step:06d}{out.suffix}"
             torch.save(
                 {
-                    "state_dict": model.state_dict(),
+                    "state_dict": sync_eval_model().state_dict(),
                     "d": args.d,
                     "agg_level": args.agg_level,
                     "version": CKPT_VERSION,
@@ -1462,7 +1552,7 @@ def main():
 
     torch.save(
         {
-            "state_dict": model.state_dict(),
+            "state_dict": sync_eval_model().state_dict(),
             "d": args.d,
             "agg_level": args.agg_level,
             "version": CKPT_VERSION,

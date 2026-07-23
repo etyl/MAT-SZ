@@ -13,6 +13,7 @@ from scripts.train_gnn import (
     normalize_tensor,
     training_autocast,
     run_chunked_scene,
+    ModelEMA,
     _warp,
     _turbulent_advect,
 )
@@ -250,6 +251,68 @@ def test_advection_raises_local_anisotropy():
     ).reshape(8, *shape)
 
     assert anisotropy(advected) > anisotropy(spectral)
+
+
+def test_ema_smooths_jittery_weights():
+    """The EMA of a weight that jitters around a fixed mean has a much smaller
+    step-to-step spread than the live weight — the point of evaluating the EMA
+    on the deterministic held-out field instead of the latest noisy step."""
+    model = build_model(16, 2)
+    ema = ModelEMA(model, 0.99)
+    center = {
+        k: v.clone() for k, v in model.state_dict().items() if v.is_floating_point()
+    }
+    key = next(iter(center))
+
+    torch.manual_seed(0)
+    live_hist, ema_hist = [], []
+    for step in range(60):
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                if v.is_floating_point():
+                    v.copy_(center[k] + 0.1 * torch.randn_like(v))
+        ema.update(model, step)
+        live_hist.append(model.state_dict()[key].clone())
+        ema_hist.append(ema.shadow[key].clone())
+
+    live_spread = torch.stack(live_hist[20:]).std(0).mean()
+    ema_spread = torch.stack(ema_hist[20:]).std(0).mean()
+    assert ema_spread < 0.5 * live_spread
+
+
+def test_ema_decay_warms_up_so_early_average_tracks():
+    """Effective decay ramps min(decay, (1+step)/(10+step)), so the first update
+    is dominated by the live weights (fast tracking) rather than the cold init."""
+    model = build_model(16, 2)
+    ema = ModelEMA(model, 0.999)
+    key = next(k for k, v in model.state_dict().items() if v.is_floating_point())
+    init = ema.shadow[key].clone()
+
+    with torch.no_grad():
+        for v in model.state_dict().values():
+            if v.is_floating_point():
+                v.add_(1.0)
+    ema.update(model, step=0)  # effective decay = min(0.999, 1/10) = 0.1
+
+    # Shadow moves 90% of the way to the new weights on step 0, not 0.1%.
+    moved = (ema.shadow[key] - init).mean()
+    assert abs(float(moved) - 0.9) < 1e-5
+
+
+def test_ema_copy_to_loads_into_fresh_model():
+    model = build_model(16, 2)
+    ema = ModelEMA(model, 0.999)
+    with torch.no_grad():
+        for v in model.state_dict().values():
+            if v.is_floating_point():
+                v.mul_(2.0)
+    ema.update(model, step=100)
+
+    target = build_model(16, 2)
+    ema.copy_to(target)
+    for k, v in target.state_dict().items():
+        assert v.dtype == model.state_dict()[k].dtype
+        assert torch.allclose(v.float(), ema.shadow[k].float(), atol=1e-6)
 
 
 def test_mixed_batch_fraction_counts_scalar_points():
