@@ -824,7 +824,6 @@ class GNNCompressorCodec:
         *,
         levels: int = 5,
         radius: int = 1 << 15,
-        agg_level: int | None = 2,
         device: str | None = None,  # None -> cuda if available, else cpu
         zstd_level: int = 9,
         eb_ratio: float | None = None,  # None = auto: fast -> 0.8, size -> sweep
@@ -851,11 +850,6 @@ class GNNCompressorCodec:
         # unique coarse grid that reaches unit stride after ``levels`` steps.
         self.anchor_stride = 1 << self.levels
         self.radius = int(radius)
-        # Neighbourhood aggregation level: cap on the L1 length of the GNN's
-        # neighbour lines (None = full neighbourhood). Smaller = fewer directions
-        # per point = faster inference, most impactful in high dimensions. Frozen
-        # into the stream so decode reproduces the encoder's prediction bitwise.
-        self.agg_level = None if agg_level is None else int(agg_level)
         if device is None:
             import torch
 
@@ -959,7 +953,6 @@ class GNNCompressorCodec:
                 "error_bound": eb,
                 "levels": self.levels,
                 "radius": self.radius,
-                "agg_level": self.agg_level,
                 "vmin": vmin,
                 "vmax": vmax,
                 "eb_ratio": ratio,

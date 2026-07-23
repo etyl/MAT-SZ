@@ -46,11 +46,6 @@ def parse_args(argv=None):
     ap.add_argument("--anchor-block", type=int, default=1)
     ap.add_argument("--max-radius", type=int, default=64,
                     help="maximum GNN neighbour radius")
-    ap.add_argument("--agg-level", type=int, default=None,
-                    help="neighbourhood aggregation level (cap on L1 line length): "
-                         "1 = direct axis neighbours only, 2 = +2-axis diagonals, "
-                         "... omit = full neighbourhood. Lower = fewer lines per "
-                         "point = faster, most impactful in high dimensions")
     ap.add_argument("--radius", type=int, default=1 << 15,
                     help="quantizer radius")
     ap.add_argument("--threads", type=int, help="PyTorch CPU thread count")
@@ -97,7 +92,7 @@ def make_predictor(args, vmin: float, vmax: float) -> GNNPredictor:
         args.checkpoint, vmin, vmax,
         max_radius=args.max_radius, device=args.device,
         levels=args.levels, anchor_stride=args.anchor_stride,
-        anchor_block=args.anchor_block, agg_level=args.agg_level)
+        anchor_block=args.anchor_block)
 
 
 def synchronize(device: str) -> None:

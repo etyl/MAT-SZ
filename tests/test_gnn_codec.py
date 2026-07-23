@@ -16,6 +16,7 @@ def tiny_checkpoint(tmp_path):
     path = tmp_path / "gnn.pt"
     torch.save({
         "d": model.d,
+        "agg_level": 2,
         "state_dict": model.state_dict(),
         "version": CKPT_VERSION,
     }, path)

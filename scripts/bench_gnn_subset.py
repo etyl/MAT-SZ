@@ -237,7 +237,6 @@ def main(argv=None):
                     help="min-max scale the subset to [0,1] before compressing")
     # Codec knobs (defaults = the realistic 4-D level-5 case).
     ap.add_argument("--levels", type=int, default=5)
-    ap.add_argument("--agg-level", type=int, default=1)
     ap.add_argument("--chunk-size", type=int, default=32)
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--zstd-level", type=int, default=9)
@@ -279,7 +278,7 @@ def main(argv=None):
     from deepsz.gnn_codec import GNNCompressorCodec
     codec = GNNCompressorCodec(
         args.gnn_checkpoint, error_bound=eb, levels=args.levels,
-        agg_level=args.agg_level, radius=args.radius, zstd_level=args.zstd_level,
+        radius=args.radius, zstd_level=args.zstd_level,
         eb_ratio=args.eb_ratio, tune=args.tune, chunk_size=args.chunk_size,
         fp16=args.fp16, compile=args.compile,
         device=device)
@@ -336,8 +335,8 @@ def main(argv=None):
     print(f"{'input':<{w}} {args.input} {tuple(sub.shape)} "
           f"({sub.size} voxels, {orig_bytes} B)")
     print(f"{'eb':<{w}} {eb:g}   device {device}")
-    print(f"{'levels/stride/agg':<{w}} {args.levels}/{anchor_stride}/"
-          f"{args.agg_level}   chunk {args.chunk_size} "
+    print(f"{'levels/stride':<{w}} {args.levels}/{args.anchor_stride}"
+          f"   chunk {args.chunk_size} batch {args.chunk_batch} "
           f"tune {args.tune} fp16 {args.fp16} compile {args.compile}")
     print("-" * 60)
     print(f"{'PSNR':<{w}} {psnr:8.3f} dB")

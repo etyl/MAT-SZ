@@ -14,9 +14,10 @@ stage schedule, which progressively densifies `known`):
   * for every *line* through a point (the (3^n - 1)/2 axis and diagonal
     directions) find the nearest known sample on each side;
   * store one embedding per lattice axis at every point. Per axis k
-    independently, rotate each neighbour's axis-k embedding (RoPE) by a phase
-    proportional to cos(line direction, axis k) — signed per side — so the
-    axis-k channel reads its neighbours through their angle to axis k;
+    independently, concatenate a small learned direction-state vector to each
+    neighbour's axis-k embedding, indexed by the signed direction cosine
+    cos(line direction, axis k) — a handful of discrete values (DirState) — so
+    the axis-k channel reads its neighbours through their angle to axis k;
   * turn a two-sided pair into a trend/curvature message (BiDirEmbed) or a
     one-sided neighbour into an extrapolation message (DirEmbed);
   * pool the per-line messages into one context per axis with single-query
@@ -30,9 +31,10 @@ stage schedule, which progressively densifies `known`):
     is the truth plus noise, so MixEmbed learns to trust it only up to that
     error.
 
-Axes never mix during propagation; direction enters only as the rotary phase,
-so with the frequency bank zeroed every axis channel is identical — the axial
-structure is a pure inductive bias layered on the direction-blind model.
+Axes never mix during propagation; direction enters only as the concatenated
+direction-state embedding, so with that table zeroed every axis channel is
+identical — the axial structure is a pure inductive bias layered on the
+direction-blind model.
 """
 
 from __future__ import annotations
@@ -52,7 +54,7 @@ from .levels import point_levels, stage_masks
 # torch is imported lazily inside the class / model so that importing this
 # module (e.g. for FLAG constants) stays cheap.
 
-CKPT_VERSION = 5
+CKPT_VERSION = 6
 
 # Query-tile for the message pass: caps the transient (B, L, m, K, d) buffers so
 # GPU peak scales with _M_TILE, not the stage's full M (line_pool is per-query,
@@ -89,7 +91,8 @@ def half_directions(ndim: int, agg_level: int | None = None) -> list[tuple[int, 
     directions (direct neighbours); level 2 adds the 2-axis diagonals (2 hops in
     L1); ... level ``ndim`` (or ``None``) keeps all ``(3^ndim - 1)/2`` lines, the
     full neighbourhood. Since the network is direction-blind (direction enters
-    only as the rotary phase and the pool masks unused lines), dropping the
+    only as the direction-state embedding and the pool masks unused lines),
+    dropping the
     higher-L1 lines is a pure inference-time cost/accuracy trade-off that shrinks
     the per-stage message tensor's L dimension — the dominant factor in high-D."""
     dirs = []
@@ -415,18 +418,35 @@ def _mlp(torch, sizes):
     return nn.Sequential(*layers)
 
 
-def build_model(d: int = 32):
-    """Construct the axial, dimension-agnostic GNN."""
+def build_model(d: int = 32, agg_level: int = 2):
+    """Construct the axial, dimension-agnostic GNN.
+
+    ``agg_level`` is the neighbourhood aggregation level the model was trained
+    for (see ``half_directions``): it fixes the set of discrete signed direction
+    cosines the message pass can see — ``{+-1/sqrt(j) : j=1..agg_level} u {0}``,
+    i.e. ``2*agg_level + 1`` states — and therefore the size of DirState's
+    learned table. It is a property of the checkpoint, not an inference knob, so
+    it must match the value the checkpoint was trained with (the loader supplies
+    it from the checkpoint)."""
     import torch
     import torch.nn as nn
     F = nn.functional
 
-    assert d % 2 == 0, "d must be even for rotary axis embeddings"
+    assert d % 2 == 0, "d must be even for the paired axis embeddings"
+    L = int(agg_level)
+    if L < 1:
+        raise ValueError("agg_level must be >= 1")
+    n_states = 2 * L + 1                # signed cosines {+-1/sqrt(j)} u {0}
 
     # Hidden width of the message/fusion/readout MLPs. Decoupled from d so the
     # per-axis field (memory ~ ndim * d) stays cheap while these functions keep
     # capacity — the wide activations are transient, over one stage's points.
     h = 2 * d
+    # Direction-state embedding: a small learned vector per discrete signed
+    # direction cosine, concatenated to each neighbour's axis embedding before
+    # the message MLPs (see DirState). ``de`` is the resulting per-side width.
+    ds = max(1, d // 4)
+    de = d + ds
 
     class InitEmbed(nn.Module):
         def __init__(self):
@@ -436,61 +456,71 @@ def build_model(d: int = 32):
         def forward(self, v):  # v: (..., 1) normalized value
             return self.net(v)
 
-    class Rope(nn.Module):
-        """Rotate a neighbour's per-axis embedding by a phase proportional to
-        the signed cosine between the line and each lattice axis. RoPE, but the
-        "position" is the direction cosine in [-1, 1] rather than an unbounded
-        token index — so the frequencies are spread linearly over [~0, pi]
-        (a full turn across the cosine range) instead of the usual geometric
-        decay, which for a bounded position leaves almost every channel
-        unrotated. Low pairs stay near pass-through (content), high pairs are
-        strongly direction-sensitive."""
+    class DirState(nn.Module):
+        """Concatenate a small learned direction-state vector to each
+        neighbour's per-axis embedding, in place of a rotary phase.
+
+        The model is single-hop (long range comes from the codec's stage
+        schedule, not composed message-passing hops), and the lines are lattice
+        directions, so the signed direction cosine ``sign * cos(line, axis k)``
+        is not a continuous position — it takes one of a small, fixed set of
+        values. A line of L1 length ``j`` (``j`` non-zero components) has
+        ``|cos| = 1/sqrt(j)`` on its non-zero axes and 0 elsewhere, so over an
+        aggregation level ``L`` the whole set is ``{+-1/sqrt(j) : j=1..L} u {0}``
+        — ``2L + 1`` states. A learned table indexed by that state is both
+        cheaper than the rotation (no per-channel sin/cos on the finest level,
+        the bulk of the forward) and strictly more expressive than a fixed
+        phase. The axis-k channel still reads its neighbours through their angle
+        to axis k — now as a concatenated feature the message MLP may use freely
+        — and perpendicular axes (the center state) get a distinct learned
+        vector rather than the identity rotation.
+
+        The ``2L + 1`` states are ordered by signed cosine ascending:
+        ``-1, -1/sqrt2, .., -1/sqrt(L), 0, +1/sqrt(L), .., +1/sqrt2, +1`` at
+        indices ``0..2L`` (center = L). ``nnz = round(1/v**2)`` recovers a
+        pair's L1 length from its cosine, giving index ``2L-nnz+1`` (v>0),
+        ``nnz-1`` (v<0), ``L`` (v==0). ``L`` is fixed by the checkpoint's
+        aggregation level, and geometry is built at the same level, so every
+        pair's ``nnz`` lands in ``[1, L]`` (the clamp is only a guard). Zeroing
+        the table makes every axis channel identical again — the axial structure
+        stays a pure, removable inductive bias (as the freq bank was)."""
 
         def __init__(self):
             super().__init__()
-            freq = torch.linspace(math.pi / (d // 2), math.pi, d // 2)
-            self.register_buffer("freq", freq)
+            self.table = nn.Parameter(torch.randn(n_states, ds) * ds ** -0.5)
 
-        def forward(self, e, cos, sign):
-            # e: (B, L, M, K, d); cos: (L, K)
-            # theta broadcasts over B (dim 0) and M (dim 2).
-            cos = cos.to(e.dtype)        # geom is fp32; match model dtype (fused)
-            theta = (sign * cos)[:, None, :, None] * self.freq  # (L, 1, K, d/2)
-            cs, sn = torch.cos(theta), torch.sin(theta)
-            B, L, M, K, _ = e.shape
-            pairs = e.reshape(B, L, M, K, d // 2, 2)
-            e1, e2 = pairs[..., 0], pairs[..., 1]        # (B, L, M, K, d/2)
-            out = torch.stack((e1 * cs - e2 * sn,
-                               e1 * sn + e2 * cs), dim=-1)
-            return out.reshape(B, L, M, K, d)
+        def _index(self, cos, sign):
+            # Bucket in fp32 for a stable index even when the message pass runs
+            # in fp16 (round() tolerates the noise, but keep cos out of half).
+            v = (sign * cos.float())
+            nnz = v.square().reciprocal().round()   # 1..L for v!=0; inf at v==0
+            idx = torch.where(v > 0, 2 * L - nnz + 1,
+                              torch.where(v < 0, nnz - 1,
+                                          v.new_full((), float(L))))
+            return idx.clamp_(0, 2 * L).long()
 
         def forward_flat(self, e, cos, sign):
             # Flat pair layout for the live-pair message pass: e (B, N, K, d),
-            # cos (N, K) — one rotation phase per gathered (line, point) pair.
-            # Same rotation as ``forward``; only the leading dims are collapsed.
-            cos = cos.to(e.dtype)
-            theta = (sign * cos)[..., None] * self.freq   # (N, K, d/2)
-            cs, sn = torch.cos(theta), torch.sin(theta)
-            B, N, K, _ = e.shape
-            pairs = e.reshape(B, N, K, d // 2, 2)
-            e1, e2 = pairs[..., 0], pairs[..., 1]         # (B, N, K, d/2)
-            out = torch.stack((e1 * cs - e2 * sn,
-                               e1 * sn + e2 * cs), dim=-1)
-            return out.reshape(B, N, K, d)
+            # cos (N, K) -> (B, N, K, d + ds), one direction state per gathered
+            # (line, point) pair, broadcast over the batch dim.
+            idx = self._index(cos, sign)                  # (N, K)
+            state = self.table[idx].to(e.dtype)           # (N, K, ds)
+            state = state.unsqueeze(0).expand(e.shape[0], *state.shape)
+            return torch.cat([e, state], dim=-1)
 
     class DirEmbed(nn.Module):
         def __init__(self):
             super().__init__()
-            self.net = _mlp(torch, [d + 2, h, d])
+            self.net = _mlp(torch, [de + 2, h, d])
 
         def forward(self, e, sign, logd):  # one neighbour + (sign, log2 dist)
             # Split the first Linear over its input blocks instead of concatenating
-            # e (B,L,M,K,d) with the two scalar columns — avoids materializing the
-            # big (…,d+2) buffer (the `cat` was ~14% of GPU time). Same math; net.*
-            # weights are unchanged so checkpoints load as-is.
-            w = self.net[0].weight                       # (h, d+2)
-            x = F.linear(e, w[:, :d], self.net[0].bias) \
-                + F.linear(torch.cat([sign, logd], -1), w[:, d:])
+            # e (B,L,M,K,de) with the two scalar columns — avoids materializing the
+            # big (…,de+2) buffer (the `cat` was ~14% of GPU time). ``e`` already
+            # carries the concatenated direction state (width de = d + ds).
+            w = self.net[0].weight                       # (h, de+2)
+            x = F.linear(e, w[:, :de], self.net[0].bias) \
+                + F.linear(torch.cat([sign, logd], -1), w[:, de:])
             for layer in self.net[1:]:
                 x = layer(x)
             return x
@@ -498,13 +528,13 @@ def build_model(d: int = 32):
     class BiDirEmbed(nn.Module):
         def __init__(self):
             super().__init__()
-            self.net = _mlp(torch, [2 * d + 2, h, d])
+            self.net = _mlp(torch, [2 * de + 2, h, d])
 
         def forward(self, e_neg, e_pos, logd_neg, logd_pos):
-            w = self.net[0].weight                       # (h, 2d+2)
-            x = F.linear(e_neg, w[:, :d]) \
-                + F.linear(e_pos, w[:, d:2 * d], self.net[0].bias) \
-                + F.linear(torch.cat([logd_neg, logd_pos], -1), w[:, 2 * d:])
+            w = self.net[0].weight                       # (h, 2de+2)
+            x = F.linear(e_neg, w[:, :de]) \
+                + F.linear(e_pos, w[:, de:2 * de], self.net[0].bias) \
+                + F.linear(torch.cat([logd_neg, logd_pos], -1), w[:, 2 * de:])
             for layer in self.net[1:]:
                 x = layer(x)
             return x
@@ -512,21 +542,24 @@ def build_model(d: int = 32):
     class AttnPool(nn.Module):
         def __init__(self):
             super().__init__()
-            self.wk = nn.Linear(d, d)
+            # A Linear(d, d) key projection dotted with a fixed learned query
+            # is just a linear functional of msgs, so a bare Linear(d, 1) here
+            # would match it exactly. Keep a hidden GELU layer so the score is
+            # a genuine nonlinear function of msgs rather than a degenerate
+            # linear fusion.
+            self.wk = _mlp(torch, [d, d, 1])
             self.wv = nn.Linear(d, d)
-            self.q = nn.Parameter(torch.randn(d) * d ** -0.5)
-            self.null_k = nn.Parameter(torch.randn(d) * d ** -0.5)
+            self.null_k = nn.Parameter(torch.randn(()) * d ** -0.5)
             self.null_v = nn.Parameter(torch.zeros(d))
 
         def forward(self, msgs, valid):
             # msgs: (L, B, N, d); valid: (L, N) bool
-            k = self.wk(msgs)
             v = self.wv(msgs)
-            scale = self.q.shape[0] ** -0.5
-            scores = (k * self.q).sum(-1) * scale  # (L, B, N)
+            scale = self.wv.in_features ** -0.5
+            scores = self.wk(msgs).squeeze(-1) * scale  # (L, B, N)
             scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
             L, B, N, dd = msgs.shape
-            sn = (self.null_k * self.q).sum() * scale
+            sn = self.null_k * scale
             scores = torch.cat([scores, sn.expand(1, B, N)], dim=0)
             v = torch.cat([v, self.null_v.expand(1, B, N, dd)], dim=0)
             # Softmax in fp32 even when the model is fp16: -inf-masked scores
@@ -603,7 +636,7 @@ def build_model(d: int = 32):
             super().__init__()
             self.d = d
             self.init = InitEmbed()
-            self.rope = Rope()
+            self.dir_state = DirState()
             self.dir = DirEmbed()
             self.bidir = BiDirEmbed()
             self.line_pool = AttnPool()
@@ -617,13 +650,14 @@ def build_model(d: int = 32):
             from neighbour *embeddings* E (not raw values) so
             trends/periodicity propagate hop by hop. Returns msgs (L, B, m, K, d)
             and valid (L, m) — the axis dim K is carried through Dir/BiDir as a
-            batch dim, each axis reading its neighbours through the rotary phase.
+            batch dim, each axis reading its neighbours through the direction
+            state.
             The block holds the geometry-only selections, so this touches O(m)
             rows of the field and performs no data-dependent index discovery.
 
             Live-pair gather: a (line, point) pair with no valid neighbour on
             either side (``~vp & ~vn``) is masked out by line_pool anyway, yet the
-            dense form ran rope/dir/bidir over it regardless — ~47% of pairs are
+            dense form ran dir_state/dir/bidir over it regardless — ~47% of pairs are
             dead at these schedules (75% at the coarsest sub-stages), and
             torch.compile can't skip masked GEMM rows. So gather the live pairs
             first and run the message MLPs only on them, splitting two-sided pairs
@@ -648,8 +682,8 @@ def build_model(d: int = 32):
             # dir/bidir MLPs get fp16 inputs under true-half.
             lp = block.logdp.to(E.dtype)
             lnn = block.logdn.to(E.dtype)
-            ep = self.rope.forward_flat(E[:, block.ip], block.cos, 1.0)
-            en = self.rope.forward_flat(E[:, block.in_], block.cos, -1.0)
+            ep = self.dir_state.forward_flat(E[:, block.ip], block.cos, 1.0)
+            en = self.dir_state.forward_flat(E[:, block.in_], block.cos, -1.0)
             # bidir over every live pair — two-sided is ~93% of them, so running
             # it on the ~3.6% one-sided too (then overwriting) is far cheaper than
             # a second gather, and peak memory stays at the live-pair size (<=
@@ -749,15 +783,22 @@ def _load_inference_model(checkpoint_path, torch, device):
     version = int(ckpt.get("version", 1))
     if version != CKPT_VERSION:
         raise ValueError(
-            "Rotary axial GNN checkpoint format v5 is required. Retrain with "
+            "Axial GNN checkpoint format v6 is required. Retrain with "
             "scripts/train_gnn.py."
         )
     d = int(ckpt["d"])
-    model = build_model(d).eval()
+    # Aggregation level is frozen at training time and sizes the direction-state
+    # table, so it must come from the checkpoint (not an inference argument).
+    if "agg_level" not in ckpt:
+        raise ValueError(
+            "checkpoint is missing 'agg_level'; retrain with scripts/train_gnn.py."
+        )
+    agg_level = int(ckpt["agg_level"])
+    model = build_model(d, agg_level).eval()
     model.load_state_dict(ckpt["state_dict"])
     model.to(device)
     checkpoint_hash = hashlib.sha256(path.read_bytes()).digest()[:16]
-    out = (d, model, checkpoint_hash)
+    out = (d, model, checkpoint_hash, agg_level)
     _MODEL_CACHE[key] = out
     return out
 
@@ -840,7 +881,7 @@ class GNNPredictor:
 
     def _maybe_compile(self):
         # Wrap the embed pass once. It fuses the elementwise message-pass ops
-        # (rope/where/dir/bidir), the ~40% of GPU time not in the GEMMs.
+        # (dir_state/where/dir/bidir), the ~40% of GPU time not in the GEMMs.
         # dynamic=True: one graph for every stage/chunk M, no recompile storm.
         # enc and dec both compile (flag replayed) so their float paths match.
         if self.compile and not getattr(self, "_compiled", False):
@@ -862,8 +903,7 @@ class GNNPredictor:
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
                  max_radius: int = 64, device: str = "cpu",
-                 levels: int = 4, anchor_stride: int = 16, anchor_block: int = 1,
-                 agg_level: int | None = None):
+                 levels: int = 4, anchor_stride: int = 16, anchor_block: int = 1):
         import torch
 
         self._torch = torch
@@ -874,13 +914,12 @@ class GNNPredictor:
         self.levels = int(levels)
         self.anchor_stride = int(anchor_stride)
         self.anchor_block = int(anchor_block)
-        # Neighbourhood aggregation level: cap on the L1 length of the neighbour
-        # lines (see `half_directions`). None = full neighbourhood. Encoder and
-        # decoder must agree, so the codec stores it in the stream meta.
-        self.agg_level = None if agg_level is None else int(agg_level)
 
-        self.d, self.model, self.checkpoint_hash = _load_inference_model(
-            checkpoint_path, torch, self.device)
+        self.d, self.model, self.checkpoint_hash, self.agg_level = (
+            _load_inference_model(checkpoint_path, torch, self.device))
+        # Neighbourhood aggregation level: cap on the L1 length of the neighbour
+        # lines (see `half_directions`), frozen into the checkpoint at training
+        # time. Encoder and decoder load the same checkpoint, so they agree.
         self._sched: dict = {}   # shape -> (stage geoms, count->index map)
         self._reset()
 
@@ -1225,7 +1264,7 @@ class ChunkedGNNPredictor:
 
     def __init__(self, checkpoint_path, vmin: float, vmax: float,
                  device: str = "cpu", levels: int = 4, anchor_stride: int = 16,
-                 anchor_block: int = 1, agg_level: int | None = None):
+                 anchor_block: int = 1):
         import torch
 
         self._torch = torch
@@ -1237,10 +1276,10 @@ class ChunkedGNNPredictor:
         self.levels = int(levels)
         self.anchor_stride = int(anchor_stride)
         self.anchor_block = int(anchor_block)
-        # Neighbourhood aggregation level (see GNNPredictor / half_directions).
-        self.agg_level = None if agg_level is None else int(agg_level)
-        self.d, self.model, self.checkpoint_hash = _load_inference_model(
-            checkpoint_path, torch, self.device)
+        # Neighbourhood aggregation level (see GNNPredictor / half_directions),
+        # frozen into the checkpoint at training time.
+        self.d, self.model, self.checkpoint_hash, self.agg_level = (
+            _load_inference_model(checkpoint_path, torch, self.device))
 
     # -- per-tensor lifecycle -------------------------------------------------
     def begin(self, shape, chunk_edges, channels: int = 1,

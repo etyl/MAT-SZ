@@ -110,7 +110,6 @@ def main(argv=None):
         from deepsz.gnn_codec import GNNCompressorCodec
         codec = GNNCompressorCodec(
             args.gnn_checkpoint, error_bound=eb, levels=args.levels,
-            agg_level=args.agg_level,
             radius=args.radius, zstd_level=args.zstd_level,
             eb_ratio=args.eb_ratio,
             tune=args.tune if args.tune in ("fast", "size") else "fast",

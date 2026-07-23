@@ -135,7 +135,7 @@ def test_legacy_stage_forward_accepts_predict_idx():
     assert np.isfinite(values.numpy()).all()
 
 
-@pytest.mark.parametrize("version", [None, 2, 3, 4])
+@pytest.mark.parametrize("version", [None, 2, 3, 4, 5])
 def test_gnn_predictor_rejects_old_checkpoint(tmp_path, version):
     model = build_model(d=8).eval()
     path = tmp_path / f"v{version or 1}.pt"
@@ -144,7 +144,7 @@ def test_gnn_predictor_rejects_old_checkpoint(tmp_path, version):
         checkpoint["version"] = version
     torch.save(checkpoint, path)
 
-    with pytest.raises(ValueError, match="format v5"):
+    with pytest.raises(ValueError, match="format v6"):
         GNNPredictor(path, 0.0, 1.0, levels=2, anchor_stride=4, anchor_block=1)
 
 
@@ -153,6 +153,7 @@ def test_gnn_predictors_share_loaded_inference_model(tmp_path):
     torch.save({
         "version": CKPT_VERSION,
         "d": 8,
+        "agg_level": 2,
         "state_dict": build_model(8).state_dict(),
     }, path)
 
@@ -185,11 +186,11 @@ def test_finalize_ctx_reuse_equivalence():
     assert all(torch.equal(a, b) for a, b in zip(implicit, explicit))
 
 
-def test_rope_axis_symmetry():
-    """Axes differ *only* through the rotary phase. In the closed loop the
-    propagating field is identical across axes (it starts at zeros), so with
-    the frequency bank zeroed every axis context stays identical; with the
-    default bank the per-axis rotation breaks the symmetry."""
+def test_dir_state_axis_symmetry():
+    """Axes differ *only* through the concatenated direction-state embedding.
+    In the closed loop the propagating field is identical across axes (it starts
+    at zeros), so with the direction-state table zeroed every axis context stays
+    identical; with the learned table the per-axis state breaks the symmetry."""
     torch.manual_seed(0)
     model = build_model(d=8).eval()
     geoms, _ = build_stage_geoms((16, 16), 2, 4, 1, 16, torch)
@@ -202,10 +203,10 @@ def test_rope_axis_symmetry():
         _, valid = model._line_messages(E, gp)
         assert bool(valid.any())                 # guard: the test is meaningful
 
-        model.rope.freq.zero_()
+        model.dir_state.table.zero_()
         ctx = model.embed(E, gp)                 # (B, M, ndim, d)
         assert torch.allclose(ctx[..., 0, :], ctx[..., 1, :])
 
-        model.rope.freq.copy_(build_model(d=8).rope.freq)
+        model.dir_state.table.copy_(build_model(d=8).dir_state.table)
         ctx = model.embed(E, gp)
         assert not torch.allclose(ctx[..., 0, :], ctx[..., 1, :])

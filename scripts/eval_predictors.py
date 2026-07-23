@@ -69,8 +69,7 @@ def build_predictor_for_decompress(method: str, hdr: Header, args):
                          max_radius=hdr.max_radius,
                          device=args.device, levels=hdr.levels,
                          anchor_stride=hdr.anchor_stride,
-                         anchor_block=hdr.anchor_block,
-                         agg_level=(None if hdr.agg_level < 0 else hdr.agg_level))
+                         anchor_block=hdr.anchor_block)
         p.fp16 = bool(hdr.flags & FLAG_FP16)
         p.compile = bool(hdr.flags & FLAG_COMPILED)
         return p
@@ -104,7 +103,6 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
         radius=args.radius, zstd_level=args.zstd_level,
         eb_ratio=args.eb_ratio,
         tune=args.tune if args.tune in ("fast", "size") else "fast",
-        agg_level=None,  # match the unchunked arm's full neighbourhood
         device=args.device, chunk_size=args.chunk_size,
         fp16=args.fp16, compile=args.compile)
     t0 = time.time()

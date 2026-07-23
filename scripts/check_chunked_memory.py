@@ -54,6 +54,8 @@ def main():
                     help="chunk edge (default: codec auto)")
     ap.add_argument("--eb", type=float, default=1e-2)
     ap.add_argument("--d", type=int, default=32, help="model width")
+    ap.add_argument("--agg-level", type=int, default=2,
+                    help="aggregation level baked into the random checkpoint")
     ap.add_argument("--levels", type=int, default=4)
     ap.add_argument("--checkpoint", default=None,
                     help="real checkpoint (default: random weights)")
@@ -69,9 +71,10 @@ def main():
     ckpt = args.checkpoint
     if ckpt is None:
         torch.manual_seed(args.seed)
-        model = build_model(d=args.d).eval()
+        model = build_model(d=args.d, agg_level=args.agg_level).eval()
         ckpt = str(Path(tempfile.mkdtemp()) / "gnn_random.pt")
-        torch.save({"d": args.d, "state_dict": model.state_dict(),
+        torch.save({"d": args.d, "agg_level": args.agg_level,
+                    "state_dict": model.state_dict(),
                     "version": CKPT_VERSION}, ckpt)
 
     shape = tuple(args.shape)

@@ -27,7 +27,7 @@ export PYTHONUNBUFFERED=1          # flush progress to the SLURM .out live
 export DEEPSZ_M_TILE=$((32**4))    # M-tiling off for this explicitly sized chunk
 
 # GNN checkpoint (same one eval_tensor.sh uses; override with CKPT=...).
-CKPT=${CKPT:-./checkpoints/d64-2agg.pt}
+CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260722-230254-dd6e10/gnn_predictor.pt}
 
 # Large source tensor; a centred EDGE^ndim hypercube is cropped out of it.
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
@@ -35,8 +35,6 @@ DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-
 EDGE=${EDGE:-128}                   # subset edge (capped per axis, floored to stride)
 EB=${EB:-0.0001}
 LEVELS=${LEVELS:-5}
-AGG=${AGG:-2}                      # neighbourhood aggregation level (1 or 2)
-CHUNK=${CHUNK:-32}
 TUNE=${TUNE:-fast}
 LABEL=${LABEL:-}
 
@@ -45,8 +43,6 @@ python scripts/bench_gnn_subset.py "$DATA" \
     --subset-edge "$EDGE" \
     --eb "$EB" \
     --levels "$LEVELS" \
-    --agg-level "$AGG" \
-    --chunk-size "$CHUNK" \
     --tune "$TUNE" \
     --normalize \
     --label "$LABEL" \

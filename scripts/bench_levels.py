@@ -55,7 +55,6 @@ LEVELS = int(os.environ.get("LEVELS", "5"))
 STRIDE = int(os.environ.get("STRIDE", "32"))
 BLOCK = int(os.environ.get("BLOCK", "1"))
 CHUNK = int(os.environ.get("CHUNK", "32"))
-AGG = int(os.environ.get("AGG", "2"))
 TUNE = os.environ.get("TUNE", "fast")
 FP16 = os.environ.get("FP16", "0") == "1"
 CODECS = [
@@ -435,7 +434,6 @@ def run_gnn(field, stats, skel):
     kw = dict(
         error_bound=EB,
         levels=LEVELS,
-        agg_level=AGG,
         chunk_size=CHUNK,
         tune=TUNE,
         fp16=FP16,
